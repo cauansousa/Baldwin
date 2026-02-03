@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Densidade e Maximização de Vendas - Capsim</title>
+  <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      margin: 0;
+      padding: 24px;
+      background: #f8fafc;
+      color: #1e293b;
+    }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 20px;
+      max-width: 1400px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+    h1 { font-size: 1.25rem; font-weight: 600; margin: 0; color: #0f172a; }
+    .link-back {
+      font-size: 0.9rem;
+      color: #2563eb;
+      text-decoration: none;
+    }
+    .link-back:hover { text-decoration: underline; }
+    .main-container {
+      display: flex;
+      gap: 24px;
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+    .sidebar {
+      flex: 0 0 220px;
+      background: white;
+      padding: 20px;
+      border-radius: 12px;
+      box-shadow: 0 1px 3px rgba(0,0,0,.08);
+      height: fit-content;
+      position: sticky;
+      top: 24px;
+    }
+    .sidebar h2 {
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      color: #64748b;
+      margin: 0 0 12px;
+    }
+    .filter-group { margin-bottom: 20px; }
+    .filter-group:last-child { margin-bottom: 0; }
+    label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.9rem;
+      cursor: pointer;
+      margin-bottom: 8px;
+    }
+    label:hover { color: #2563eb; }
+    input[type="checkbox"] { width: 16px; height: 16px; accent-color: #2563eb; }
+    select {
+      width: 100%;
+      padding: 8px;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      font-size: 0.9rem;
+    }
+    .simulator {
+      margin-top: 24px;
+      padding-top: 20px;
+      border-top: 1px solid #e2e8f0;
+    }
+    .simulator .input-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+    .simulator input[type="number"] {
+      width: 70px;
+      padding: 6px 8px;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      font-size: 0.9rem;
+    }
+    .simulator .result {
+      margin-top: 12px;
+      padding: 12px;
+      background: #f1f5f9;
+      border-radius: 8px;
+      font-size: 0.85rem;
+    }
+    .simulator .result strong { color: #0f172a; }
+    .chart-area {
+      flex: 1;
+      background: white;
+      border-radius: 12px;
+      box-shadow: 0 1px 3px rgba(0,0,0,.08);
+      padding: 16px;
+      min-height: 560px;
+    }
+    .chart-area .toggle-view {
+      margin-bottom: 12px;
+    }
+    .chart-area .toggle-view label {
+      margin-right: 16px;
+    }
+    #chart { width: 100%; height: 520px; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>Densidade de Demanda e Maximização de Vendas</h1>
+    <a href="grafico_interativo.html" class="link-back">← Voltar ao gráfico Performance & Size</a>
+  </div>
+
+  <div class="main-container">
+    <aside class="sidebar">
+      <div class="filter-group">
+        <h2>Ano</h2>
+        <select id="ano">
+          <option value="0">Ano 0</option>
+          <option value="1">Ano 1</option>
+          <option value="2">Ano 2</option>
+          <option value="3">Ano 3</option>
+          <option value="4">Ano 4</option>
+          <option value="5">Ano 5</option>
+          <option value="6">Ano 6</option>
+          <option value="7">Ano 7</option>
+          <option value="8">Ano 8</option>
+        </select>
+      </div>
+      <div class="filter-group">
+        <h2>Segmento</h2>
+        <label><input type="checkbox" id="segLowTech" checked> Low Tech</label>
+        <label><input type="checkbox" id="segHighTech" checked> High Tech</label>
+      </div>
+      <div class="filter-group">
+        <h2>Exibir no mapa</h2>
+        <label><input type="checkbox" id="showIdealSpots" checked> Ideal spots</label>
+        <label><input type="checkbox" id="showCircles" checked> Círculos fine/rough cut</label>
+      </div>
+      <div class="filter-group">
+        <h2>Visualização</h2>
+        <label><input type="radio" name="viewMode" value="2d" checked> Mapa de calor 2D</label>
+        <label><input type="radio" name="viewMode" value="3d"> Superfície 3D</label>
+      </div>
+
+      <div class="simulator">
+        <h2>Simulador de produto</h2>
+        <div class="input-row">
+          <span>Performance:</span>
+          <input type="number" id="prodPerf" value="8" step="0.1" min="0" max="20">
+        </div>
+        <div class="input-row">
+          <span>Size:</span>
+          <input type="number" id="prodSize" value="11" step="0.1" min="0" max="20">
+        </div>
+        <button id="btnOptimal" style="margin-top:8px;padding:6px 12px;cursor:pointer;background:#2563eb;color:white;border:none;border-radius:6px;font-size:0.9rem;">Encontrar ótimo</button>
+        <div class="result" id="simResult">
+          Demanda Low Tech: —<br>
+          Demanda High Tech: —<br>
+          <strong>Total: —</strong>
+        </div>
+      </div>
+    </aside>
+
+    <main class="chart-area">
+      <div id="chart"></div>
+    </main>
+  </div>
+
+  <script>
+    const SQ2 = Math.sqrt(2);
+    const FINE_CUT = 2.5;
+    const ROUGH_CUT = 4.0;
+    const GRID_STEP = 0.25;
+    const PERF_MIN = 4;
+    const PERF_MAX = 14;
+    const SIZE_MIN = 7;
+    const SIZE_MAX = 17;
+
+    const DATA = {
+      low: {
+        perf: [4.8, 5.3, 5.8, 6.3, 6.8, 7.3, 7.8, 8.3, 8.8],
+        size: [15.2, 14.7, 14.2, 13.7, 13.2, 12.7, 12.2, 11.7, 11.2],
+        idealOffset: [0, 0],
+        relevance: 0.09,
+        marketSize: [7560, 8316, 9147.6, 10062.36, 11068.596, 12175.4556, 13393.00116, 14732.30128, 16205.53140],
+        color: '#2563eb'
+      },
+      high: {
+        perf: [7.4, 8.1, 8.8, 9.5, 10.2, 10.9, 11.6, 12.3, 13.0],
+        size: [12.6, 11.9, 11.2, 10.5, 9.8, 9.1, 8.4, 7.7, 7.0],
+        idealOffset: [1 / SQ2, -1 / SQ2],
+        relevance: 0.33,
+        marketSize: [3240, 3888, 4665.6, 5598.72, 6718.464, 8062.1568, 9674.58816, 11609.50579, 13931.40695],
+        color: '#dc2626'
+      }
+    };
+
+    function getIdealSpot(seg, ano) {
+      const s = DATA[seg];
+      const cx = s.perf[ano];
+      const cy = s.size[ano];
+      const [dx, dy] = s.idealOffset;
+      return [cx + 2.5 * dx, cy + 2.5 * dy];
+    }
+
+    function positioningScore(dist) {
+      if (dist <= FINE_CUT) return 100;
+      if (dist > ROUGH_CUT) return 0;
+      return 100 - ((dist - FINE_CUT) / (ROUGH_CUT - FINE_CUT)) * 99;
+    }
+
+    function densityAtPoint(perf, size, ano, segments) {
+      let total = 0;
+      const contrib = {};
+      for (const seg of segments) {
+        const s = DATA[seg];
+        const [ix, iy] = getIdealSpot(seg, ano);
+        const dist = Math.sqrt((perf - ix) ** 2 + (size - iy) ** 2);
+        const score = positioningScore(dist);
+        const mkt = s.marketSize[ano];
+        const c = mkt * (s.relevance / 100) * (score / 100);
+        contrib[seg] = c;
+        total += c;
+      }
+      return { total, contrib };
+    }
+
+    function computeGrid(ano, segments) {
+      const perfArr = [];
+      const sizeArr = [];
+      for (let p = PERF_MIN; p <= PERF_MAX; p += GRID_STEP) perfArr.push(p);
+      for (let s = SIZE_MIN; s <= SIZE_MAX; s += GRID_STEP) sizeArr.push(s);
+
+      const z = [];
+      const zLow = [];
+      const zHigh = [];
+      for (let si = 0; si < sizeArr.length; si++) {
+        const row = [];
+        const rowLow = [];
+        const rowHigh = [];
+        for (let pi = 0; pi < perfArr.length; pi++) {
+          const d = densityAtPoint(perfArr[pi], sizeArr[si], ano, segments);
+          row.push(d.total);
+          rowLow.push(d.contrib.low ?? 0);
+          rowHigh.push(d.contrib.high ?? 0);
+        }
+        z.push(row);
+        zLow.push(rowLow);
+        zHigh.push(rowHigh);
+      }
+      return { perfArr, sizeArr, z, zLow, zHigh };
+    }
+
+    function circlePoints(cx, cy, r, n = 80) {
+      const pts = [];
+      for (let i = 0; i <= n; i++) {
+        const t = (2 * Math.PI * i) / n;
+        pts.push([cx + r * Math.cos(t), cy + r * Math.sin(t)]);
+      }
+      return pts;
+    }
+
+    function buildTraces(grid, ano, showSpots, showCircles) {
+      const traces = [];
+      const lowOn = document.getElementById('segLowTech').checked;
+      const highOn = document.getElementById('segHighTech').checked;
+      const segments = [];
+      if (lowOn) segments.push('low');
+      if (highOn) segments.push('high');
+
+      const view3d = document.querySelector('input[name="viewMode"]:checked').value === '3d';
+
+      if (view3d) {
+        traces.push({
+          z: grid.z,
+          x: grid.perfArr,
+          y: grid.sizeArr,
+          type: 'surface',
+          colorscale: 'Viridis',
+          colorbar: {
+            title: { text: 'Densidade de Demanda', side: 'right', font: { size: 12 } },
+            tickfont: { size: 10 }
+          },
+          name: 'Superfície de densidade',
+          hovertemplate: 'Performance: %{x:.2f}<br>Size: %{y:.2f}<br>Densidade: %{z:.0f}<extra></extra>'
+        });
+      } else {
+        traces.push({
+          z: grid.z,
+          x: grid.perfArr,
+          y: grid.sizeArr,
+          type: 'heatmap',
+          colorscale: 'Viridis',
+          colorbar: { title: 'Densidade' },
+          hovertemplate: 'Perf: %{x:.2f}<br>Size: %{y:.2f}<br>Densidade: %{z:.0f}<extra></extra>'
+        });
+      }
+
+      const pPerf = parseFloat(document.getElementById('prodPerf').value) || 8;
+      const pSize = parseFloat(document.getElementById('prodSize').value) || 11;
+      const prodDensity = densityAtPoint(pPerf, pSize, ano, segments);
+
+      if (!view3d && (showSpots || showCircles)) {
+        if (lowOn) {
+          const [ix, iy] = getIdealSpot('low', ano);
+          const cx = DATA.low.perf[ano];
+          const cy = DATA.low.size[ano];
+          if (showCircles) {
+            [FINE_CUT, ROUGH_CUT].forEach((r, i) => {
+              const pts = circlePoints(cx, cy, r);
+              traces.push({
+                x: pts.map(p => p[0]),
+                y: pts.map(p => p[1]),
+                mode: 'lines',
+                type: 'scatter',
+                line: { color: DATA.low.color, width: i === 0 ? 1.5 : 1, dash: i === 1 ? 'dash' : 'solid' },
+                opacity: 0.5,
+                hoverinfo: 'skip',
+                showlegend: false
+              });
+            });
+          }
+          if (showSpots) {
+            traces.push({
+              x: [ix],
+              y: [iy],
+              mode: 'markers',
+              type: 'scatter',
+              marker: { size: 12, color: DATA.low.color, symbol: 'diamond', line: { color: 'white', width: 1 } },
+              name: 'Ideal Low Tech',
+              hoverinfo: 'name'
+            });
+          }
+        }
+        if (highOn) {
+          const [ix, iy] = getIdealSpot('high', ano);
+          const cx = DATA.high.perf[ano];
+          const cy = DATA.high.size[ano];
+          if (showCircles) {
+            [FINE_CUT, ROUGH_CUT].forEach((r, i) => {
+              const pts = circlePoints(cx, cy, r);
+              traces.push({
+                x: pts.map(p => p[0]),
+                y: pts.map(p => p[1]),
+                mode: 'lines',
+                type: 'scatter',
+                line: { color: DATA.high.color, width: i === 0 ? 1.5 : 1, dash: i === 1 ? 'dash' : 'solid' },
+                opacity: 0.5,
+                hoverinfo: 'skip',
+                showlegend: false
+              });
+            });
+          }
+          if (showSpots) {
+            traces.push({
+              x: [ix],
+              y: [iy],
+              mode: 'markers',
+              type: 'scatter',
+              marker: { size: 12, color: DATA.high.color, symbol: 'diamond', line: { color: 'white', width: 1 } },
+              name: 'Ideal High Tech',
+              hoverinfo: 'name'
+            });
+          }
+        }
+        traces.push({
+          x: [pPerf],
+          y: [pSize],
+          mode: 'markers',
+          type: 'scatter',
+          marker: { size: 14, color: '#22c55e', symbol: 'cross', line: { color: '#166534', width: 2 } },
+          name: 'Meu produto',
+          hoverinfo: 'name'
+        });
+      } else if (view3d) {
+        const spotData = [];
+        if (lowOn && showSpots) {
+          const [ix, iy] = getIdealSpot('low', ano);
+          const dz = densityAtPoint(ix, iy, ano, segments).total;
+          spotData.push({ x: ix, y: iy, z: dz, name: 'Ideal Low Tech', color: DATA.low.color });
+        }
+        if (highOn && showSpots) {
+          const [ix, iy] = getIdealSpot('high', ano);
+          const dz = densityAtPoint(ix, iy, ano, segments).total;
+          spotData.push({ x: ix, y: iy, z: dz, name: 'Ideal High Tech', color: DATA.high.color });
+        }
+        spotData.forEach(s => {
+          traces.push({
+            x: [s.x],
+            y: [s.y],
+            z: [s.z],
+            mode: 'markers',
+            type: 'scatter3d',
+            marker: { size: 8, color: s.color, symbol: 'diamond' },
+            name: s.name,
+            hovertemplate: s.name + '<br>Perf: %{x:.2f}<br>Size: %{y:.2f}<br>Densidade: %{z:.0f}<extra></extra>'
+          });
+        });
+        traces.push({
+          x: [pPerf],
+          y: [pSize],
+          z: [prodDensity.total],
+          mode: 'markers',
+          type: 'scatter3d',
+          marker: { size: 10, color: '#22c55e', symbol: 'cross' },
+          name: 'Meu produto',
+          hovertemplate: 'Meu produto<br>Perf: %{x:.2f}<br>Size: %{y:.2f}<br>Densidade: %{z:.0f}<extra></extra>'
+        });
+      }
+
+      return traces;
+    }
+
+    function findOptimal(ano, segments) {
+      let best = { perf: 0, size: 0, total: 0 };
+      for (let p = PERF_MIN; p <= PERF_MAX; p += GRID_STEP) {
+        for (let s = SIZE_MIN; s <= SIZE_MAX; s += GRID_STEP) {
+          const d = densityAtPoint(p, s, ano, segments);
+          if (d.total > best.total) {
+            best = { perf: p, size: s, total: d.total, contrib: d.contrib };
+          }
+        }
+      }
+      return best;
+    }
+
+    function updateSimulator() {
+      const ano = parseInt(document.getElementById('ano').value) || 0;
+      const segments = [];
+      if (document.getElementById('segLowTech').checked) segments.push('low');
+      if (document.getElementById('segHighTech').checked) segments.push('high');
+      const pPerf = parseFloat(document.getElementById('prodPerf').value) || 8;
+      const pSize = parseFloat(document.getElementById('prodSize').value) || 11;
+
+      const d = densityAtPoint(pPerf, pSize, ano, segments);
+      const el = document.getElementById('simResult');
+      el.innerHTML = 
+        (segments.includes('low') ? `Demanda Low Tech: ${(d.contrib.low ?? 0).toFixed(0)}<br>` : '') +
+        (segments.includes('high') ? `Demanda High Tech: ${(d.contrib.high ?? 0).toFixed(0)}<br>` : '') +
+        `<strong>Total: ${d.total.toFixed(0)}</strong>`;
+    }
+
+    function updateChart() {
+      const ano = parseInt(document.getElementById('ano').value) || 0;
+      const segments = [];
+      if (document.getElementById('segLowTech').checked) segments.push('low');
+      if (document.getElementById('segHighTech').checked) segments.push('high');
+      if (segments.length === 0) return;
+
+      const grid = computeGrid(ano, segments);
+      const showSpots = document.getElementById('showIdealSpots').checked;
+      const showCircles = document.getElementById('showCircles').checked;
+      const traces = buildTraces(grid, ano, showSpots, showCircles);
+
+      const view3d = document.querySelector('input[name="viewMode"]:checked').value === '3d';
+      const layout = view3d
+        ? {
+            scene: {
+              xaxis: {
+                title: { text: 'Performance (Desempenho)', font: { size: 12 } },
+                tickfont: { size: 10 }
+              },
+              yaxis: {
+                title: { text: 'Size (Tamanho)', font: { size: 12 } },
+                tickfont: { size: 10 }
+              },
+              zaxis: {
+                title: { text: 'Densidade de Demanda', font: { size: 12 } },
+                tickfont: { size: 10 }
+              },
+              camera: { eye: { x: 1.5, y: 1.5, z: 1.2 } }
+            },
+            margin: { t: 24, r: 80, b: 48, l: 48 },
+            paper_bgcolor: 'white',
+            showlegend: true,
+            legend: {
+              x: 1.02,
+              y: 1,
+              xanchor: 'left',
+              font: { size: 11 }
+            }
+          }
+        : {
+            xaxis: { title: 'Performance (Desempenho)', range: [PERF_MIN, PERF_MAX], constrain: 'domain' },
+            yaxis: { title: 'Size (Tamanho)', range: [SIZE_MIN, SIZE_MAX], scaleanchor: 'x' },
+            margin: { t: 12, r: 12, b: 48, l: 56 },
+            plot_bgcolor: '#fafafa',
+            paper_bgcolor: 'white',
+            showlegend: true,
+            legend: { x: 0, y: 1.02, orientation: 'h' },
+            hovermode: 'closest'
+          };
+
+      Plotly.react('chart', traces, layout, { responsive: true });
+      updateSimulator();
+    }
+
+    document.getElementById('ano').addEventListener('change', updateChart);
+    document.getElementById('segLowTech').addEventListener('change', updateChart);
+    document.getElementById('segHighTech').addEventListener('change', updateChart);
+    document.getElementById('showIdealSpots').addEventListener('change', updateChart);
+    document.getElementById('showCircles').addEventListener('change', updateChart);
+    document.querySelectorAll('input[name="viewMode"]').forEach(r => r.addEventListener('change', updateChart));
+    document.getElementById('prodPerf').addEventListener('input', updateChart);
+    document.getElementById('prodPerf').addEventListener('change', updateChart);
+    document.getElementById('prodSize').addEventListener('input', updateChart);
+    document.getElementById('prodSize').addEventListener('change', updateChart);
+
+    document.getElementById('btnOptimal').addEventListener('click', () => {
+      const ano = parseInt(document.getElementById('ano').value) || 0;
+      const segments = [];
+      if (document.getElementById('segLowTech').checked) segments.push('low');
+      if (document.getElementById('segHighTech').checked) segments.push('high');
+      if (segments.length === 0) return;
+      const opt = findOptimal(ano, segments);
+      document.getElementById('prodPerf').value = opt.perf.toFixed(2);
+      document.getElementById('prodSize').value = opt.size.toFixed(2);
+      updateChart();
+    });
+
+    updateChart();
+  </script>
+</body>
+</html>

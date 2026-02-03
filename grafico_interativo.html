@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Performance & Size - Visualização Interativa</title>
+  <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      margin: 0;
+      padding: 24px;
+      background: #f8fafc;
+      color: #1e293b;
+    }
+    h1 {
+      font-size: 1.25rem;
+      font-weight: 600;
+      margin: 0 0 20px;
+      color: #0f172a;
+    }
+    .container {
+      display: flex;
+      gap: 24px;
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+    .filters {
+      flex: 0 0 200px;
+      background: white;
+      padding: 20px;
+      border-radius: 12px;
+      box-shadow: 0 1px 3px rgba(0,0,0,.08);
+      height: fit-content;
+      position: sticky;
+      top: 24px;
+    }
+    .filters h2 {
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      color: #64748b;
+      margin: 0 0 12px;
+    }
+    .filter-group {
+      margin-bottom: 20px;
+    }
+    .filter-group:last-child { margin-bottom: 0; }
+    label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.9rem;
+      cursor: pointer;
+      margin-bottom: 8px;
+    }
+    label:hover { color: #2563eb; }
+    input[type="checkbox"] {
+      width: 16px;
+      height: 16px;
+      accent-color: #2563eb;
+    }
+    .range-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-top: 8px;
+    }
+    .range-row input {
+      width: 60px;
+      padding: 6px 8px;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      font-size: 0.9rem;
+    }
+    .chart-wrapper {
+      flex: 1;
+      background: white;
+      border-radius: 12px;
+      box-shadow: 0 1px 3px rgba(0,0,0,.08);
+      padding: 16px;
+      min-height: 500px;
+    }
+    #chart { width: 100%; height: 520px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <aside class="filters">
+      <h1>Performance & Size por Ano</h1>
+      <a href="grafico_densidade.html" style="display:block;margin-bottom:16px;font-size:0.9rem;color:#2563eb;text-decoration:none;">Ver gráfico de densidade →</a>
+      <div class="filter-group">
+        <h2>Segmento</h2>
+        <label><input type="checkbox" id="lowTech" checked> Low Tech</label>
+        <label><input type="checkbox" id="highTech" checked> High Tech</label>
+      </div>
+      <div class="filter-group">
+        <h2>Período (anos)</h2>
+        <div class="range-row">
+          <input type="number" id="anoMin" value="0" min="0" max="8">
+          <span>até</span>
+          <input type="number" id="anoMax" value="8" min="0" max="8">
+        </div>
+      </div>
+      <div class="filter-group">
+        <h2>Exibir</h2>
+        <label><input type="checkbox" id="showCircles" checked> Círculos de aceitação</label>
+        <label><input type="checkbox" id="showLabels" checked> Rótulos dos anos</label>
+      </div>
+    </aside>
+    <main class="chart-wrapper">
+      <div id="chart"></div>
+    </main>
+  </div>
+
+  <script>
+    // Capsim: centro do círculo vs ideal spot
+    // Low Tech: ideal = centro do círculo (sem deslocamento)
+    // High Tech: ideal na borda inferior-direita (+perf, -size)
+    const SQ2 = Math.sqrt(2);
+    const DATA = {
+      low: {
+        perf: [4.8, 5.3, 5.8, 6.3, 6.8, 7.3, 7.8, 8.3, 8.8],
+        size: [15.2, 14.7, 14.2, 13.7, 13.2, 12.7, 12.2, 11.7, 11.2],
+        raio: 2.5,
+        color: '#2563eb',
+        name: 'Low Tech',
+        idealOffset: [0, 0]  // centro do círculo
+      },
+      high: {
+        perf: [7.4, 8.1, 8.8, 9.5, 10.2, 10.9, 11.6, 12.3, 13.0],
+        size: [12.6, 11.9, 11.2, 10.5, 9.8, 9.1, 8.4, 7.7, 7.0],
+        raio: 2.5,
+        color: '#dc2626',
+        name: 'High Tech',
+        idealOffset: [1 / SQ2, -1 / SQ2]   // leading edge: +perf, -size
+      }
+    };
+
+    function circlePoints(cx, cy, r, n = 80) {
+      const pts = [];
+      for (let i = 0; i <= n; i++) {
+        const t = (2 * Math.PI * i) / n;
+        pts.push([cx + r * Math.cos(t), cy + r * Math.sin(t)]);
+      }
+      return pts;
+    }
+
+    function buildTraces() {
+      const lowOn = document.getElementById('lowTech').checked;
+      const highOn = document.getElementById('highTech').checked;
+      const anoMin = Math.min(8, Math.max(0, parseInt(document.getElementById('anoMin').value) || 0));
+      const anoMax = Math.min(8, Math.max(0, parseInt(document.getElementById('anoMax').value) || 8));
+      const showCircles = document.getElementById('showCircles').checked;
+      const showLabels = document.getElementById('showLabels').checked;
+
+      document.getElementById('anoMin').value = anoMin;
+      document.getElementById('anoMax').value = anoMax;
+
+      const traces = [];
+      const margin = Math.max(DATA.low.raio, DATA.high.raio) + 1;
+
+      if (lowOn) {
+        const r = DATA.low.raio;
+        const [dx, dy] = DATA.low.idealOffset;
+        const perf = DATA.low.perf.slice(anoMin, anoMax + 1);
+        const size = DATA.low.size.slice(anoMin, anoMax + 1);
+        const anos = Array.from({ length: anoMax - anoMin + 1 }, (_, i) => anoMin + i);
+        const idealPerf = perf.map((p, i) => p + r * dx);
+        const idealSize = size.map((s, i) => s + r * dy);
+
+        if (showCircles) {
+          perf.forEach((p, i) => {
+            const pts = circlePoints(p, size[i], r);
+            traces.push({
+              x: pts.map(d => d[0]),
+              y: pts.map(d => d[1]),
+              mode: 'lines',
+              line: { color: DATA.low.color, width: 1, dash: 'dot' },
+              opacity: 0.2,
+              hoverinfo: 'skip',
+              showlegend: false
+            });
+          });
+        }
+
+        traces.push({
+          x: idealPerf,
+          y: idealSize,
+          mode: showLabels ? 'lines+markers+text' : 'lines+markers',
+          type: 'scatter',
+          name: 'Low Tech (ideal)',
+          line: { color: DATA.low.color, width: 2.5 },
+          marker: { size: 10, color: DATA.low.color, line: { color: 'white', width: 1 }, symbol: 'diamond' },
+          text: showLabels ? anos.map(String) : [],
+          textposition: 'top right',
+          textfont: { size: 11, color: DATA.low.color }
+        });
+      }
+
+      if (highOn) {
+        const r = DATA.high.raio;
+        const [dx, dy] = DATA.high.idealOffset;
+        const perf = DATA.high.perf.slice(anoMin, anoMax + 1);
+        const size = DATA.high.size.slice(anoMin, anoMax + 1);
+        const anos = Array.from({ length: anoMax - anoMin + 1 }, (_, i) => anoMin + i);
+        const idealPerf = perf.map((p, i) => p + r * dx);
+        const idealSize = size.map((s, i) => s + r * dy);
+
+        if (showCircles) {
+          perf.forEach((p, i) => {
+            const pts = circlePoints(p, size[i], r);
+            traces.push({
+              x: pts.map(d => d[0]),
+              y: pts.map(d => d[1]),
+              mode: 'lines',
+              line: { color: DATA.high.color, width: 1, dash: 'dot' },
+              opacity: 0.2,
+              hoverinfo: 'skip',
+              showlegend: false
+            });
+          });
+        }
+
+        traces.push({
+          x: idealPerf,
+          y: idealSize,
+          mode: showLabels ? 'lines+markers+text' : 'lines+markers',
+          type: 'scatter',
+          name: 'High Tech (ideal)',
+          line: { color: DATA.high.color, width: 2.5 },
+          marker: { size: 10, color: DATA.high.color, line: { color: 'white', width: 1 }, symbol: 'diamond' },
+          text: showLabels ? anos.map(String) : [],
+          textposition: 'top right',
+          textfont: { size: 11, color: DATA.high.color }
+        });
+      }
+
+      const allPerf = [];
+      const allSize = [];
+      const r = { low: DATA.low.raio, high: DATA.high.raio };
+      const off = { low: DATA.low.idealOffset, high: DATA.high.idealOffset };
+      if (lowOn) {
+        const p = DATA.low.perf.slice(anoMin, anoMax + 1);
+        const s = DATA.low.size.slice(anoMin, anoMax + 1);
+        allPerf.push(...p.map((v, i) => v + r.low * off.low[0]));
+        allSize.push(...s.map((v, i) => v + r.low * off.low[1]));
+      }
+      if (highOn) {
+        const p = DATA.high.perf.slice(anoMin, anoMax + 1);
+        const s = DATA.high.size.slice(anoMin, anoMax + 1);
+        allPerf.push(...p.map((v, i) => v + r.high * off.high[0]));
+        allSize.push(...s.map((v, i) => v + r.high * off.high[1]));
+      }
+
+      const xRange = allPerf.length ? [Math.min(...allPerf) - margin, Math.max(...allPerf) + margin] : [4, 14];
+      const yRange = allSize.length ? [Math.min(...allSize) - margin, Math.max(...allSize) + margin] : [6, 17];
+
+      return { traces, xRange, yRange };
+    }
+
+    function updateChart() {
+      const { traces, xRange, yRange } = buildTraces();
+      const layout = {
+        xaxis: { title: 'Performance (Desempenho)', range: xRange, gridcolor: '#f1f5f9', zeroline: false },
+        yaxis: { title: 'Size (Tamanho)', range: yRange, scaleanchor: 'x', gridcolor: '#f1f5f9', zeroline: false },
+        margin: { t: 12, r: 12, b: 48, l: 56 },
+        plot_bgcolor: '#fafafa',
+        paper_bgcolor: 'white',
+        showlegend: true,
+        legend: { x: 0, y: 1.02, orientation: 'h', bgcolor: 'transparent' },
+        hovermode: 'closest'
+      };
+      Plotly.react('chart', traces, layout, { responsive: true });
+    }
+
+    ['lowTech', 'highTech', 'showCircles', 'showLabels'].forEach(id => {
+      document.getElementById(id).addEventListener('change', updateChart);
+    });
+    ['anoMin', 'anoMax'].forEach(id => {
+      document.getElementById(id).addEventListener('change', updateChart);
+      document.getElementById(id).addEventListener('input', updateChart);
+    });
+
+    updateChart();
+  </script>
+</body>
+</html>
