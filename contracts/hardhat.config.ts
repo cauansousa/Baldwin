@@ -19,6 +19,10 @@ subtask(TASK_COMPILE_SOLIDITY_GET_SOLC_BUILD).setAction(async (args: { solcVersi
 
 const config: HardhatUserConfig = {
   paths: { sources: "./src" },
+  networks: {
+    // `npx hardhat node`
+    localhost: { url: "http://127.0.0.1:8545", chainId: 31337 },
+  },
   solidity: {
     version: "0.8.26",
     settings: { optimizer: { enabled: true, runs: 200 }, evmVersion: "cancun", viaIR: false },

@@ -24,10 +24,18 @@ function rng(seed: number) {
 }
 
 const MARKETS = [BTC, ETH];
-const STEPS = 220;
+const STEPS = 300;
 
 describe("Solvency invariant (randomized)", function () {
   this.timeout(600_000);
+  const totals = { liquidations: 0, badDebt: 0n, insurance: 0n };
+
+  after(() => {
+    // Across the seeds the runs must have covered liquidations with a penalty and bad debt.
+    expect(totals.liquidations, "liquidations").to.be.gt(5);
+    expect(totals.badDebt > 0n, "bad debt occurred").to.equal(true);
+    expect(totals.insurance > 0n, "penalties reached the insurance fund").to.equal(true);
+  });
 
   for (const seed of [1, 2, 3, 20241123]) {
     it(`holds through a random sequence of actions (seed ${seed})`, async () => {
@@ -39,6 +47,8 @@ describe("Solvency invariant (randomized)", function () {
       const exchangeAddress = await exchange.getAddress();
       const prices: Record<number, bigint> = { [BTC]: wad(50_000), [ETH]: wad(2_000) };
       const stats = { fills: 0, failedFills: 0, liquidations: 0, withdrawals: 0, refusedWithdrawals: 0, fundings: 0 };
+
+      const failureReasons: Record<string, number> = {};
 
       const refreshPrices = async () => {
         for (const m of MARKETS) await oracle.setPrice(m, prices[m]);
@@ -90,7 +100,7 @@ describe("Solvency invariant (randomized)", function () {
       };
 
       await exchange.connect(liquidator).deposit(usdc(5_000_000));
-      for (const t of traders) await exchange.connect(t).deposit(usdc(r.int(5_000, 40_000)));
+      for (const t of traders) await exchange.connect(t).deposit(usdc(r.int(8_000, 30_000)));
 
       for (let step = 0; step < STEPS; step++) {
         const roll = r.next();
@@ -105,22 +115,27 @@ describe("Solvency invariant (randomized)", function () {
           while (taker === maker) taker = r.pick(traders);
           const makerBuys = r.next() < 0.5;
           const unit = market === BTC ? wad(1) : wad(25);
-          const size = (unit * BigInt(r.int(1, 1500))) / 1000n + r.big(10n ** 12n);
+          const size = (unit * BigInt(r.int(1, 500))) / 1000n + r.big(10n ** 12n);
           const price = (prices[market] * BigInt(r.int(9900, 10100))) / 10000n + r.big(10n ** 15n);
           const makerOrder = ctx.order(maker, makerBuys, size, price, { marketId: market });
           const takerOrder = ctx.order(taker, !makerBuys, size, price, { marketId: market });
           // partial fills too
           const fill = r.next() < 0.3 ? r.big(size) + 1n : size;
           const receipt = (await (await ctx.settle([await ctx.match(maker, makerOrder, taker, takerOrder, fill)])).wait())!;
-          if (ctx.failures(receipt).length) stats.failedFills++;
-          else stats.fills++;
+          const failed = ctx.failures(receipt);
+          if (failed.length) {
+            stats.failedFills++;
+            failureReasons[failed[0].error] = (failureReasons[failed[0].error] ?? 0) + 1;
+          } else stats.fills++;
         } else if (roll < 0.68) {
           // ---- price move: mostly small, sometimes a gap large enough to create bad debt
           label = "price move";
           const market = r.pick(MARKETS);
-          const bps = r.next() < 0.12 ? r.int(-3000, 3000) : r.int(-500, 500);
+          const bps = r.next() < 0.12 ? r.int(-3000, 3000) : r.int(-700, 700);
           prices[market] = (prices[market] * BigInt(10_000 + bps)) / 10_000n + r.big(10n ** 15n);
           await oracle.setPrice(market, prices[market]);
+          // keepers usually react quickly, but not always
+          if (r.next() < 0.6) await liquidateAll();
         } else if (roll < 0.78) {
           // ---- funding
           label = "funding";
@@ -152,7 +167,10 @@ describe("Solvency invariant (randomized)", function () {
         await checkInvariant(`step ${step} (${label})`);
       }
 
-      if (process.env.INVARIANT_DEBUG) console.log(seed, stats, "badDebt", await exchange.totalBadDebt(), "insurance", await exchange.insuranceFund());
+      totals.liquidations += stats.liquidations;
+      totals.badDebt += await exchange.totalBadDebt();
+      totals.insurance += await exchange.insuranceFund();
+      if (process.env.INVARIANT_DEBUG) console.log(seed, stats, failureReasons, "badDebt", await exchange.totalBadDebt(), "insurance", await exchange.insuranceFund());
       // The run must actually have exercised the system.
       expect(stats.fills, "fills").to.be.gt(30);
       expect(stats.fundings, "fundings").to.be.gt(5);

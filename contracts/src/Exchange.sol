@@ -611,8 +611,9 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
 
     // =============================================================== oracle
 
+    /// @dev A timestamp in the future counts as fresh.
     function _isFresh(uint256 updatedAt) private view returns (bool) {
-        return updatedAt + maxPriceAge >= block.timestamp;
+        return block.timestamp <= updatedAt || block.timestamp - updatedAt <= maxPriceAge;
     }
 
     /// @dev Index price; reverts if the oracle reverts, returns zero or, when
