@@ -22,21 +22,26 @@ The source of truth for the on-chain interface is
 - Collateral: USDC only (6 decimals). Sizes and prices are 18-decimal WAD.
 - Margin: cross-margin per account across all markets.
   `accountValue = balance + Σ unrealizedPnL − Σ pendingFunding`, at oracle (index) prices.
-- A fill is accepted only if, after it, each side either satisfies initial margin
-  or strictly reduced its position without flipping (risk-reducing fills always allowed).
+- Every fill needs a fresh index price and a fill price within a fixed band around it
+  (`maxPriceDeviationBps`, 5% by default). The band plus the taker fee must stay below
+  maintenance margin, so a fill at the worst in-band price cannot worsen an account's health.
+- A fill is accepted only if, after it, each side either satisfies initial margin, or
+  strictly reduced its position without flipping, kept a non-negative account value and
+  did not lower its health (`accountValue − maintenance requirement`).
 - Withdrawals must leave initial margin satisfied.
 - Fees: maker/taker bps of notional, charged in USDC, paid to the fee recipient.
 - Funding: hourly; rate = clamp((mark − index) / index, ±cap), longs pay shorts when
   positive. Mark = last fill price. Accrued through a cumulative index, settled into
   balance whenever a position is touched.
-- Liquidation: anyone may close a position of an account below maintenance margin at
-  the index price. Penalty (bps of notional) is split between liquidator and insurance
+- Liquidation: anyone may take over a position of an account below maintenance margin at
+  the index price. The liquidator becomes the counterparty, so it needs its own collateral
+  and must satisfy initial margin afterwards. Penalty (bps of notional) is split between liquidator and insurance
   fund. Losses beyond the account's value are covered by the insurance fund; any
   remainder is recorded as bad debt (event) — socialized loss/ADL is out of MVP scope.
 - Oracle: `IOracle.getPrice(marketId) → (priceWad, updatedAt)`; stale prices revert.
   Chainlink adapter for production, mock for tests/local.
 - Admin: owner adds/updates markets, sets operators, fee recipient, pause. Pause blocks
-  deposits and settlement of position-increasing matches; withdrawals, cancels and
+  settlement of position-increasing matches; deposits, withdrawals, cancels and
   liquidations stay open.
 
 ## Engine API (default port 8080)
