@@ -27,10 +27,12 @@ npm run deploy:local   # terminal 2: deploys and writes deployments/localhost.js
 `deploy.ts` deploys MockUSDC, MockOracle and Exchange, adds BTC-USD (id 0) and ETH-USD
 (id 1), makes the deployer owner, operator and fee recipient, and mints 1,000,000 test
 USDC to the first five accounts. `MAX_PRICE_AGE` (seconds, default one year because the
-mock price is only set by hand) and `MAX_FUNDING_RATE_BPS` (per hour, default 10) can be
-set through the environment. The script is for mocks only.
+mock price is only set by hand), `MAX_FUNDING_RATE_BPS` (per hour, default 10) and
+`MAX_PRICE_DEVIATION_BPS` (default 500) can be set through the environment. The script
+is for mocks only.
 
-Constructor: `Exchange(usdc, oracle, owner, feeRecipient, maxPriceAge, maxFundingRateBps)`.
+Constructor: `Exchange(usdc, oracle, owner, feeRecipient, maxPriceAge, maxFundingRateBps,
+maxPriceDeviationBps)`; the funding cap may be at most 100 bps per hour.
 Admin functions (not part of `IExchange`): `addMarket`, `updateMarket`, `setOperator`,
 `setFeeRecipient`, `setPaused`.
 
@@ -42,15 +44,28 @@ Admin functions (not part of `IExchange`): `addMarket`, `updateMarket`, `setOper
   position and opens the remainder at the fill price.
   `accountValue = balance + Σ unrealized PnL − Σ pending funding` at index prices.
 - **Fills.** `settleMatches` (operators only) runs every match in its own call frame; a
-  failing match emits `MatchFailed` with the revert data and the batch continues. The
-  price is the maker's `limitPrice` and must be within the taker's limit. Order hash =
-  EIP-712 digest; fills are tracked per hash, `cancelOrder(nonce)` kills every order of the
-  caller with that nonce. Only 65-byte, low-s EOA signatures are accepted.
-- **Margin.** After a fill each side must either satisfy initial margin at fresh index
-  prices, or have strictly reduced its position without flipping. In the second case the
-  account must not end with negative value (see deviations). Withdrawals are allowed up to
+  failing match emits `MatchFailed` with the revert data and the batch continues. Before
+  each match at least `MATCH_GAS_BASE + MATCH_GAS_PER_MARKET × marketCount` gas must be
+  left, otherwise the whole batch reverts with `InsufficientGas` (an under-gassed
+  transaction must not be able to report valid matches as failed). The price is the
+  maker's `limitPrice` and must be within the taker's limit. Order hash = EIP-712 digest;
+  fills are tracked per hash, `cancelOrder(nonce)` kills every order of the caller with
+  that nonce. Only 65-byte, low-s EOA signatures are accepted.
+- **Price band.** Every fill needs a fresh index price and must satisfy
+  `|price − index| × 10000 ≤ index × maxPriceDeviationBps` (inclusive), else
+  `PriceOutOfBand(price, index)`. This stops accounts from moving equity between them
+  through off-market fills and keeps the mark price next to the index. Market parameters
+  must satisfy `maxPriceDeviationBps + max(makerFeeBps, takerFeeBps) < maintenanceMarginBps`.
+- **Fill size.** Both orders must be at least `minOrderSize`; so must the fill, unless it
+  completes one of the two orders or closes one side's position entirely.
+- **Margin.** After a fill each side must satisfy initial margin, unless it strictly
+  reduced its position without flipping. A reducing side must not end with negative value
+  (`NegativeAccountValue`) and must either satisfy initial margin or not have lowered its
+  `accountValue − maintenance requirement` (all markets) across the fill
+  (`InsufficientMargin`). Withdrawals are allowed up to
   `freeCollateral = accountValue − initial margin`, so unrealized profit is withdrawable
-  and the cash balance can be negative.
+  and the cash balance can be negative; `withdraw` first accrues due funding in the
+  account's markets.
 - **Funding.** `updateFunding` (anyone; also called by fills and liquidations of that
   market) acts at most once per hour: `rate = clamp((mark − index)/index, ±cap)`,
   `cumulativeFunding += index × rate × elapsed / 1h`, with `elapsed` capped at 8 hours.
@@ -65,12 +80,15 @@ Admin functions (not part of `IExchange`): `addMarket`, `updateMarket`, `setOper
   receive it rounded down, fees/penalties/margin requirements round up, funding payers
   pay the ceiling and receivers get the floor. Dust stays in the contract unassigned.
   Invariant (tested): `USDC held + totalBadDebt ≥ Σ accountValue + insuranceFund`.
-- **Stale oracle** (`updatedAt` older than `maxPriceAge`): opening/increasing/flipping
-  fills, liquidations, withdrawals of accounts with open positions and the value/margin
-  views revert. Reducing fills still work (valued at the last known price), accounts
-  without positions can withdraw, and funding accrues nothing for the period.
-- **Pause** (and markets with `active = false`): no deposits (pause only) and only fills
-  in which both sides reduce. Withdrawals, cancels, funding and liquidations stay open.
+- **Stale oracle** (`updatedAt` older than `maxPriceAge`, or in the future): all fills in
+  that market, all fills of accounts holding a position in that market, liquidations,
+  withdrawals of accounts with open positions and the value/margin views revert. Funding
+  accrues nothing for the period. On-chain cancels, deposits and withdrawals of accounts
+  without positions keep working. Trade-off: there is no trading at all during an oracle
+  outage, not even to close; in exchange nobody can trade at a price that can no longer
+  be checked.
+- **Pause** (and markets with `active = false`): only fills in which both sides reduce.
+  Deposits, withdrawals, cancels, funding and liquidations stay open.
 
 ## Trust model
 
@@ -105,11 +123,22 @@ Admin functions (not part of `IExchange`): `addMarket`, `updateMarket`, `setOper
   value), so nobody but a protocol-run keeper has a reason to liquidate them.
 - **Liquidators take inventory**: they receive the position at the index price and must
   hedge or unwind it themselves. No close factor: an account one unit under maintenance
-  can be liquidated completely.
-- **Mark price = last fill** and funding samples it once per accrual. It can be stale or
-  pushed by small fills within the rate cap; a TWAP/impact price is needed. Funding is not
+  can be liquidated completely. Liquidations are not subject to the minimum fill size.
+- **Mark price = last fill** and funding samples it once per accrual. It can be old, and
+  the operator (or two cooperating traders) can place it anywhere inside the price band
+  with one minimum-size fill, so funding can still be steered up to the rate cap; a
+  TWAP/impact price is needed. The rate sampled at accrual is charged for the whole
+  elapsed period, also on positions opened just before the accrual. Funding is not
   charged for time beyond 8 hours without an accrual, nor while the index price is stale,
   and anyone may trigger that zero-rate accrual while the oracle is stale.
+- **Off-chain cancels are not binding on-chain.** A cancel sent only to the engine (or an
+  order the engine dropped) can still be settled by the operator as long as the signature
+  is valid; only `cancelOrder` on-chain or an expiry ends an order, and `expiry = 0`
+  (never) is allowed.
+- **The operator picks the maker side** of two crossing orders and thereby the price
+  (within both limits and the band) and who pays which fee.
+- **Fee changes apply to resting orders**: an order signed under one fee schedule is
+  charged the fees in force when it is filled (at most 1%).
 - **Oracle**: one global `maxPriceAge` for all feeds; no L2 sequencer-uptime check, no
   deviation/circuit breaker, no fallback feed. A market whose oracle call reverts freezes
   withdrawals and liquidations of every account that has a position in it. The oracle
@@ -118,12 +147,15 @@ Admin functions (not part of `IExchange`): `addMarket`, `updateMarket`, `setOper
   only when it closes or is liquidated. A price gap larger than the maintenance margin
   before liquidation becomes bad debt (also when both sides belong to one person).
   Open-interest caps are the only limit on exposure; there are no per-account position
-  limits and no price bands for fills relative to the index.
-- Fill prices far from the index are accepted if both traders signed them and margin
-  holds; this lets two accounts transfer value between them at will (not below zero).
-- `minOrderSize` applies to the order, not to the fill, and also to reduce-only orders, so
-  positions smaller than the minimum can only be closed with a larger order or by first
-  adding to them.
+  limits. The band and the maintenance margin are tied by a parameter check only.
+- No trading during an oracle outage (see above); a market whose price band has moved
+  away from resting orders simply stops matching them.
+- `minOrderSize` also applies to reduce-only orders: a position below the minimum is
+  closed with an order of at least the minimum size that is filled for exactly the
+  position. A reducing fill worth less than a few millionths of a USDC can be rejected
+  for an account under initial margin, because fee rounding outweighs the margin released.
+- The batch gas floor was measured with the mock oracle and must be re-measured with the
+  production oracle; it grows with the number of markets.
 - EOA signatures only (no ERC-1271 smart accounts, no compact signatures). Orders have no
   time-in-force or post-only semantics on-chain; nonces are only cancellation handles.
 - Every margin check loops over all markets (one storage read each, plus an oracle call

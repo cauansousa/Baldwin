@@ -123,8 +123,11 @@ describe("Solvency invariant (randomized)", function () {
             const size = r.next() < 0.3 ? abs : r.big(abs) + 1n;
             // a long sells at the bottom of the band, a short buys back at the top
             const price = pos > 0n ? (prices[market] * 9500n) / 10000n + 1n : (prices[market] * 10500n) / 10000n;
-            const reduce = ctx.order(reducer, pos < 0n, abs, price, { marketId: market, reduceOnly: true });
-            const take = ctx.order(other, pos > 0n, abs, price, { marketId: market });
+            // dust positions are closed with an order of the minimum size, filled for the position
+            const min = (await exchange.getMarket(market)).minOrderSize;
+            const orderSize = abs > min ? abs : min;
+            const reduce = ctx.order(reducer, pos < 0n, orderSize, price, { marketId: market, reduceOnly: true });
+            const take = ctx.order(other, pos > 0n, orderSize, price, { marketId: market });
             const m = r.next() < 0.5 ? await ctx.match(reducer, reduce, other, take, size) : await ctx.match(other, take, reducer, reduce, size);
             const liquidatableBefore = await exchange.isLiquidatable(reducer.address);
             const receipt = (await (await ctx.settle([m])).wait())!;
