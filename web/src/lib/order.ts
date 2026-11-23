@@ -1,6 +1,21 @@
 import { CANCEL_TYPES, EIP712_DOMAIN_NAME, EIP712_DOMAIN_VERSION, ORDER_TYPES, type Order } from "@shared";
 
 export const DEFAULT_EXPIRY_SECONDS = 24 * 60 * 60;
+/** The contract rejects orders without an expiry or expiring more than 7 days ahead. */
+export const MAX_EXPIRY_SECONDS = 7 * 24 * 60 * 60;
+
+/**
+ * Some wallets (hardware, WalletConnect) return the recovery byte as 0/1.
+ * The engine and the contract only accept 27/28, so map it; anything that is
+ * not a 65-byte signature is returned untouched for the engine to reject.
+ */
+export function normalizeSignature(signature: `0x${string}`): `0x${string}` {
+  if (!/^0x[0-9a-fA-F]{130}$/.test(signature)) return signature;
+  const v = signature.slice(-2).toLowerCase();
+  if (v === "00") return `${signature.slice(0, -2)}1b` as `0x${string}`;
+  if (v === "01") return `${signature.slice(0, -2)}1c` as `0x${string}`;
+  return signature;
+}
 
 /**
  * Nonce unique per trader: millisecond timestamp in the high bits, 64 random

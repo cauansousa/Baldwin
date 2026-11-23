@@ -71,6 +71,10 @@ function callExchange(data: Hex): Hex {
       const { initial, maintenance } = state.marginRequirement();
       return encodeFunctionResult({ abi: exchangeAbi, functionName, result: [initial, maintenance] });
     }
+    case "paused":
+      return encodeFunctionResult({ abi: exchangeAbi, functionName, result: false });
+    case "maxPriceDeviationBps":
+      return encodeFunctionResult({ abi: exchangeAbi, functionName, result: 500n });
     case "freeCollateral":
       return encodeFunctionResult({ abi: exchangeAbi, functionName, result: state.freeCollateral() });
     default:
@@ -187,7 +191,8 @@ async function request({ method, params }: { method: string; params?: unknown })
     }
     case "eth_signTypedData_v4":
       await sleep(300);
-      return `0x${"11".repeat(64)}1b`;
+      // v = 0 on purpose: exercises the 0/1 -> 27/28 normalization in the app.
+      return `0x${"11".repeat(64)}00`;
     default:
       throw new RpcError(-32601, `mock provider: ${method} not supported`);
   }

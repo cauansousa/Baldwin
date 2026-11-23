@@ -12,6 +12,8 @@ import type { EngineApi, FeedHandlers } from "./types";
 const REQUEST_TIMEOUT_MS = 10_000;
 const RECONNECT_MIN_MS = 500;
 const RECONNECT_MAX_MS = 10_000;
+/** WS message types that carry data; anything else typed (acks, pong, error) is ignored. */
+export const DATA_MESSAGE_TYPES = new Set(["snapshot", "update"]);
 
 async function request(baseUrl: string, path: string, init?: RequestInit): Promise<unknown> {
   const res = await fetch(baseUrl + path, {
@@ -72,6 +74,8 @@ function openFeed(baseUrl: string, marketId: number, handlers: FeedHandlers): ()
       if (typeof msg !== "object" || msg === null) return;
       const m = msg as Record<string, unknown>;
       if (m.marketId !== undefined && Number(m.marketId) !== marketId) return;
+      // Acknowledgements ("subscribed", "pong", ...) carry no market data.
+      if (typeof m.type === "string" && !DATA_MESSAGE_TYPES.has(m.type)) return;
       const payload = m.data ?? m;
       if (m.channel === "orderbook") {
         // Anything that is not a full snapshot (e.g. a delta) triggers a REST re-fetch.

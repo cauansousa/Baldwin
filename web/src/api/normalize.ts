@@ -112,13 +112,22 @@ function normalizeOpenOrder(value: unknown): OpenOrder | null {
   const o = isObject(value.order) ? value.order : value;
   try {
     const size = bigintFromJson(o.size, "size");
-    // Prefer "what is no longer resting" (includes matches awaiting settlement).
-    let filledSize = 0n;
-    if (value.remaining !== undefined) filledSize = size - bigintFromJson(value.remaining, "remaining");
-    else if (value.remainingSize !== undefined) filledSize = size - bigintFromJson(value.remainingSize, "remainingSize");
-    else if (value.filledSize !== undefined) filledSize = bigintFromJson(value.filledSize, "filledSize");
-    else if (value.filled !== undefined) filledSize = bigintFromJson(value.filled, "filled");
-    if (filledSize < 0n) filledSize = 0n;
+    const opt = (v: unknown, field: string) => (v === undefined || v === null ? undefined : bigintFromJson(v, field));
+    const filledSize = opt(value.filled, "filled") ?? opt(value.filledSize, "filledSize") ?? 0n;
+    const pendingSize = opt(value.pending, "pending") ?? 0n;
+    let remainingSize =
+      opt(value.remaining, "remaining") ?? opt(value.remainingSize, "remainingSize") ?? size - filledSize - pendingSize;
+    if (remainingSize < 0n) remainingSize = 0n;
+    const status =
+      typeof value.status === "string" && value.status
+        ? value.status
+        : remainingSize > 0n
+          ? filledSize + pendingSize > 0n
+            ? "partially_filled"
+            : "open"
+          : pendingSize > 0n
+            ? "pending_settlement"
+            : "filled";
     return {
       orderHash: String(value.orderHash ?? value.hash) as `0x${string}`,
       order: {
@@ -131,13 +140,21 @@ function normalizeOpenOrder(value: unknown): OpenOrder | null {
         nonce: bigintFromJson(o.nonce, "nonce"),
         expiry: bigintFromJson(o.expiry, "expiry"),
       },
+      status,
       filledSize,
+      pendingSize,
+      remainingSize,
       postOnly: value.postOnly === true,
       ioc: value.ioc === true,
     };
   } catch {
     return null;
   }
+}
+
+/** Only orders that are still (partly) resting and not closed by the engine can be cancelled. */
+export function isCancellable(o: OpenOrder): boolean {
+  return o.remainingSize > 0n && (o.status === "open" || o.status === "partially_filled");
 }
 
 export function normalizeOpenOrders(value: unknown): OpenOrder[] {

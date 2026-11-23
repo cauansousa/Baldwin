@@ -31,8 +31,14 @@ export interface Trade {
 export interface OpenOrder {
   orderHash: `0x${string}`;
   order: Order;
-  /** Matched so far (settled or awaiting settlement), WAD. */
+  /** Engine status: open, partially_filled, pending_settlement, filled, cancelled, expired, rejected. */
+  status: string;
+  /** Confirmed on-chain, WAD. */
   filledSize: bigint;
+  /** Matched, awaiting on-chain confirmation, WAD. */
+  pendingSize: bigint;
+  /** Still resting in the book, WAD. Zero means there is nothing left to cancel. */
+  remainingSize: bigint;
   postOnly: boolean;
   ioc: boolean;
 }

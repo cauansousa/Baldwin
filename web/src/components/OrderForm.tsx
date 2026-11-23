@@ -5,12 +5,12 @@ import { useSignTypedData } from "wagmi";
 import { engine } from "../api";
 import type { MarketInfo } from "../api/types";
 import { config } from "../config";
-import type { ChainAccount, ChainMarket } from "../hooks/useChain";
+import type { ChainAccount, ChainMarket, ExchangeStatus } from "../hooks/useChain";
 import { queryKeys } from "../hooks/useEngine";
 import { describeError } from "../lib/errors";
-import { DEFAULT_EXPIRY_SECONDS, defaultExpiry, generateNonce, orderToJson, orderTypedData } from "../lib/order";
-import { estimateOrder } from "../lib/risk";
-import { formatSize, formatUsdc, parseWad } from "../lib/units";
+import { DEFAULT_EXPIRY_SECONDS, defaultExpiry, generateNonce, normalizeSignature, orderToJson, orderTypedData } from "../lib/order";
+import { classifyLimitPrice, estimateOrder, priceBand } from "../lib/risk";
+import { formatBps, formatPrice, formatSize, formatUsdc, parseWad } from "../lib/units";
 
 export interface OrderPrefill {
   key: number; // changes on every request so the same values can be applied twice
@@ -32,6 +32,7 @@ interface Props {
   market: MarketInfo | undefined;
   chainMarket: ChainMarket | undefined;
   account: ChainAccount | undefined;
+  exchangeStatus: ExchangeStatus | undefined;
   /** Connected address on the right network; undefined disables submission. */
   trader: `0x${string}` | undefined;
   prefill: OrderPrefill | undefined;
@@ -49,7 +50,7 @@ const STATUS_LABELS: Record<string, string> = {
 /** Statuses meaning the order did not survive; shown as a warning, not a success. */
 const CLOSED_STATUSES = new Set(["cancelled", "expired", "rejected"]);
 
-export function OrderForm({ market, chainMarket, account, trader, prefill }: Props) {
+export function OrderForm({ market, chainMarket, account, exchangeStatus, trader, prefill }: Props) {
   const queryClient = useQueryClient();
   const { signTypedDataAsync } = useSignTypedData();
 
@@ -97,14 +98,26 @@ export function OrderForm({ market, chainMarket, account, trader, prefill }: Pro
       ? estimateOrder({
           sizeWad: parsed.size,
           priceWad: parsed.price,
+          isBuy,
+          indexPriceWad: chainMarket?.indexPrice,
           initialMarginBps: params.initialMarginBps,
           feeBps,
         })
       : undefined;
 
+  // Reduce-only orders never add exposure, so they need no new initial margin.
+  const margin = estimate ? (reduceOnly ? 0n : estimate.initialMargin) : undefined;
+  const totalCost = estimate && margin !== undefined ? margin + estimate.fee + estimate.priceLoss : undefined;
   const free = account?.freeCollateral;
-  const marginShort =
-    !reduceOnly && estimate !== undefined && free !== undefined && estimate.initialMargin + estimate.fee > free;
+  const marginShort = !reduceOnly && totalCost !== undefined && free !== undefined && totalCost > free;
+
+  // Fills must happen within index ± maxPriceDeviationBps.
+  const maxDeviation = exchangeStatus?.maxPriceDeviationBps;
+  const band =
+    chainMarket?.indexPrice !== undefined && maxDeviation !== undefined
+      ? priceBand(chainMarket.indexPrice, maxDeviation)
+      : undefined;
+  const bandPosition = band && parsed.price !== undefined ? classifyLimitPrice(isBuy, parsed.price, band) : undefined;
 
   const busy = submit.status === "signing" || submit.status === "sending";
   const blocker = !market
@@ -134,7 +147,9 @@ export function OrderForm({ market, chainMarket, account, trader, prefill }: Pro
     };
     try {
       setSubmit({ status: "signing" });
-      const signature = await signTypedDataAsync(orderTypedData(config.chainId, config.exchange, order));
+      const signature = normalizeSignature(
+        await signTypedDataAsync(orderTypedData(config.chainId, config.exchange, order)),
+      );
       setSubmit({ status: "sending" });
       const result = await engine.postOrder({
         order: orderToJson(order),
@@ -245,8 +260,20 @@ export function OrderForm({ market, chainMarket, account, trader, prefill }: Pro
             <dd className="num">{usd(estimate?.fee)}</dd>
           </div>
           <div>
-            <dt>Margem inicial necessária</dt>
-            <dd className="num">{reduceOnly && estimate ? "0,00 USDC" : usd(estimate?.initialMargin)}</dd>
+            <dt title="Calculada sobre o valor nocional ao preço índice, como faz o contrato.">Margem inicial (no índice)</dt>
+            <dd className="num">{usd(margin)}</dd>
+          </div>
+          {estimate !== undefined && estimate.priceLoss > 0n && (
+            <div>
+              <dt title="Diferença entre o seu preço limite e o preço índice, se a ordem executar inteira no limite.">
+                Perda imediata vs. índice
+              </dt>
+              <dd className="num neg">{usd(estimate.priceLoss)}</dd>
+            </div>
+          )}
+          <div>
+            <dt>Custo estimado</dt>
+            <dd className="num strong">{totalCost !== undefined ? `≈ ${formatUsdc(totalCost)} USDC` : "—"}</dd>
           </div>
           <div>
             <dt>Colateral livre</dt>
@@ -257,10 +284,24 @@ export function OrderForm({ market, chainMarket, account, trader, prefill }: Pro
             <dd>{DEFAULT_EXPIRY_SECONDS / 3600} h</dd>
           </div>
         </dl>
+        <p className="footnote">Valores estimados para execução total no preço limite; o contrato é quem decide.</p>
 
+        {band && maxDeviation !== undefined && bandPosition === "crossing" && (
+          <p className="note note-warn" role="alert">
+            Preço fora da banda permitida ({formatPrice(band.lower)} – {formatPrice(band.upper)}, índice ±
+            {formatBps(maxDeviation)}). Só executa contra ofertas dentro da banda; o restante não executado será
+            cancelado pelo motor.
+          </p>
+        )}
+        {band && bandPosition === "resting" && (
+          <p className="note">
+            Preço {isBuy ? "abaixo" : "acima"} da banda permitida ({formatPrice(band.lower)} – {formatPrice(band.upper)}).
+            A ordem fica no livro e só poderá executar quando o índice se aproximar.
+          </p>
+        )}
         {marginShort && (
           <p className="note note-warn">
-            A margem exigida supera o colateral livre. A ordem só será executada se reduzir sua posição.
+            O custo estimado supera o colateral livre. A ordem só será executada se reduzir sua posição.
           </p>
         )}
 

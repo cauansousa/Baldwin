@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  classifyLimitPrice,
+  priceBand,
   entryPriceWad,
   estimateLiquidationPrice,
   estimateOrder,
@@ -25,11 +27,71 @@ describe("notional / fees / margin", () => {
     expect(notionalUsdc(1n, WAD)).toBe(0n);
   });
 
-  it("estimates fee and initial margin for an order", () => {
-    const est = estimateOrder({ sizeWad: wad(2), priceWad: wad(3_000), initialMarginBps: 1000, feeBps: 5 });
+  it("estimates fee at the limit price and initial margin at the index price", () => {
+    const est = estimateOrder({
+      sizeWad: wad(2),
+      priceWad: wad(3_000),
+      isBuy: true,
+      indexPriceWad: wad(3_000),
+      initialMarginBps: 1000,
+      feeBps: 5,
+    });
     expect(est.notional).toBe(usdc(6_000));
     expect(est.fee).toBe(usdc(3));
     expect(est.initialMargin).toBe(usdc(600));
+    expect(est.priceLoss).toBe(0n);
+    expect(est.totalCost).toBe(usdc(603));
+  });
+
+  it("charges the gap to the index for an aggressive limit, margin still on the index notional", () => {
+    const base = { sizeWad: wad(2), indexPriceWad: wad(3_000), initialMarginBps: 1000, feeBps: 5 };
+    const buy = estimateOrder({ ...base, priceWad: wad(3_100), isBuy: true });
+    expect(buy.initialMargin).toBe(usdc(600)); // 10% of 2 * 3000, not of 2 * 3100
+    expect(buy.fee).toBe(usdc(3.1));
+    expect(buy.priceLoss).toBe(usdc(200));
+    expect(buy.totalCost).toBe(usdc(803.1));
+    const sell = estimateOrder({ ...base, priceWad: wad(2_950), isBuy: false });
+    expect(sell.priceLoss).toBe(usdc(100));
+    expect(sell.initialMargin).toBe(usdc(600));
+    // Passive prices cost nothing extra.
+    expect(estimateOrder({ ...base, priceWad: wad(2_900), isBuy: true }).priceLoss).toBe(0n);
+    expect(estimateOrder({ ...base, priceWad: wad(3_100), isBuy: false }).priceLoss).toBe(0n);
+  });
+
+  it("rounds fee, margin and loss up, and falls back to the limit price without an index", () => {
+    // 0.000001 base at $1.50 = 1.5 USDC units of notional -> ceil 2; 10% -> ceil 1; 5 bps -> ceil 1.
+    const est = estimateOrder({ sizeWad: wad(0.000001), priceWad: wad(1.5), isBuy: true, initialMarginBps: 1000, feeBps: 5 });
+    expect(est.notional).toBe(1n);
+    expect(est.initialMargin).toBe(1n);
+    expect(est.fee).toBe(1n);
+    expect(est.priceLoss).toBe(0n);
+    const loss = estimateOrder({
+      sizeWad: wad(0.000001),
+      priceWad: wad(1.5),
+      indexPriceWad: wad(1),
+      isBuy: true,
+      initialMarginBps: 1000,
+      feeBps: 0,
+    });
+    expect(loss.priceLoss).toBe(1n); // 0.5 unit rounds up
+    expect(loss.fee).toBe(0n);
+  });
+
+  it("price band and limit classification", () => {
+    const band = priceBand(wad(1_000), 500);
+    expect(band).toEqual({ lower: wad(950), upper: wad(1_050) });
+    expect(classifyLimitPrice(true, wad(1_000), band)).toBe("inside");
+    expect(classifyLimitPrice(true, wad(1_050), band)).toBe("inside");
+    expect(classifyLimitPrice(false, wad(950), band)).toBe("inside");
+    // Passive side: just rests.
+    expect(classifyLimitPrice(true, wad(949.99), band)).toBe("resting");
+    expect(classifyLimitPrice(false, wad(1_050.01), band)).toBe("resting");
+    // Aggressive side: remainder would be cancelled.
+    expect(classifyLimitPrice(true, wad(1_050.01), band)).toBe("crossing");
+    expect(classifyLimitPrice(false, wad(949.99), band)).toBe("crossing");
+    // Bounds round inwards.
+    expect(priceBand(3n, 500)).toEqual({ lower: 3n, upper: 3n });
+    expect(priceBand(wad(1), 20_000).lower).toBe(0n);
   });
 
   it("mulBps floors", () => {

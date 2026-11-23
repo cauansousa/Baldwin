@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { mergeTrades, normalizeMarkets, normalizeOpenOrders, normalizeOrderBook, normalizeTrades, tryNormalizeOrderBook } from "./normalize";
+import { DATA_MESSAGE_TYPES } from "./http";
+import { isCancellable, mergeTrades, normalizeMarkets, normalizeOpenOrders, normalizeOrderBook, normalizeTrades, tryNormalizeOrderBook } from "./normalize";
 
 describe("engine payload normalization", () => {
   it("sorts the book and drops empty levels", () => {
@@ -28,17 +29,39 @@ describe("engine payload normalization", () => {
     expect(merged.map((x) => x.id)).toEqual(["c", "b"]);
   });
 
-  it("accepts nested or flat open orders and wrapped lists", () => {
-    const order = { trader: "0xabc", marketId: 0, isBuy: true, reduceOnly: false, size: "10", limitPrice: "5", nonce: "1", expiry: "0" };
+  const order = { trader: "0xabc", marketId: 0, isBuy: true, reduceOnly: false, size: "10", limitPrice: "5", nonce: "1", expiry: "9" };
+
+  it("reads the engine order view: confirmed, pending and remaining are separate", () => {
+    const [view] = normalizeOpenOrders([
+      { orderHash: "0x3", order, status: "partially_filled", remaining: "6", pending: "3", filled: "1", postOnly: true, ioc: false },
+    ]);
+    expect(view).toMatchObject({ status: "partially_filled", filledSize: 1n, pendingSize: 3n, remainingSize: 6n, postOnly: true });
+    expect(isCancellable(view!)).toBe(true);
+  });
+
+  it("orders with nothing resting, or closed by the engine, are not cancellable", () => {
+    const [settling, closed] = normalizeOpenOrders([
+      { orderHash: "0x4", order, status: "pending_settlement", remaining: "0", pending: "10", filled: "0" },
+      { orderHash: "0x5", order, status: "cancelled", remaining: "0", pending: "4", filled: "2", reason: "cancelled by trader" },
+    ]);
+    expect(settling?.filledSize).toBe(0n); // pending is NOT reported as executed
+    expect(settling?.pendingSize).toBe(10n);
+    expect(isCancellable(settling!)).toBe(false);
+    expect(isCancellable(closed!)).toBe(false);
+  });
+
+  it("accepts nested or flat open orders, wrapped lists, and derives missing fields", () => {
     const [nested] = normalizeOpenOrders([{ orderHash: "0x1", order, filledSize: "4" }]);
-    expect(nested?.filledSize).toBe(4n);
-    const [flat] = normalizeOpenOrders({ orders: [{ orderHash: "0x2", ...order, remainingSize: "7" }] });
-    expect(flat?.filledSize).toBe(3n);
+    expect(nested).toMatchObject({ filledSize: 4n, pendingSize: 0n, remainingSize: 6n, status: "partially_filled" });
+    const [flat] = normalizeOpenOrders({ orders: [{ orderHash: "0x2", ...order, remainingSize: "10" }] });
+    expect(flat).toMatchObject({ filledSize: 0n, remainingSize: 10n, status: "open" });
     expect(flat?.order.size).toBe(10n);
-    // Engine shape: remaining / pending / filled — "executed" counts pending matches too.
-    const [view] = normalizeOpenOrders([{ orderHash: "0x3", order, remaining: "6", pending: "3", filled: "1", postOnly: true, ioc: false }]);
-    expect(view?.filledSize).toBe(4n);
-    expect(view?.postOnly).toBe(true);
+  });
+
+  it("only snapshot/update WS messages carry data (acks are ignored)", () => {
+    expect(DATA_MESSAGE_TYPES.has("snapshot")).toBe(true);
+    expect(DATA_MESSAGE_TYPES.has("update")).toBe(true);
+    for (const t of ["subscribed", "unsubscribed", "pong", "error"]) expect(DATA_MESSAGE_TYPES.has(t)).toBe(false);
   });
 
   it("normalizes markets", () => {

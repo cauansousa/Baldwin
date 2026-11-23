@@ -59,7 +59,7 @@ Protocol constants, ABIs and EIP-712 types come from `../shared/src/index.ts` (a
 
 - Market parameters, index/mark prices, balances and positions are read from the contract; the
   engine supplies the market list, book, trades and open orders.
-- The liquidation price shown is an estimate: it assumes only that market moves and ignores
+- Order cost (margin on the index-price notional + fee + loss versus index) and the liquidation price are estimates. The liquidation price assumes only that market moves and ignores
   future funding. The contract decides.
-- Orders expire 24 h after signing. Post-only / IOC are sent as `postOnly` / `ioc` next to the
+- Orders expire 24 h after signing (the contract requires a non-zero expiry of at most 7 days). Post-only / IOC are sent as `postOnly` / `ioc` next to the
   signed order; they are not part of the signature.

@@ -8,7 +8,7 @@ import { OrderForm, type OrderPrefill } from "./components/OrderForm";
 import { PositionsTable } from "./components/PositionsTable";
 import { TradesPanel } from "./components/TradesPanel";
 import { config } from "./config";
-import { useChainAccount, useChainMarkets } from "./hooks/useChain";
+import { useChainAccount, useChainMarkets, useExchangeStatus } from "./hooks/useChain";
 import { useMarketFeed, useMarkets } from "./hooks/useEngine";
 import { describeError } from "./lib/errors";
 
@@ -25,6 +25,7 @@ export function App() {
 
   const chainMarkets = useChainMarkets(markets);
   const account = useChainAccount(address, markets);
+  const exchangeStatus = useExchangeStatus();
   const feed = useMarketFeed(market?.marketId);
   const chainMarket = market ? chainMarkets.data?.get(market.marketId) : undefined;
 
@@ -63,6 +64,13 @@ export function App() {
         </div>
       )}
 
+      {exchangeStatus.data?.paused && (
+        <div className="banner banner-warn" role="alert">
+          A exchange está pausada: apenas ordens que reduzem posição serão executadas. Depósitos, saques e
+          cancelamentos continuam funcionando.
+        </div>
+      )}
+
       <main className="main">
         <div className="col-left">
           <div className="market-row">
@@ -81,7 +89,14 @@ export function App() {
           </div>
         </div>
         <div className="col-right">
-          <OrderForm market={market} chainMarket={chainMarket} account={account.data} trader={trader} prefill={prefill} />
+          <OrderForm
+            market={market}
+            chainMarket={chainMarket}
+            account={account.data}
+            exchangeStatus={exchangeStatus.data}
+            trader={trader}
+            prefill={prefill}
+          />
           <AccountPanel account={account.data} loadError={account.error} trader={trader} connected={isConnected} />
         </div>
       </main>

@@ -2,12 +2,23 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { useSignTypedData } from "wagmi";
 import { engine } from "../api";
+import { isCancellable } from "../api/normalize";
 import type { MarketInfo, OpenOrder } from "../api/types";
 import { config } from "../config";
 import { queryKeys, useOpenOrders } from "../hooks/useEngine";
 import { describeError } from "../lib/errors";
-import { cancelTypedData } from "../lib/order";
+import { cancelTypedData, normalizeSignature } from "../lib/order";
 import { formatPrice, formatSize } from "../lib/units";
+
+const STATUS_LABELS: Record<string, string> = {
+  open: "Aberta",
+  partially_filled: "Parcial",
+  pending_settlement: "Em liquidação",
+  filled: "Executada",
+  cancelled: "Cancelada",
+  expired: "Expirada",
+  rejected: "Rejeitada",
+};
 
 const expiryFormat = new Intl.DateTimeFormat("pt-BR", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
 
@@ -32,7 +43,9 @@ export function OpenOrdersTable({ markets, viewer, trader }: Props) {
     setError(undefined);
     setCancelling(o.orderHash);
     try {
-      const signature = await signTypedDataAsync(cancelTypedData(config.chainId, config.exchange, trader, o.order.nonce));
+      const signature = normalizeSignature(
+        await signTypedDataAsync(cancelTypedData(config.chainId, config.exchange, trader, o.order.nonce)),
+      );
       await engine.cancelOrder(o.orderHash, signature);
     } catch (err) {
       setError(describeError(err));
@@ -67,7 +80,10 @@ export function OpenOrdersTable({ markets, viewer, trader }: Props) {
                 <th>Lado</th>
                 <th className="r">Preço limite</th>
                 <th className="r">Tamanho</th>
-                <th className="r">Executado</th>
+                <th className="r" title="Confirmado on-chain; “pend.” = casado, aguardando confirmação on-chain">
+                  Executado
+                </th>
+                <th title="Parcial: parte executada, resto no livro. Em liquidação: toda casada, aguardando confirmação on-chain.">Status</th>
                 <th>Condição</th>
                 <th>Expira</th>
                 <th />
@@ -82,9 +98,13 @@ export function OpenOrdersTable({ markets, viewer, trader }: Props) {
                     <td className={o.order.isBuy ? "pos" : "neg"}>{o.order.isBuy ? "Compra" : "Venda"}</td>
                     <td className="r num">{formatPrice(o.order.limitPrice)}</td>
                     <td className="r num">{formatSize(o.order.size)}</td>
-                    <td className="r num">{formatSize(o.filledSize)}</td>
+                    <td className="r num">
+                      {formatSize(o.filledSize)}
+                      {o.pendingSize > 0n && <span className="muted"> +{formatSize(o.pendingSize)} pend.</span>}
+                    </td>
+                    <td>{STATUS_LABELS[o.status] ?? o.status}</td>
                     <td>
-                      {[o.order.reduceOnly && "Somente redução", o.postOnly && "Post-only", o.ioc && "IOC"]
+                      {[o.order.reduceOnly && "Só redução", o.postOnly && "Post-only", o.ioc && "IOC"]
                         .filter(Boolean)
                         .join(" · ") || "—"}
                     </td>
@@ -92,9 +112,11 @@ export function OpenOrdersTable({ markets, viewer, trader }: Props) {
                       {o.order.expiry === 0n ? "Sem validade" : expiryFormat.format(Number(o.order.expiry) * 1000)}
                     </td>
                     <td className="r">
-                      <button className="btn btn-small" disabled={!trader || cancelling !== undefined} onClick={() => void cancel(o)}>
-                        {cancelling === o.orderHash ? "Cancelando…" : "Cancelar"}
-                      </button>
+                      {isCancellable(o) && (
+                        <button className="btn btn-small" disabled={!trader || cancelling !== undefined} onClick={() => void cancel(o)}>
+                          {cancelling === o.orderHash ? "Cancelando…" : "Cancelar"}
+                        </button>
+                      )}
                     </td>
                   </tr>
                 );

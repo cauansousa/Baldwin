@@ -29,25 +29,83 @@ export function unrealizedPnlUsdc(sizeWad: bigint, entryNotionalUsdc: bigint, pr
   return sizeWad > 0n ? value - entryNotionalUsdc : entryNotionalUsdc - value;
 }
 
-export interface OrderEstimate {
-  notional: bigint; // USDC units
-  fee: bigint; // USDC units
-  initialMargin: bigint; // USDC units
+const ceilDiv = (a: bigint, b: bigint) => (a <= 0n ? 0n : (a + b - 1n) / b);
+
+/** |size| * price, in USDC units (6 dec), rounded up. */
+export function notionalUsdcCeil(sizeWad: bigint, priceWad: bigint): bigint {
+  return ceilDiv(abs(sizeWad) * priceWad, WAD * USDC_TO_WAD);
 }
 
-/** Notional, fee and initial margin of an order at its limit price. */
+/** amount * bps / 10_000, rounded up. */
+export function mulBpsCeil(amount: bigint, bps: bigint | number): bigint {
+  return ceilDiv(amount * BigInt(bps), BPS);
+}
+
+export interface OrderEstimate {
+  /** Size at the limit price, USDC units. */
+  notional: bigint;
+  /** Fee on the limit-price notional, rounded up. */
+  fee: bigint;
+  /** Initial margin on the INDEX-price notional (what the contract checks), rounded up. */
+  initialMargin: bigint;
+  /**
+   * Immediate loss versus the index if the whole order fills at its limit:
+   * buying above / selling below the index. Zero for passive prices.
+   */
+  priceLoss: bigint;
+  /** initialMargin + fee + priceLoss: collateral the order may consume. */
+  totalCost: bigint;
+}
+
+/**
+ * Worst-case cost estimate of an order that fills entirely at its limit price.
+ * Without an index price the limit price stands in for it.
+ */
 export function estimateOrder(p: {
   sizeWad: bigint;
   priceWad: bigint;
+  isBuy: boolean;
+  indexPriceWad?: bigint;
   initialMarginBps: bigint | number;
   feeBps: bigint | number;
 }): OrderEstimate {
+  const index = p.indexPriceWad !== undefined && p.indexPriceWad > 0n ? p.indexPriceWad : p.priceWad;
   const notional = notionalUsdc(p.sizeWad, p.priceWad);
+  const fee = mulBpsCeil(notionalUsdcCeil(p.sizeWad, p.priceWad), p.feeBps);
+  const initialMargin = mulBpsCeil(notionalUsdcCeil(p.sizeWad, index), p.initialMarginBps);
+  const adverse = p.isBuy ? p.priceWad - index : index - p.priceWad;
+  const priceLoss = adverse > 0n ? notionalUsdcCeil(p.sizeWad, adverse) : 0n;
+  return { notional, fee, initialMargin, priceLoss, totalCost: initialMargin + fee + priceLoss };
+}
+
+export interface PriceBand {
+  lower: bigint; // WAD
+  upper: bigint; // WAD
+}
+
+/** Fill prices the contract accepts: index ± maxPriceDeviationBps. */
+export function priceBand(indexPriceWad: bigint, maxDeviationBps: bigint | number): PriceBand {
+  const dev = BigInt(maxDeviationBps);
+  const down = dev > BPS ? BPS : dev;
   return {
-    notional,
-    fee: mulBps(notional, p.feeBps),
-    initialMargin: mulBps(notional, p.initialMarginBps),
+    lower: ceilDiv(indexPriceWad * (BPS - down), BPS),
+    upper: (indexPriceWad * (BPS + dev)) / BPS,
   };
+}
+
+/**
+ * Where a limit price sits relative to the band:
+ *  - "inside": can fill now.
+ *  - "resting": passive side (buy below / sell above the band). It simply rests
+ *    until the index comes closer.
+ *  - "crossing": aggressive side (buy above / sell below the band). It may match
+ *    makers inside the band, but whatever is left would rest at a price that can
+ *    never settle, so the engine cancels the remainder.
+ */
+export function classifyLimitPrice(isBuy: boolean, limitPriceWad: bigint, band: PriceBand): "inside" | "resting" | "crossing" {
+  if (limitPriceWad > band.upper) return isBuy ? "crossing" : "resting";
+  if (limitPriceWad < band.lower) return isBuy ? "resting" : "crossing";
+  return "inside";
 }
 
 /**

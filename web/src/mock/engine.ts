@@ -29,6 +29,7 @@ export const mockEngine: EngineApi = {
     const m = requireMarket(req.order.marketId);
     const size = BigInt(req.order.size);
     if (size < m.minOrderSize) throw new EngineError(400, "order size below market minimum");
+    if (!/^0x[0-9a-f]{128}(1b|1c)$/i.test(req.signature)) throw new EngineError(400, "signature must be a 65-byte hex string with v = 27/28");
     const orderHash = newOrderHash();
     if (req.ioc) return { orderHash, status: "cancelled", reason: "IOC order: nothing to match", fills: [] };
     openOrders.unshift({
@@ -40,7 +41,10 @@ export const mockEngine: EngineApi = {
         nonce: BigInt(req.order.nonce),
         expiry: BigInt(req.order.expiry),
       },
+      status: "open",
       filledSize: 0n,
+      pendingSize: 0n,
+      remainingSize: size,
       postOnly: req.postOnly === true,
       ioc: false,
     });

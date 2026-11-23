@@ -86,6 +86,29 @@ export function useChainMarkets(markets: MarketInfo[]) {
   });
 }
 
+export interface ExchangeStatus {
+  paused?: boolean;
+  maxPriceDeviationBps?: bigint;
+}
+
+/** Exchange-wide flags: pause state and the fill-price band around the index. */
+export function useExchangeStatus() {
+  const exchange = config.exchange;
+  return useQuery({
+    queryKey: [...queryKeys.chain, "status", exchange],
+    enabled: !!exchange,
+    refetchInterval: 10_000,
+    queryFn: async (): Promise<ExchangeStatus> => {
+      const ex = { abi: exchangeAbi, address: exchange!, chainId } as const;
+      const [paused, maxPriceDeviationBps] = await readAll([
+        readContract(wagmiConfig, { ...ex, functionName: "paused" }),
+        readContract(wagmiConfig, { ...ex, functionName: "maxPriceDeviationBps" }),
+      ] as const);
+      return { paused, maxPriceDeviationBps };
+    },
+  });
+}
+
 /** Balances, margin figures and positions of one trader. */
 export function useChainAccount(trader: `0x${string}` | undefined, markets: MarketInfo[]) {
   const ids = markets.map((m) => m.marketId);

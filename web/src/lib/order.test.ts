@@ -1,7 +1,16 @@
 import { describe, expect, it } from "vitest";
 import { hashTypedData } from "viem";
 import { engineErrorMessage, describeError, EngineError } from "./errors";
-import { cancelTypedData, defaultExpiry, generateNonce, orderToJson, orderTypedData } from "./order";
+import {
+  cancelTypedData,
+  DEFAULT_EXPIRY_SECONDS,
+  defaultExpiry,
+  generateNonce,
+  MAX_EXPIRY_SECONDS,
+  normalizeSignature,
+  orderToJson,
+  orderTypedData,
+} from "./order";
 
 const trader = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8" as const;
 const exchange = "0x5FbDB2315678afecb367f032d93F642f64180aa3" as const;
@@ -16,8 +25,20 @@ describe("order helpers", () => {
     expect(generateNonce(now) < 2n ** 256n).toBe(true);
   });
 
-  it("default expiry is 24h ahead, in seconds", () => {
+  it("default expiry is 24h ahead, in seconds, non-zero and within the 7-day maximum", () => {
     expect(defaultExpiry(1_800_000_000_999)).toBe(1_800_000_000n + 86_400n);
+    expect(DEFAULT_EXPIRY_SECONDS).toBeGreaterThan(0);
+    expect(DEFAULT_EXPIRY_SECONDS).toBeLessThanOrEqual(MAX_EXPIRY_SECONDS);
+  });
+
+  it("normalizes signature v from 0/1 to 27/28 and leaves everything else alone", () => {
+    const rs = "ab".repeat(64);
+    expect(normalizeSignature(`0x${rs}00`)).toBe(`0x${rs}1b`);
+    expect(normalizeSignature(`0x${rs}01`)).toBe(`0x${rs}1c`);
+    expect(normalizeSignature(`0x${rs}1b`)).toBe(`0x${rs}1b`);
+    expect(normalizeSignature(`0x${rs}1C`)).toBe(`0x${rs}1C`);
+    expect(normalizeSignature("0x1234")).toBe("0x1234");
+    expect(normalizeSignature(`0x${rs}${rs}00`)).toBe(`0x${rs}${rs}00`); // not 65 bytes
   });
 
   it("serializes bigints as decimal strings", () => {
