@@ -44,6 +44,12 @@ describe("ChainlinkOracle", () => {
     await expect(oracle.getPrice(0)).to.be.revertedWithCustomError(oracle, "InvalidAnswer");
     await agg.set(5, 0);
     await expect(oracle.getPrice(0)).to.be.revertedWithCustomError(oracle, "InvalidAnswer");
+    // a timestamp in the future is not a real observation
+    const now = (await ethers.provider.getBlock("latest"))!.timestamp;
+    await agg.set(5, now + 3600);
+    await expect(oracle.getPrice(0)).to.be.revertedWithCustomError(oracle, "InvalidAnswer");
+    await agg.set(5, now);
+    expect((await oracle.getPrice(0))[0]).to.equal(5n * 10n ** 10n);
     await expect(oracle.getPrice(3)).to.be.revertedWithCustomError(oracle, "FeedNotSet").withArgs(3);
   });
 
@@ -61,7 +67,7 @@ describe("ChainlinkOracle", () => {
     const usdcToken = await (await ethers.getContractFactory("MockUSDC")).deploy();
     const exchange = await (
       await ethers.getContractFactory("Exchange")
-    ).deploy(await usdcToken.getAddress(), await oracle.getAddress(), owner.address, owner.address, 3600, 10);
+    ).deploy(await usdcToken.getAddress(), await oracle.getAddress(), owner.address, owner.address, 3600, 10, 500);
     await exchange.addMarket({
       active: true,
       initialMarginBps: 2000,

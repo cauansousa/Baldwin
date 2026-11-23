@@ -17,6 +17,7 @@ export const BTC_PRICE = wad(50_000);
 export const ETH_PRICE = wad(2_000);
 export const MAX_PRICE_AGE = HOUR;
 export const MAX_FUNDING_RATE_BPS = 10n;
+export const MAX_PRICE_DEVIATION_BPS = 500n;
 
 export type Order = IExchange.OrderStruct;
 export type Match = IExchange.MatchStruct;
@@ -63,6 +64,7 @@ export async function deployFixture() {
     feeRecipient.address,
     MAX_PRICE_AGE,
     MAX_FUNDING_RATE_BPS,
+    MAX_PRICE_DEVIATION_BPS,
   )) as unknown as Exchange;
 
   await oracle.setPrice(BTC, BTC_PRICE);

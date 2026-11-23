@@ -65,11 +65,18 @@ describe("Exchange", () => {
       const F = await ethers.getContractFactory("Exchange");
       const t = await token.getAddress();
       const o = await oracle.getAddress();
-      await expect(F.deploy(ethers.ZeroAddress, o, owner.address, owner.address, 60, 10)).to.be.revertedWithCustomError(exchange, "ZeroAddress");
-      await expect(F.deploy(t, ethers.ZeroAddress, owner.address, owner.address, 60, 10)).to.be.revertedWithCustomError(exchange, "ZeroAddress");
-      await expect(F.deploy(t, o, owner.address, ethers.ZeroAddress, 60, 10)).to.be.revertedWithCustomError(exchange, "ZeroAddress");
-      await expect(F.deploy(t, o, owner.address, owner.address, 0, 10)).to.be.revertedWithCustomError(exchange, "InvalidConfig");
-      await expect(F.deploy(t, o, owner.address, owner.address, 60, 10_001)).to.be.revertedWithCustomError(exchange, "InvalidConfig");
+      await expect(F.deploy(ethers.ZeroAddress, o, owner.address, owner.address, 60, 10, 500)).to.be.revertedWithCustomError(exchange, "ZeroAddress");
+      await expect(F.deploy(t, ethers.ZeroAddress, owner.address, owner.address, 60, 10, 500)).to.be.revertedWithCustomError(exchange, "ZeroAddress");
+      await expect(F.deploy(t, o, owner.address, ethers.ZeroAddress, 60, 10, 500)).to.be.revertedWithCustomError(exchange, "ZeroAddress");
+      await expect(F.deploy(t, o, owner.address, owner.address, 0, 10, 500)).to.be.revertedWithCustomError(exchange, "InvalidConfig");
+      // funding rate cap is itself capped at 100 bps per hour
+      await expect(F.deploy(t, o, owner.address, owner.address, 60, 101, 500)).to.be.revertedWithCustomError(exchange, "InvalidConfig");
+      // the price band must be set and below 100%
+      await expect(F.deploy(t, o, owner.address, owner.address, 60, 10, 0)).to.be.revertedWithCustomError(exchange, "InvalidConfig");
+      await expect(F.deploy(t, o, owner.address, owner.address, 60, 10, 10_000)).to.be.revertedWithCustomError(exchange, "InvalidConfig");
+      const ok = await F.deploy(t, o, owner.address, owner.address, 60, 100, 500);
+      expect(await ok.maxFundingRateBps()).to.equal(100);
+      expect(await ok.maxPriceDeviationBps()).to.equal(500);
     });
 
     it("only the owner can administer", async () => {
@@ -116,6 +123,10 @@ describe("Exchange", () => {
         { takerFeeBps: 101 },
         { liquidationPenaltyBps: 1001 },
         { symbol: "" },
+        // band (500) + highest fee must stay below the maintenance margin
+        { maintenanceMarginBps: 505, liquidationPenaltyBps: 150 },
+        { maintenanceMarginBps: 520, liquidationPenaltyBps: 150, makerFeeBps: 20 },
+        { maintenanceMarginBps: 500, liquidationPenaltyBps: 150, makerFeeBps: 0, takerFeeBps: 0 },
       ];
       for (const o of bad) {
         await expect(exchange.addMarket(marketConfig("X-USD", o))).to.be.revertedWithCustomError(exchange, "InvalidMarketConfig");
@@ -391,8 +402,9 @@ describe("Exchange", () => {
       const tiny = wad("0.001") - 1n;
       expect(await ctx.settleError(await ctx.match(alice, buy({ size: tiny }), bob, sell(), tiny))).to.equal("OrderTooSmall");
       expect(await ctx.settleError(await ctx.match(alice, buy(), bob, sell({ size: tiny }), tiny))).to.equal("OrderTooSmall");
-      // a fill smaller than the minimum is fine as long as both orders are large enough
-      expect(await ctx.settleError(await ctx.match(alice, buy(), bob, sell(), 1n))).to.equal("");
+      // price outside the band around the index (5%)
+      const far = wad(52_501);
+      expect(await ctx.settleError(await ctx.match(alice, buy({ limitPrice: far }), bob, sell({ limitPrice: far }), ONE))).to.equal("PriceOutOfBand");
     });
 
     it("fills at the maker's price, which must satisfy the taker's limit", async () => {
@@ -573,13 +585,13 @@ describe("Exchange", () => {
       void bob;
     });
 
-    it("a reducing fill cannot leave the account with negative value", async () => {
+    it("an account with negative value cannot trade its way out; it must be liquidated", async () => {
       const { exchange, oracle, ctx, alice, carol } = await leveragedFixture();
       await exchange.connect(carol).deposit(usdc(50_000));
-      await oracle.setPrice(BTC, wad(46_000));
-      // Selling the long at 30,000 would realize -20,000 against a 10,090 balance and
-      // hand the difference to carol at the insurance fund's expense.
-      expect(await ctx.settleError(await ctx.trade(carol, alice, ONE, wad(30_000)))).to.equal("NegativeAccountValue");
+      await oracle.setPrice(BTC, wad(38_000));
+      expect(await exchange.accountValue(alice.address)).to.equal(usdc(-1_910));
+      expect(await ctx.settleError(await ctx.trade(carol, alice, ONE, wad(38_000)))).to.equal("NegativeAccountValue");
+      expect(await ctx.settleError(await ctx.trade(carol, alice, wad("0.5"), wad(39_000)))).to.equal("NegativeAccountValue");
       expect(await exchange.balanceOf(alice.address)).to.equal(usdc(10_090));
     });
 
@@ -1135,12 +1147,13 @@ describe("Exchange", () => {
       expect(await exchange.paused()).to.equal(false);
     });
 
-    it("blocks deposits and position-increasing fills; the rest stays open", async () => {
+    it("blocks position-increasing fills; everything else stays open", async () => {
       const { exchange, oracle, ctx, alice, bob, carol, liquidator } = await leveragedFixture();
       await exchange.connect(carol).deposit(usdc(50_000));
       await exchange.setPaused(true);
 
-      await expect(exchange.connect(alice).deposit(usdc(1))).to.be.revertedWithCustomError(exchange, "ExchangePaused");
+      // deposits stay open: liquidations do too, so traders must be able to add margin
+      await expect(exchange.connect(alice).deposit(usdc(1))).to.emit(exchange, "Deposit");
 
       // increasing, opening (carol), flipping: all blocked
       expect(await ctx.settleError(await ctx.trade(alice, bob, wad("0.1"), BTC_PRICE))).to.equal("OnlyReducingAllowed");
@@ -1155,8 +1168,14 @@ describe("Exchange", () => {
       await exchange.connect(bob).withdraw(usdc(1_000));
       await exchange.updateFunding(BTC);
 
+      // an account near maintenance can save itself by depositing while paused
+      await oracle.setPrice(BTC, wad(40_500));
+      expect(await exchange.isLiquidatable(alice.address)).to.equal(true);
+      await exchange.connect(alice).deposit(usdc(1_000));
+      expect(await exchange.isLiquidatable(alice.address)).to.equal(false);
+
       // liquidation
-      await oracle.setPrice(BTC, wad(40_000));
+      await oracle.setPrice(BTC, wad(39_000));
       await exchange.connect(liquidator).liquidate(alice.address, BTC, MAX);
       expect((await exchange.getPosition(alice.address, BTC)).size).to.equal(0);
 
@@ -1188,7 +1207,7 @@ describe("Exchange", () => {
       return f;
     }
 
-    it("a price is fresh up to and including maxPriceAge", async () => {
+    it("a price is fresh up to and including maxPriceAge, and never from the future", async () => {
       const { exchange, oracle } = await loadFixture(deployFixture);
       await oracle.setPrice(BTC, BTC_PRICE);
       const t = await time.latest();
@@ -1196,6 +1215,12 @@ describe("Exchange", () => {
       expect(await exchange.indexPrice(BTC)).to.equal(BTC_PRICE);
       await time.increaseTo(t + MAX_PRICE_AGE + 1);
       await expect(exchange.indexPrice(BTC)).to.be.revertedWithCustomError(exchange, "StalePrice").withArgs(BTC);
+
+      const now = await time.latest();
+      await oracle.setPriceAt(BTC, BTC_PRICE, now + 1_000);
+      await expect(exchange.indexPrice(BTC)).to.be.revertedWithCustomError(exchange, "StalePrice").withArgs(BTC);
+      await oracle.setPriceAt(BTC, BTC_PRICE, now);
+      expect(await exchange.indexPrice(BTC)).to.equal(BTC_PRICE);
     });
 
     it("views that depend on a stale price revert, others work", async () => {
@@ -1208,37 +1233,43 @@ describe("Exchange", () => {
       expect(await exchange.balanceOf(alice.address)).to.equal(usdc(10_090));
     });
 
-    it("blocks liquidations and position-increasing fills", async () => {
+    it("blocks liquidations and every fill, including reductions and full closes", async () => {
       const { exchange, ctx, alice, bob, carol, liquidator } = await staleFixture();
       await expect(exchange.connect(liquidator).liquidate(alice.address, BTC, MAX)).to.be.revertedWithCustomError(exchange, "StalePrice");
       expect(await ctx.settleError(await ctx.trade(carol, bob, wad("0.1"), wad(44_000)))).to.equal("StalePrice");
       expect(await ctx.settleError(await ctx.trade(bob, alice, wad(2), wad(44_000)))).to.equal("StalePrice");
+      expect(await ctx.settleError(await ctx.trade(bob, alice, wad("0.5"), wad(44_000)))).to.equal("StalePrice");
+      expect(await ctx.settleError(await ctx.trade(bob, alice, ONE, wad(44_000)))).to.equal("StalePrice");
+      expect((await exchange.getPosition(alice.address, BTC)).size).to.equal(ONE);
     });
 
-    it("still allows risk-reducing fills", async () => {
-      const { exchange, ctx, alice, bob } = await staleFixture();
-      await ctx.settleOk([await ctx.trade(bob, alice, ONE, wad(44_000))]);
-      expect((await exchange.getPosition(alice.address, BTC)).size).to.equal(0);
-      expect(await exchange.openInterest(BTC)).to.deep.equal([0n, 0n]);
-      // no positions left: the account no longer depends on the oracle
-      expect(await exchange.accountValue(alice.address)).to.equal(usdc(4_068)); // 10,090 - 6,000 - 22
-      await exchange.connect(alice).withdraw(usdc(4_068));
+    it("a stale price in another market blocks fills of accounts exposed to it", async () => {
+      const f = await loadFixture(deployFixture);
+      const { exchange, oracle, ctx, alice, bob, carol } = f;
+      for (const s of [alice, bob, carol]) await exchange.connect(s).deposit(usdc(50_000));
+      await ctx.settleOk([
+        await ctx.trade(alice, bob, ONE, BTC_PRICE),
+        await ctx.trade(alice, bob, wad(1), wad(2_000), { marketId: ETH }),
+      ]);
+      await time.increase(MAX_PRICE_AGE + 1);
+      await oracle.setPrice(BTC, BTC_PRICE); // BTC fresh, ETH stale
+      expect(await ctx.settleError(await ctx.trade(bob, alice, wad("0.5"), BTC_PRICE))).to.equal("StalePrice");
+      await oracle.setPrice(ETH, wad(2_000));
+      expect(await ctx.settleError(await ctx.trade(bob, alice, wad("0.5"), BTC_PRICE))).to.equal("");
     });
 
-    it("withdrawals: blocked with open positions, open without", async () => {
+    it("cancel and, for flat accounts, withdraw still work", async () => {
       const { exchange, alice, carol } = await staleFixture();
       await expect(exchange.connect(alice).withdraw(1)).to.be.revertedWithCustomError(exchange, "StalePrice");
+      await exchange.connect(alice).cancelOrder(1);
       await exchange.connect(carol).withdraw(usdc(50_000));
+      await exchange.connect(carol).deposit(usdc(1));
     });
 
-    it("a reverting oracle blocks partial reductions, but not full closes or flat accounts", async () => {
+    it("a reverting oracle blocks fills, but not flat accounts", async () => {
       const { exchange, oracle, ctx, alice, bob, carol } = await staleFixture();
       await oracle.setBroken(true);
-      // a partial reduction leaves a position that has to be valued
-      expect(await ctx.settleError(await ctx.trade(bob, alice, wad("0.5"), wad(44_000)))).to.equal("OracleBroken");
-      // closing completely leaves nothing to value
-      expect(await ctx.settleError(await ctx.trade(bob, alice, ONE, wad(44_000)))).to.equal("");
-      await exchange.connect(alice).withdraw(usdc(4_068));
+      expect(await ctx.settleError(await ctx.trade(bob, alice, ONE, wad(44_000)))).to.equal("OracleBroken");
       await exchange.connect(carol).withdraw(usdc(50_000));
     });
 
@@ -1258,7 +1289,7 @@ describe("Exchange", () => {
       const evil = await Token.deploy();
       const exchange2 = await (
         await ethers.getContractFactory("Exchange")
-      ).deploy(await evil.getAddress(), await f.oracle.getAddress(), f.owner.address, f.feeRecipient.address, MAX_PRICE_AGE, 10);
+      ).deploy(await evil.getAddress(), await f.oracle.getAddress(), f.owner.address, f.feeRecipient.address, MAX_PRICE_AGE, 10, 500);
       await evil.mint(f.alice.address, usdc(1_000));
       await evil.connect(f.alice).approve(await exchange2.getAddress(), MAX);
       await exchange2.connect(f.alice).deposit(usdc(500));

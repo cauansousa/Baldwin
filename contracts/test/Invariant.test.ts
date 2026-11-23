@@ -28,11 +28,12 @@ const STEPS = 300;
 
 describe("Solvency invariant (randomized)", function () {
   this.timeout(600_000);
-  const totals = { liquidations: 0, badDebt: 0n, insurance: 0n };
+  const totals = { liquidations: 0, edgeReductions: 0, badDebt: 0n, insurance: 0n };
 
   after(() => {
     // Across the seeds the runs must have covered liquidations with a penalty and bad debt.
     expect(totals.liquidations, "liquidations").to.be.gt(5);
+    expect(totals.edgeReductions, "reducing fills at the band edge").to.be.gt(20);
     expect(totals.badDebt > 0n, "bad debt occurred").to.equal(true);
     expect(totals.insurance > 0n, "penalties reached the insurance fund").to.equal(true);
   });
@@ -46,7 +47,7 @@ describe("Solvency invariant (randomized)", function () {
       const accounts = [...traders, liquidator, feeRecipient];
       const exchangeAddress = await exchange.getAddress();
       const prices: Record<number, bigint> = { [BTC]: wad(50_000), [ETH]: wad(2_000) };
-      const stats = { fills: 0, failedFills: 0, liquidations: 0, withdrawals: 0, refusedWithdrawals: 0, fundings: 0 };
+      const stats = { fills: 0, failedFills: 0, edgeReductions: 0, liquidations: 0, withdrawals: 0, refusedWithdrawals: 0, fundings: 0 };
 
       const failureReasons: Record<string, number> = {};
 
@@ -106,8 +107,38 @@ describe("Solvency invariant (randomized)", function () {
         const roll = r.next();
         let label: string;
 
-        if (roll < 0.5) {
-          // ---- fill at a price near the index, with sizes and prices that do not divide evenly
+        if (roll < 0.1) {
+          // ---- a trader reduces a position at the worst price the band allows (the
+          //      shape of the equity-stripping attack), against whoever takes the other side
+          label = "band-edge reduction";
+          const market = r.pick(MARKETS);
+          const holders = [];
+          for (const t of traders) if ((await exchange.getPosition(t.address, market)).size !== 0n) holders.push(t);
+          if (holders.length > 0) {
+            const reducer = r.pick(holders);
+            let other = r.pick(traders);
+            while (other === reducer) other = r.pick(traders);
+            const pos = (await exchange.getPosition(reducer.address, market)).size;
+            const abs = pos > 0n ? pos : -pos;
+            const size = r.next() < 0.3 ? abs : r.big(abs) + 1n;
+            // a long sells at the bottom of the band, a short buys back at the top
+            const price = pos > 0n ? (prices[market] * 9500n) / 10000n + 1n : (prices[market] * 10500n) / 10000n;
+            const reduce = ctx.order(reducer, pos < 0n, abs, price, { marketId: market, reduceOnly: true });
+            const take = ctx.order(other, pos > 0n, abs, price, { marketId: market });
+            const m = r.next() < 0.5 ? await ctx.match(reducer, reduce, other, take, size) : await ctx.match(other, take, reducer, reduce, size);
+            const liquidatableBefore = await exchange.isLiquidatable(reducer.address);
+            const receipt = (await (await ctx.settle([m])).wait())!;
+            const failed = ctx.failures(receipt);
+            if (failed.length) {
+              failureReasons[failed[0].error] = (failureReasons[failed[0].error] ?? 0) + 1;
+            } else {
+              stats.edgeReductions++;
+              // a reducing fill never turns a healthy account into a liquidatable one
+              if (!liquidatableBefore) expect(await exchange.isLiquidatable(reducer.address), "reduction made account liquidatable").to.equal(false);
+            }
+          }
+        } else if (roll < 0.5) {
+          // ---- fill anywhere inside the price band, with sizes and prices that do not divide evenly
           label = "fill";
           const market = r.pick(MARKETS);
           const maker = r.pick(traders);
@@ -116,7 +147,7 @@ describe("Solvency invariant (randomized)", function () {
           const makerBuys = r.next() < 0.5;
           const unit = market === BTC ? wad(1) : wad(25);
           const size = (unit * BigInt(r.int(1, 500))) / 1000n + r.big(10n ** 12n);
-          const price = (prices[market] * BigInt(r.int(9900, 10100))) / 10000n + r.big(10n ** 15n);
+          const price = (prices[market] * BigInt(r.int(9501, 10499))) / 10000n + r.big(10n ** 15n);
           const makerOrder = ctx.order(maker, makerBuys, size, price, { marketId: market });
           const takerOrder = ctx.order(taker, !makerBuys, size, price, { marketId: market });
           // partial fills too
@@ -168,6 +199,11 @@ describe("Solvency invariant (randomized)", function () {
       }
 
       totals.liquidations += stats.liquidations;
+      totals.edgeReductions += stats.edgeReductions;
+      // only expected failure modes: nothing may slip through as an unknown revert
+      for (const reason of Object.keys(failureReasons)) {
+        expect(["InsufficientMargin", "NegativeAccountValue", "FillTooSmall", "OpenInterestCapExceeded"], `unexpected failure ${reason}`).to.include(reason);
+      }
       totals.badDebt += await exchange.totalBadDebt();
       totals.insurance += await exchange.insuranceFund();
       if (process.env.INVARIANT_DEBUG) console.log(seed, stats, failureReasons, "badDebt", await exchange.totalBadDebt(), "insurance", await exchange.insuranceFund());

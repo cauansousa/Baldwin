@@ -81,6 +81,15 @@ export const EXCHANGE_ABI = [
   "function filledSize(bytes32 orderHash) view returns (uint256)",
   "function isCancelled(address trader, uint256 nonce) view returns (bool)",
   "function isOperator(address account) view returns (bool)",
+  // Implementation details of Exchange.sol that off-chain code relies on (not in IExchange).
+  "function paused() view returns (bool)",
+  "function lastFundingTime(uint32 marketId) view returns (uint256)",
+  "function maxPriceDeviationBps() view returns (uint256)",
+  "function totalBadDebt() view returns (uint256)",
+  "error InsufficientMargin(address trader)",
+  "error NegativeAccountValue(address trader)",
+  "error ReduceOnlyViolated(address trader)",
+  "error PriceOutOfBand(uint256 price, uint256 index)",
 ] as const;
 
 export const ERC20_ABI = [

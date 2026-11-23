@@ -18,6 +18,8 @@ const usdc = (n: string) => ethers.parseUnits(n, 6);
 const MAX_PRICE_AGE = BigInt(process.env.MAX_PRICE_AGE ?? 365 * 24 * 3600);
 // Funding rate cap per hour, in bps.
 const MAX_FUNDING_RATE_BPS = BigInt(process.env.MAX_FUNDING_RATE_BPS ?? 10);
+// Fill prices must be within this many bps of the index price.
+const MAX_PRICE_DEVIATION_BPS = BigInt(process.env.MAX_PRICE_DEVIATION_BPS ?? 500);
 const MINT_PER_ACCOUNT = usdc("1000000");
 const FUNDED_ACCOUNTS = 5;
 
@@ -46,6 +48,7 @@ async function main() {
     deployer.address, // fee recipient
     MAX_PRICE_AGE,
     MAX_FUNDING_RATE_BPS,
+    MAX_PRICE_DEVIATION_BPS,
   );
   await exchange.waitForDeployment();
 

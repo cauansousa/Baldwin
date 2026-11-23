@@ -52,6 +52,26 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
     uint256 public constant LIQUIDATOR_SHARE_BPS = 5_000;
     /// @notice Upper bound for maker and taker fees.
     uint256 public constant MAX_FEE_BPS = 100;
+    /// @notice Upper bound for `maxFundingRateBps` (1% per hour).
+    uint256 public constant MAX_FUNDING_RATE_CAP_BPS = 100;
+    /// @notice Gas that must be available before each match of a batch is attempted:
+    ///         MATCH_GAS_BASE + MATCH_GAS_PER_MARKET * marketCount. If less is left the
+    ///         whole batch reverts, so that an under-gassed transaction cannot make a
+    ///         valid match fail with out-of-gas and be reported as `MatchFailed`.
+    /// @dev Measured as the gas used by a whole single-match `settleMatches`
+    ///      transaction (optimizer 200 runs, cancun, MockOracle; test "batch gas floor"),
+    ///      which is an upper bound for the match itself. The two most expensive cases
+    ///      found, with both accounts holding a position in every market and cold storage:
+    ///        - both sides flip, with a funding accrual and pending funding to settle:
+    ///          322k gas with 2 markets, 524k with 8 (about 34k per market);
+    ///        - both sides reduce (two valuations per account): 278k with 2 markets,
+    ///          561k with 8 (about 47k per market).
+    ///      The floor is 500k for 2 markets (1.55x the measurement) and 1.1M for 8
+    ///      (1.96x). The per-market figure is deliberately generous because a Chainlink
+    ///      feed costs more than the mock oracle; re-measure with the production oracle.
+    ///      The margin also covers the 1/64 of gas withheld from the inner call.
+    uint256 public constant MATCH_GAS_BASE = 300_000;
+    uint256 public constant MATCH_GAS_PER_MARKET = 100_000;
 
     bytes32 public constant ORDER_TYPEHASH = keccak256(
         "Order(address trader,uint32 marketId,bool isBuy,bool reduceOnly,uint256 size,uint256 limitPrice,uint256 nonce,uint64 expiry)"
@@ -64,6 +84,8 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
     uint256 public immutable maxPriceAge;
     /// @notice Cap on the absolute funding rate, in bps of notional per FUNDING_INTERVAL.
     uint256 public immutable maxFundingRateBps;
+    /// @notice Every fill price must be within this many bps of the index price.
+    uint256 public immutable maxPriceDeviationBps;
 
     // -------------------------------------------------------------- storage
     struct MarketState {
@@ -104,7 +126,6 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
     error UnknownMarket(uint32 marketId);
     error NotOperator();
     error OnlySelf();
-    error ExchangePaused();
     error InvalidPrice(uint32 marketId);
     error StalePrice(uint32 marketId);
     error MarketMismatch();
@@ -115,6 +136,9 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
     error OrderIsCancelled();
     error OrderExpired();
     error OrderTooSmall();
+    error FillTooSmall();
+    error PriceOutOfBand(uint256 price, uint256 index);
+    error InsufficientGas();
     error Overfill();
     error ReduceOnlyViolated(address trader);
     error OnlyReducingAllowed();
@@ -132,17 +156,25 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
     /// @param owner_ admin.
     /// @param feeRecipient_ account credited with trading fees.
     /// @param maxPriceAge_ seconds after which an oracle price is stale.
-    /// @param maxFundingRateBps_ funding rate cap per hour, in bps.
+    /// @param maxFundingRateBps_ funding rate cap per hour, in bps (at most 100).
+    /// @param maxPriceDeviationBps_ width of the fill price band around the index, in bps.
     constructor(
         address collateral_,
         address oracle_,
         address owner_,
         address feeRecipient_,
         uint256 maxPriceAge_,
-        uint256 maxFundingRateBps_
+        uint256 maxFundingRateBps_,
+        uint256 maxPriceDeviationBps_
     ) Ownable(owner_) EIP712("Baldwin", "1") {
         if (collateral_ == address(0) || oracle_ == address(0) || feeRecipient_ == address(0)) revert ZeroAddress();
-        if (maxPriceAge_ == 0 || maxFundingRateBps_ > BPS) revert InvalidConfig();
+        if (
+            maxPriceAge_ == 0 ||
+            maxFundingRateBps_ > MAX_FUNDING_RATE_CAP_BPS ||
+            maxPriceDeviationBps_ == 0 ||
+            maxPriceDeviationBps_ >= BPS
+        ) revert InvalidConfig();
+        maxPriceDeviationBps = maxPriceDeviationBps_;
         _collateral = IERC20(collateral_);
         oracle = IOracle(oracle_);
         maxPriceAge = maxPriceAge_;
@@ -183,14 +215,15 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
         emit FeeRecipientUpdated(feeRecipient_);
     }
 
-    /// @notice While paused: no deposits and only fills that reduce both sides' positions.
-    ///         Withdrawals, cancels, funding and liquidations stay open.
+    /// @notice While paused: only fills that reduce both sides' positions. Deposits,
+    ///         withdrawals, cancels, funding and liquidations stay open.
     function setPaused(bool paused_) external onlyOwner {
         paused = paused_;
         emit Paused(paused_);
     }
 
-    function _validateMarket(Market calldata market) private pure {
+    function _validateMarket(Market calldata market) private view {
+        uint256 maxFeeBps = Math.max(market.makerFeeBps, market.takerFeeBps);
         if (
             market.maintenanceMarginBps == 0 ||
             market.maintenanceMarginBps > market.initialMarginBps ||
@@ -199,6 +232,11 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
             market.takerFeeBps > MAX_FEE_BPS ||
             // The penalty must fit in the margin an account still has when it becomes liquidatable.
             market.liquidationPenaltyBps > market.maintenanceMarginBps ||
+            // A fill that reduces a position releases maintenanceMarginBps of the reduced
+            // notional and costs at most the band width plus the fee. Keeping the cost
+            // below the release means a reducing fill can never worsen
+            // (accountValue - maintenance requirement).
+            maxPriceDeviationBps + maxFeeBps >= market.maintenanceMarginBps ||
             bytes(market.symbol).length == 0
         ) revert InvalidMarketConfig();
     }
@@ -206,8 +244,8 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
     // =============================================================== trader
 
     /// @inheritdoc IExchange
+    /// @dev Open while paused: liquidations stay open, so accounts must be able to add margin.
     function deposit(uint256 amount) external nonReentrant {
-        if (paused) revert ExchangePaused();
         if (amount == 0) revert ZeroAmount();
         _balances[msg.sender] += amount.toInt256();
         _collateral.safeTransferFrom(msg.sender, address(this), amount);
@@ -218,9 +256,15 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
     /// @dev Allowed up to `freeCollateral`, i.e. unrealized profit is withdrawable and
     ///      the cash balance may go negative. An account with open positions needs fresh
     ///      oracle prices for all of them; an account without positions needs no oracle.
+    ///      Funding that is due in the account's markets is accrued first, so that it
+    ///      cannot be withdrawn just before it is charged.
     function withdraw(uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
-        Health memory h = _health(msg.sender, true);
+        uint256 count = _markets.length;
+        for (uint32 marketId = 0; marketId < count; ++marketId) {
+            if (_positions[msg.sender][marketId].size != 0) _accrueFunding(marketId);
+        }
+        Health memory h = _health(msg.sender);
         if (h.value < (amount + h.initial).toInt256()) revert InsufficientFreeCollateral();
         _balances[msg.sender] -= amount.toInt256();
         _collateral.safeTransfer(msg.sender, amount);
@@ -239,7 +283,9 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
     /// @inheritdoc IExchange
     function settleMatches(Match[] calldata matches) external nonReentrant {
         if (!_operators[msg.sender]) revert NotOperator();
+        uint256 gasFloor = MATCH_GAS_BASE + MATCH_GAS_PER_MARKET * _markets.length;
         for (uint256 i = 0; i < matches.length; ++i) {
+            if (gasleft() < gasFloor) revert InsufficientGas();
             // Each match runs in its own call frame so that a failure rolls back only
             // that match.
             try this.executeMatch(matches[i]) {} catch (bytes memory reason) {
@@ -253,6 +299,8 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
         uint256 fee;
         int256 oldSize;
         int256 newSize;
+        int256 marginBefore; // see _marginBeforeTrade
+        bool smallFillAllowed; // the fill completes the order or closes the position
     }
 
     /// @notice Settles one match. Only callable by this contract, from `settleMatches`.
@@ -271,6 +319,11 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
         if (price == 0) revert InvalidPrice(marketId);
         if (m.taker.isBuy ? price > m.taker.limitPrice : price < m.taker.limitPrice) revert PriceNotCrossed();
 
+        // Every fill needs a fresh index price and must be priced close to it. This is
+        // what stops two accounts from moving value between them through an off-market
+        // fill, and keeps the mark price (hence funding) anchored to the index.
+        _requireInBand(marketId, price);
+
         // Funding up to now is charged on the positions as they were before this fill,
         // using the mark price before this fill.
         _accrueFunding(marketId);
@@ -281,6 +334,11 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
         FillResult memory maker = _fillSide(m.maker, m.makerSig, m.fillSize, price, false);
         FillResult memory taker = _fillSide(m.taker, m.takerSig, m.fillSize, price, true);
 
+        // Fills below the minimum size are only for finishing an order or closing a position.
+        if (
+            m.fillSize < _markets[marketId].minOrderSize && !maker.smallFillAllowed && !taker.smallFillAllowed
+        ) revert FillTooSmall();
+
         // Longs and shorts move together, so checking one side covers both. Fills that
         // do not add open interest pass even if the cap was lowered below the current level.
         if (state.longOpenInterest > longsBefore && state.longOpenInterest > _markets[marketId].maxOpenInterest) {
@@ -288,8 +346,8 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
         }
         state.markPrice = price;
 
-        _requireMarginAfterTrade(m.maker.trader, maker.oldSize, maker.newSize);
-        _requireMarginAfterTrade(m.taker.trader, taker.oldSize, taker.newSize);
+        _requireMarginAfterTrade(m.maker.trader, maker.oldSize, maker.newSize, maker.marginBefore);
+        _requireMarginAfterTrade(m.taker.trader, taker.oldSize, taker.newSize, taker.marginBefore);
 
         emit Fill(
             marketId,
@@ -336,7 +394,9 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
         bool reducing = _isReduction(r.oldSize, r.newSize);
         if (order.reduceOnly && !reducing) revert ReduceOnlyViolated(trader);
         if ((paused || !market.active) && !reducing) revert OnlyReducingAllowed();
+        r.smallFillAllowed = filled == order.size || (r.newSize == 0 && r.oldSize != 0);
 
+        r.marginBefore = _marginBeforeTrade(trader, r.oldSize, r.newSize);
         _changePosition(trader, marketId, delta, price);
 
         // fee = ceil(ceil(notional) * feeBps)
@@ -362,24 +422,25 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
         int256 oldSize = _positions[trader][marketId].size;
         if (oldSize == 0) revert NoPosition();
 
-        Health memory h = _health(trader, true);
+        Health memory h = _health(trader);
         if (h.value >= h.maintenance.toInt256()) revert NotLiquidatable();
 
         uint256 closeSize = Math.min(maxSize, _abs(oldSize));
         if (closeSize == 0) revert ZeroAmount();
-        uint256 price = _price(marketId, true);
+        uint256 price = _price(marketId);
         // Signed size moved from the trader to the liquidator.
         int256 moved = oldSize > 0 ? closeSize.toInt256() : -closeSize.toInt256();
 
         _settleFunding(trader, marketId);
         _settleFunding(msg.sender, marketId);
         int256 liquidatorOldSize = _positions[msg.sender][marketId].size;
+        int256 liquidatorMarginBefore = _marginBeforeTrade(msg.sender, liquidatorOldSize, liquidatorOldSize + moved);
         _changePosition(trader, marketId, -moved, price);
         _changePosition(msg.sender, marketId, moved, price);
 
         (uint256 penalty, uint256 badDebt) = _chargePenaltyAndAbsorb(trader, marketId, closeSize, price);
 
-        _requireMarginAfterTrade(msg.sender, liquidatorOldSize, liquidatorOldSize + moved);
+        _requireMarginAfterTrade(msg.sender, liquidatorOldSize, liquidatorOldSize + moved, liquidatorMarginBefore);
 
         emit Liquidation(marketId, trader, msg.sender, moved, price, penalty, badDebt);
     }
@@ -392,7 +453,7 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
         uint256 closeSize,
         uint256 price
     ) private returns (uint256 penalty, uint256 badDebt) {
-        Health memory h = _health(trader, true);
+        Health memory h = _health(trader);
 
         // The penalty is capped at what the account is still worth, so that it can never
         // create or enlarge a deficit (which the insurance fund would have to pay).
@@ -436,8 +497,9 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
     ///
     ///      The rate is sampled once, at accrual time, and applied to the whole elapsed
     ///      period (capped at MAX_FUNDING_ELAPSED). If the index price is unavailable or
-    ///      stale, or the market never traded, the period accrues no funding; this never
-    ///      reverts, so that risk-reducing fills keep working during an oracle outage.
+    ///      stale, or the market never traded, the period accrues no funding. This never
+    ///      reverts. Since fills must be priced within the band around the index, the
+    ///      premium itself is bounded by maxPriceDeviationBps at the time of the fill.
     function _accrueFunding(uint32 marketId) private {
         MarketState storage state = _marketState[marketId];
         uint256 elapsed = block.timestamp - state.lastFundingTime;
@@ -561,27 +623,44 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
         uint256 positions; // number of markets with a non-zero position
     }
 
+    /// @dev For a trade that strictly reduces a position without flipping: the account's
+    ///      (value - maintenance requirement) before the trade, at fresh prices. Zero (and
+    ///      unused) for any other trade. Call after funding was settled and before the
+    ///      position is changed.
+    function _marginBeforeTrade(address trader, int256 oldSize, int256 newSize) private view returns (int256) {
+        if (!_isReduction(oldSize, newSize)) return 0;
+        Health memory h = _health(trader);
+        return h.value - h.maintenance.toInt256();
+    }
+
     /// @dev Margin rule applied to an account after a trade changed one of its positions.
-    ///       - Position strictly reduced without flipping: always allowed, provided the
-    ///         account is not left with negative value. Without that floor, an account
-    ///         could sell its position far below the index price to an accomplice and
-    ///         leave the loss to the insurance fund. This branch accepts stale prices so
-    ///         that positions can be reduced during an oracle outage.
-    ///       - Anything else (open, increase, flip): initial margin must hold at fresh
-    ///         prices.
-    function _requireMarginAfterTrade(address trader, int256 oldSize, int256 newSize) private view {
+    ///      All prices must be fresh.
+    ///       - Open, increase or flip: initial margin must hold.
+    ///       - Position strictly reduced without flipping: the account must not end with
+    ///         negative value, and it must either satisfy initial margin or not have
+    ///         lowered its (value - maintenance requirement) compared to before the trade.
+    ///         With the price band and the market parameter check the second condition
+    ///         always holds for reductions (apart from sub-cent rounding on dust); it is
+    ///         kept as an independent safeguard against equity being moved out of an
+    ///         under-margined account through "reducing" fills.
+    function _requireMarginAfterTrade(
+        address trader,
+        int256 oldSize,
+        int256 newSize,
+        int256 marginBefore
+    ) private view {
+        Health memory h = _health(trader);
         if (_isReduction(oldSize, newSize)) {
-            if (_health(trader, false).value < 0) revert NegativeAccountValue(trader);
-        } else {
-            Health memory h = _health(trader, true);
-            if (h.value < h.initial.toInt256()) revert InsufficientMargin(trader);
+            if (h.value < 0) revert NegativeAccountValue(trader);
+            if (h.value - h.maintenance.toInt256() >= marginBefore) return;
         }
+        if (h.value < h.initial.toInt256()) revert InsufficientMargin(trader);
     }
 
     /// @dev Account value and margin requirements over all markets at index prices.
     ///      Reads the oracle only for markets in which the account has a position.
     ///      Long value is rounded down and short liability up; requirements are rounded up.
-    function _health(address trader, bool requireFresh) private view returns (Health memory h) {
+    function _health(address trader) private view returns (Health memory h) {
         h.value = _balances[trader];
         uint256 count = _markets.length;
         for (uint32 marketId = 0; marketId < count; ++marketId) {
@@ -589,7 +668,7 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
             int256 size = position.size;
             if (size == 0) continue;
 
-            uint256 price = _price(marketId, requireFresh);
+            uint256 price = _price(marketId);
             uint256 absSize = _abs(size);
             int256 pnl = size > 0
                 ? Math.mulDiv(absSize, price, NOTIONAL_SCALE).toInt256() - position.entryNotional.toInt256()
@@ -611,18 +690,26 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
 
     // =============================================================== oracle
 
-    /// @dev A timestamp in the future counts as fresh.
+    /// @dev A price is usable if it is at most maxPriceAge old. A timestamp in the future
+    ///      is rejected: it cannot be a real observation and would stay "fresh" for longer
+    ///      than intended.
     function _isFresh(uint256 updatedAt) private view returns (bool) {
-        return block.timestamp <= updatedAt || block.timestamp - updatedAt <= maxPriceAge;
+        return updatedAt <= block.timestamp && block.timestamp - updatedAt <= maxPriceAge;
     }
 
-    /// @dev Index price; reverts if the oracle reverts, returns zero or, when
-    ///      `requireFresh`, returns a stale price.
-    function _price(uint32 marketId, bool requireFresh) private view returns (uint256 price) {
+    /// @dev Fresh index price; reverts if the oracle reverts or returns a zero or stale price.
+    function _price(uint32 marketId) private view returns (uint256 price) {
         uint256 updatedAt;
         (price, updatedAt) = oracle.getPrice(marketId);
         if (price == 0) revert InvalidPrice(marketId);
-        if (requireFresh && !_isFresh(updatedAt)) revert StalePrice(marketId);
+        if (!_isFresh(updatedAt)) revert StalePrice(marketId);
+    }
+
+    /// @dev Reverts unless |price - index| <= index * maxPriceDeviationBps / 1e4.
+    function _requireInBand(uint32 marketId, uint256 price) private view {
+        uint256 index = _price(marketId);
+        uint256 diff = price > index ? price - index : index - price;
+        if (diff * BPS > index * maxPriceDeviationBps) revert PriceOutOfBand(price, index);
     }
 
     /// @dev Non-reverting variant: `usable` is false if the oracle call fails or the
@@ -666,20 +753,20 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
     /// @inheritdoc IExchange
     /// @dev Reverts if the account has a position in a market whose price is stale.
     function accountValue(address trader) external view returns (int256) {
-        return _health(trader, true).value;
+        return _health(trader).value;
     }
 
     /// @inheritdoc IExchange
     /// @dev Reverts if the account has a position in a market whose price is stale.
     function marginRequirement(address trader) external view returns (uint256 initial, uint256 maintenance) {
-        Health memory h = _health(trader, true);
+        Health memory h = _health(trader);
         return (h.initial, h.maintenance);
     }
 
     /// @inheritdoc IExchange
     /// @dev Reverts if the account has a position in a market whose price is stale.
     function freeCollateral(address trader) external view returns (uint256) {
-        Health memory h = _health(trader, true);
+        Health memory h = _health(trader);
         int256 free = h.value - h.initial.toInt256();
         return free > 0 ? uint256(free) : 0;
     }
@@ -687,7 +774,7 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
     /// @inheritdoc IExchange
     /// @dev Reverts if the account has a position in a market whose price is stale.
     function isLiquidatable(address trader) external view returns (bool) {
-        Health memory h = _health(trader, true);
+        Health memory h = _health(trader);
         return h.value < h.maintenance.toInt256();
     }
 
@@ -695,7 +782,7 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
     /// @dev Reverts if the price is stale.
     function indexPrice(uint32 marketId) external view returns (uint256) {
         _requireMarket(marketId);
-        return _price(marketId, true);
+        return _price(marketId);
     }
 
     /// @inheritdoc IExchange

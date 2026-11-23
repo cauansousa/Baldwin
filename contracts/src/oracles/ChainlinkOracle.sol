@@ -54,8 +54,9 @@ contract ChainlinkOracle is IOracle, Ownable {
 
         int256 answer;
         (, answer, , updatedAt, ) = feed.aggregator.latestRoundData();
-        // updatedAt == 0 means the round is not complete.
-        if (answer <= 0 || updatedAt == 0) revert InvalidAnswer(marketId);
+        // updatedAt == 0 means the round is not complete; a timestamp in the future
+        // cannot be a real observation.
+        if (answer <= 0 || updatedAt == 0 || updatedAt > block.timestamp) revert InvalidAnswer(marketId);
 
         if (feed.decimals <= 18) {
             priceWad = uint256(answer) * 10 ** (18 - feed.decimals);
