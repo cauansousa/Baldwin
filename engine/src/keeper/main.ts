@@ -28,6 +28,7 @@ async function main(): Promise<void> {
   const keeper = new Keeper({
     chain: new ViemKeeperChain(client, wallet, account, deployment.exchange),
     marketIds: deployment.markets.map((m) => m.marketId),
+    self: account.address,
     startBlock: cfg.startBlock,
     fundingIntervalSec: cfg.fundingIntervalSec,
     logger: log,

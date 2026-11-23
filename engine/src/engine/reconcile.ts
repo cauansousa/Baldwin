@@ -1,3 +1,4 @@
+import { decodeErrorResult, isAddressEqual, parseAbi } from "viem";
 import { BPS, WAD } from "../../../shared/src/index.ts";
 import type { ChainReader } from "../chain/types.ts";
 import type { MarketConfig, Match, Order, Hex } from "../types.ts";
@@ -29,9 +30,41 @@ export interface Verdict {
 export const UNATTRIBUTED: Verdict = { maker: { atFault: false }, taker: { atFault: false } };
 
 /**
- * Work out which side(s) made a match fail on-chain, from contract views. The raw
- * revert data is deliberately not interpreted: the checks below hold for any
- * implementation of IExchange.
+ * Custom errors of the current Exchange implementation that name the trader at fault.
+ * They are not part of IExchange, so this is strictly opportunistic: revert data that
+ * does not decode to one of these falls through to the view-based diagnosis.
+ */
+const TRADER_ERRORS = parseAbi([
+  "error InsufficientMargin(address trader)",
+  "error NegativeAccountValue(address trader)",
+  "error ReduceOnlyViolated(address trader)",
+]);
+
+const TRADER_ERROR_TEXT: Record<(typeof TRADER_ERRORS)[number]["name"], string> = {
+  InsufficientMargin: "insufficient margin",
+  NegativeAccountValue: "fill would leave the account with negative value",
+  ReduceOnlyViolated: "reduce-only order would not reduce the position",
+};
+
+/** Exact attribution from the revert data, when it names one of the two traders. */
+export function attributeFromRevert(match: Match, reason: Hex): Verdict | null {
+  let err;
+  try {
+    err = decodeErrorResult({ abi: TRADER_ERRORS, data: reason });
+  } catch {
+    return null;
+  }
+  const trader = err.args[0];
+  const text = TRADER_ERROR_TEXT[err.errorName];
+  // The contract stops at the first failing check, so the other side is not implicated.
+  if (isAddressEqual(trader, match.maker.trader)) return { maker: { atFault: true, reason: text }, taker: { atFault: false } };
+  if (isAddressEqual(trader, match.taker.trader)) return { maker: { atFault: false }, taker: { atFault: true, reason: text } };
+  return null;
+}
+
+/**
+ * Work out which side(s) made a match fail on-chain, from contract views. Used when
+ * the revert data does not name a trader; these checks hold for any IExchange.
  *
  * Definitive: nonce cancelled on-chain, order has less unfilled size on-chain than
  * the fill, order expired by block time.

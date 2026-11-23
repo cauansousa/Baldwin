@@ -1,8 +1,11 @@
+import { encodeErrorResult, parseAbi } from "viem";
 import { describe, expect, it } from "vitest";
 import { EngineError, type Trade } from "../src/engine/engine.ts";
 import { hashOrder } from "../src/signing.ts";
 import { BatchRevertedError } from "../src/settlement/types.ts";
 import { alice, bob, carol, DOMAIN, harness, makeOrder, MARKET, signCancel, signOrder, wad } from "./helpers.ts";
+
+const REASON = "0xdeadbeef";
 
 const code = async (p: Promise<unknown>) => {
   try {
@@ -264,8 +267,6 @@ describe("matching and settlement", () => {
 });
 
 describe("on-chain failure reconciliation", () => {
-  const REASON = "0xdeadbeef";
-
   it("maker at fault: maker is removed for good, the innocent taker gets its size back and trades on", async () => {
     const h = harness({ withChain: true });
     const bad = await h.place(alice, false, 100, 1);
@@ -406,6 +407,24 @@ describe("on-chain failure reconciliation", () => {
     await h.engine.idle();
     expect(h.engine.getOrder(taker.orderHash)!.status).toBe("rejected");
     expect(h.engine.getOrder(maker.orderHash)).toMatchObject({ status: "open", remaining: wad(1) });
+  });
+
+  it("revert data naming a trader decides the fault exactly, even against the view-based estimate", async () => {
+    const h = harness({ withChain: true }); // chain views say everybody is healthy
+    const maker = await h.place(alice, false, 100, 1);
+    const blame = (trader: `0x${string}`) =>
+      encodeErrorResult({ abi: parseAbi(["error InsufficientMargin(address trader)"]), args: [trader] });
+    h.settler.failWhen = () => blame(bob.address);
+    const taker = await h.place(bob, true, 100, 1);
+    await h.engine.idle();
+    expect(h.engine.getOrder(taker.orderHash)).toMatchObject({ status: "rejected", reason: expect.stringMatching(/insufficient margin/) });
+    expect(h.engine.getOrder(maker.orderHash)).toMatchObject({ status: "open", remaining: wad(1) });
+
+    h.settler.failWhen = () => blame(alice.address);
+    const taker2 = await h.place(carol, true, 100, 1);
+    await h.engine.idle();
+    expect(h.engine.getOrder(maker.orderHash)!.status).toBe("rejected");
+    expect(h.engine.getOrder(taker2.orderHash)).toMatchObject({ status: "open", remaining: wad(1) });
   });
 
   it("both sides at fault: both removed", async () => {
@@ -595,6 +614,9 @@ describe("submission failures", () => {
       expect(v.filled + v.remaining).toBeLessThanOrEqual(v.order.size);
       if (v.status === "open" || v.status === "partially_filled") expect(v.filled + v.remaining).toBe(v.order.size);
     }
+    expect(h.engine.settlementStatus().failed).toBeGreaterThan(3);
+    expect(h.engine.settlementStatus().settled).toBeGreaterThan(3);
+    expect(h.settler.calls.length).toBe(new Set(h.settler.calls.map((b) => b.id)).size); // no retries
     const book = h.engine.getOrderBook(1, 100);
     if (book.bids[0] && book.asks[0]) expect(book.bids[0].price < book.asks[0].price).toBe(true);
     for (const m of h.settler.settled) expect(m.maker.trader).not.toBe(m.taker.trader);

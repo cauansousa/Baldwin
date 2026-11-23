@@ -5,7 +5,7 @@ import type { ChainReader } from "../chain/types.ts";
 import { hashOrder, verifyCancelSignature, verifyOrderSignature, type Domain } from "../signing.ts";
 import { BatchRevertedError, type Batch, type MatchResult, type Settler } from "../settlement/types.ts";
 import { errMessage, silentLogger, type Address, type Hex, type Logger, type MarketConfig, type Match, type Order } from "../types.ts";
-import { classifyFailure, isReducing, notionalUsdc, UNATTRIBUTED, type Verdict } from "./reconcile.ts";
+import { attributeFromRevert, classifyFailure, isReducing, notionalUsdc, UNATTRIBUTED, type Verdict } from "./reconcile.ts";
 
 export type OrderStatus =
   /** Resting, nothing matched yet. */
@@ -626,9 +626,8 @@ export class Engine extends EventEmitter<EngineEvents> {
           // Definitively not settled, repeatedly: give up on these matches.
           this.log.error("batch reverted repeatedly; failing its matches", { batch: batch.id, error: this.lastError });
           results = batch.matches.map(() => ({ status: "failed", txHash: e.txHash, reason: "0x" }) as const);
-          const verdicts = new Map(batch.matches.map((_, i) => [i, UNATTRIBUTED]));
-          this.applyResults(batch, results, verdicts);
           this.current = null;
+          this.applyResults(batch, results, new Map());
           reverts = 0;
           this.stalled = false;
           continue;
@@ -642,10 +641,12 @@ export class Engine extends EventEmitter<EngineEvents> {
       }
       const verdicts = new Map<number, Verdict>();
       for (let i = 0; i < results.length; i++) {
-        if (results[i]!.status === "failed") verdicts.set(i, await this.classify(batch.matches[i]!));
+        const r = results[i]!;
+        if (r.status === "failed") verdicts.set(i, await this.classify(batch.matches[i]!, r.reason));
       }
-      this.applyResults(batch, results, verdicts);
+      // The outcome is final from here on: the batch must never be handed to the settler again.
       this.current = null;
+      this.applyResults(batch, results, verdicts);
       reverts = 0;
       this.stalled = false;
       this.lastError = null;
@@ -665,7 +666,9 @@ export class Engine extends EventEmitter<EngineEvents> {
     });
   }
 
-  private async classify(match: Match): Promise<Verdict> {
+  private async classify(match: Match, reason: Hex): Promise<Verdict> {
+    const exact = attributeFromRevert(match, reason);
+    if (exact) return exact;
     if (!this.chain) return UNATTRIBUTED;
     try {
       return await classifyFailure(match, this.markets.get(match.marketId)!, this.chain);
@@ -680,10 +683,15 @@ export class Engine extends EventEmitter<EngineEvents> {
     const touched = new Set<number>();
     batch.matches.forEach((m, i) => {
       const r = results[i]!;
-      if (r.status === "settled") this.applySettled(m, r.txHash);
-      else {
-        this.applyFailed(m, verdicts.get(i) ?? UNATTRIBUTED, r.reason);
-        touched.add(m.marketId);
+      try {
+        if (r.status === "settled") this.applySettled(m, r.txHash);
+        else {
+          touched.add(m.marketId);
+          this.applyFailed(m, verdicts.get(i) ?? UNATTRIBUTED, r.reason);
+        }
+      } catch (e) {
+        // A listener or an internal invariant threw. The on-chain outcome stands; keep going.
+        this.log.error("error while applying a settlement result", { batch: batch.id, match: m.id, error: errMessage(e) });
       }
     });
     for (const marketId of touched) this.emit("book", marketId);

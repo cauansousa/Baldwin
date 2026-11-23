@@ -1,4 +1,4 @@
-import { maxUint256, type Account, type PublicClient, type WalletClient } from "viem";
+import { type Account, type PublicClient, type WalletClient } from "viem";
 import { exchangeAbi } from "../abi.ts";
 import type { Address } from "../types.ts";
 import type { KeeperChain } from "./keeper.ts";
@@ -39,13 +39,26 @@ export class ViemKeeperChain implements KeeperChain {
     return this.client.readContract({ address: this.exchange, abi: exchangeAbi, functionName: "isLiquidatable", args: [trader] });
   }
 
-  async liquidate(trader: Address, marketId: number): Promise<void> {
+  ownFreeCollateral(): Promise<bigint> {
+    return this.client.readContract({ address: this.exchange, abi: exchangeAbi, functionName: "freeCollateral", args: [this.account.address] });
+  }
+
+  indexPrice(marketId: number): Promise<bigint> {
+    return this.client.readContract({ address: this.exchange, abi: exchangeAbi, functionName: "indexPrice", args: [marketId] });
+  }
+
+  async initialMarginBps(marketId: number): Promise<bigint> {
+    const m = await this.client.readContract({ address: this.exchange, abi: exchangeAbi, functionName: "getMarket", args: [marketId] });
+    return BigInt(m.initialMarginBps);
+  }
+
+  async liquidate(trader: Address, marketId: number, maxSize: bigint): Promise<void> {
     const { request } = await this.client.simulateContract({
       account: this.account,
       address: this.exchange,
       abi: exchangeAbi,
       functionName: "liquidate",
-      args: [trader, marketId, maxUint256],
+      args: [trader, marketId, maxSize],
     });
     await this.mined(await this.wallet.writeContract(request));
   }
