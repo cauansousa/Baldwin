@@ -24,7 +24,8 @@ account has no ETH.
 
 The keeper account must hold collateral in the Exchange: the liquidator takes over the
 liquidated position and has to margin it. At start-up the keeper warns if its free collateral
-is below `KEEPER_MIN_FREE_COLLATERAL`. It does not unwind what it takes over.
+is below `KEEPER_MIN_FREE_COLLATERAL`. What it takes over it closes again through the engine
+(see "Keeper").
 
 `scripts/e2e-local.ts` runs a maker/taker round trip against a local node and a running engine.
 
@@ -64,8 +65,15 @@ As in `docs/SPEC.md`. Every bigint is a decimal string.
   Clients should always send `trader` and `nonce`.
 - `GET /orders?trader=0x…` → orders that rest or have matches awaiting settlement:
   `{ orderHash, order, status, remaining, pending, filled, postOnly, ioc, reason?, createdAt }`.
-- `GET /markets`, `GET /orderbook/:marketId?depth=` (default 50, max 500) → `{ marketId, bids: [{price,size}], asks }`,
-  `GET /trades/:marketId?limit=` (newest first), `GET /health`, `GET /metrics`.
+- `GET /markets` → per market: parameters (`marketId`, `symbol`, `active`, `minOrderSize`,
+  `maxOpenInterest`, margin and fee bps), book top (`bestBid`, `bestAsk`, `lastPrice`) and figures
+  read from the contract so that clients need fewer chain reads: `indexPrice`, `markTwap`,
+  `currentFundingRate` (WAD per hour, positive = longs pay), `lastFundingTime`, `nextFundingTime`
+  (unix seconds), `openInterestLong`, `openInterestShort`. Each of these is `null` when its view
+  cannot be read or the index is unavailable; they are refreshed every ~10 s.
+- `GET /orderbook/:marketId?depth=` (default 50, max 500) → `{ marketId, bids: [{price,size}], asks }`,
+  `GET /trades/:marketId?limit=` (newest first), `GET /health` (also carries the exchange-wide
+  `insuranceFund` and `totalBadDebt`, USDC units or `null`), `GET /metrics`.
 - `WS /ws`: `{ op: "subscribe"|"unsubscribe", channel: "orderbook"|"trades", marketId }`, `{ op: "ping" }`.
   `orderbook` sends `{ type: "snapshot", channel, marketId, data: { bids, asks } }` on subscribe and after
   every change (full top-50 book each time). `trades` sends a `snapshot` of recent trades, then
@@ -123,11 +131,12 @@ submissions may take at most `INTAKE_TIMEOUT_MS` (8 s), after which the order is
 
 ### Health
 
-`GET /health` → `{ ok, recovering, warnings[], settlement, chain, operator, operatorBalanceWei,
-operatorBalanceEth, confirmations, cancelWatcherBlock, … }`. `ok` is false while the engine is
+`GET /health` → `{ ok, recovering, insuranceFund, totalBadDebt, warnings[], settlement, chain,
+operator, operatorBalanceWei, operatorBalanceEth, confirmations, cancelWatcherBlock, … }`. `ok` is false while the engine is
 recovering, settlement is stalled or the store is broken. `warnings` lists: recovering, a low
 operator balance, a stalled settlement, the operator being unable to pay for a settlement
-transaction, a transaction stuck at the fee cap, a broken store, a paused exchange, halted markets.
+transaction, a transaction stuck at the fee cap, a broken store, a paused exchange, halted markets,
+and recorded bad debt (`totalBadDebt > 0`; a warning, `ok` stays true).
 `chain` is what the engine currently believes: pause flag and, per market, index price and price band.
 
 ## Matching rules
@@ -317,7 +326,7 @@ chain you run on.
   `baldwin_batch_errors_total`, `baldwin_batch_latency_seconds` (histogram),
   `baldwin_settlement_queue_depth`, `baldwin_settlement_stalled`, `baldwin_resting_orders`,
   `baldwin_exchange_paused`, `baldwin_settler_insufficient_funds`, `baldwin_settler_fee_cap_reached`,
-  `baldwin_store_broken`, `baldwin_recovering`, `baldwin_operator_balance_eth`, `baldwin_rpc_errors_total{method}`,
+  `baldwin_store_broken`, `baldwin_recovering`, `baldwin_insurance_fund_usdc`, `baldwin_total_bad_debt_usdc`, `baldwin_operator_balance_eth`, `baldwin_rpc_errors_total{method}`,
   `baldwin_cancel_watcher_block`. The endpoint is not authenticated: expose it to your
   monitoring network only.
 - **Shutdown**: on SIGTERM/SIGINT the engine refuses new orders (503 `SHUTTING_DOWN`; cancels and
@@ -326,6 +335,69 @@ chain you run on.
   A second signal, or `SHUTDOWN_TIMEOUT_MS` + 10 s, ends the process in any case (the store is
   closed first). Anything unresolved is picked up by the next start.
 - Unexpected errors in a request (HTTP 500) are written to the JSON log with route and a short stack.
+
+## Keeper
+
+A separate process (`npm run keeper`, its own key). Each tick it reads new `Fill`/`Liquidation`
+events, liquidates accounts below maintenance margin, updates funding when a full interval has
+passed on-chain, and unwinds its own inventory.
+
+### Inventory unwind
+
+A liquidator takes the liquidated position over, so the keeper ends up holding positions. With
+`KEEPER_UNWIND=true` (default) it closes them through the engine, as an ordinary trader:
+
+- Per market in which the keeper holds a position it keeps **one reduce-only order** resting in
+  the engine (signed with the keeper key, sent to `ENGINE_URL` over the public REST API): a sell
+  for a long, a buy for a short, sized to the whole position, priced `KEEPER_UNWIND_OFFSET_BPS`
+  (10) **through** the index — a sell below it, a buy above — which is attractive to takers and
+  well inside the price band (the offset is capped at half the band). It expires after
+  `KEEPER_UNWIND_EXPIRY_SEC` (300).
+- The on-chain position is read before every decision. The order is left alone while the
+  position is unchanged, the index is within `KEEPER_UNWIND_REPRICE_BPS` (20) of where it was
+  priced and it has two minutes to live; otherwise it is cancelled and, **only after the engine
+  confirmed the cancel**, replaced. No position: no order.
+- It cannot increase the keeper's exposure: orders are reduce-only (the contract refuses a
+  reduce-only fill that would not reduce) and never larger than the position just read. With
+  one order per market it cannot trip the engine's reduce-only cap or self-trade rule by itself.
+- Engine answers follow the `outcome` contract: `not_applied` (halted, paused for non-reduce-only,
+  recovering, rate-limited, shutting down, cap exceeded while a fill is still settling) → try
+  again next tick; `unknown` or no answer (engine down) → the **same signed order** is sent again
+  until there is a definite answer or it has expired.
+- Before the keeper takes over another position in a market it withdraws its order there, since
+  the position the order was sized for is about to change (a reduce-only order that no longer
+  reduces would fail on-chain and count as a fault of the keeper in the engine). If the engine
+  cannot be reached the liquidation goes ahead regardless.
+- On SIGTERM it cancels what it has resting (by nonce, so also an order whose fate was unknown).
+- Not handled: a position smaller than the market's minimum order size (the contract rejects
+  such orders; reported in the status and left), and a fill that was already matched when a
+  liquidation changed the position (it can fail on-chain once).
+
+### Observability
+
+Every ~5 minutes a `keeper status` JSON line is logged. With `KEEPER_PORT` set, the keeper also
+serves `GET /health` (200/503; `ok` is false when no tick has run for a while) and `GET /metrics`:
+
+`{ ok, keeper, freeCollateral, trackedAccounts, eventCursor, eventsCaughtUp, liquidations,
+liquidationFailures, lastLiquidation, positionsInBackoff, lastTickAt, unwind: [{ marketId,
+position, order, note }] }`
+
+Metrics (prefix `baldwin_keeper_`): `tracked_accounts`, `liquidations`, `liquidation_failures`,
+`last_liquidation_timestamp`, `positions_in_backoff`, `event_cursor_block`, `last_tick_timestamp`,
+`free_collateral_usdc`, `position{market}`, `unwind_order_working{market}`, `rpc_errors_total{method}`.
+
+## Soak test
+
+`scripts/soak-local.ts` runs N simulated traders against a local node and a running engine
+through the real REST API (random orders around the index, IOC and post-only, cancels), retries
+requests without a definite answer with the identical signed order, and at the end checks:
+every accepted order's engine state against on-chain `filledSize` (via idempotent
+resubmission), no order overfilled, `filledSize` equal to the sum of `Fill` events, every trade
+the engine reported present on-chain, positions netting to zero and balanced open interest per
+market, an uncrossed book, and `/health` ok with an empty settlement queue. The engine can be
+killed and restarted while it runs. See the header of the script for how to start the engine
+for it (rate limits raised). A local Hardhat node advances its clock by a second per block, so
+under load its time runs ahead of the host's; the engine follows chain time for expiry.
 
 ## Running on testnet (Arbitrum Sepolia)
 
@@ -355,8 +427,24 @@ chain you run on.
    RestartSec=2
    TimeoutStopSec=45                     # more than SHUTDOWN_TIMEOUT_MS
    ```
-   (pm2 or a container with a restart policy work the same way; `stop_grace_period` /
-   `kill_timeout` must exceed `SHUTDOWN_TIMEOUT_MS`.) Run exactly **one** engine per operator
+   The keeper unit additionally needs `ENGINE_URL` (the engine's address as seen from the
+   keeper) and, for monitoring, `KEEPER_PORT`. (pm2 works the same way; `kill_timeout` must
+   exceed `SHUTDOWN_TIMEOUT_MS`.)
+
+   **Docker** (alternative): `engine/Dockerfile` builds one image for both processes
+   (multi-stage, `node:22-slim`, runs as the unprivileged `node` user, state in the `/data`
+   volume, deployment files mounted read-only at `/deployments`), and
+   `engine/docker-compose.testnet.yml` runs engine and keeper from `.env.testnet`:
+   ```sh
+   cd engine && cp .env.testnet.example .env.testnet    # fill in
+   docker compose -f docker-compose.testnet.yml up -d --build
+   ```
+   The build context is the repository root (`docker build -f engine/Dockerfile .`). **These two
+   files were written without a Docker daemon available: the image has never been built or run.**
+   Only `docker compose config` (syntax and variable resolution) and the container's start
+   command (`node --import tsx src/main.ts`, run directly on the host) were checked. Build it
+   once and watch the first start before relying on it; the systemd units above are the path
+   that was actually exercised (as plain processes). Run exactly **one** engine per operator
    key and per store file. Put a TLS-terminating reverse proxy in front (it must pass WebSocket
    upgrades on `/ws`; set `TRUST_PROXY=true`), and do not expose `/metrics` publicly.
 4. Monitor:
@@ -460,6 +548,9 @@ chain you run on.
   two valid signatures, but it can settle a signed order its trader cancelled only off-chain
   (see "Dead nonces"). Traders can always cancel on-chain.
 - **Optimistic fills can be undone.** A `pending` fill is a promise the chain may refuse.
+- Expiry is judged by the later of the host clock and the latest block's timestamp (re-read every
+  `CHAIN_REFRESH_MS`, lead capped at 15 minutes). A chain whose clock jumps ahead between two
+  reads can still make an order expire on-chain first; that is a failed match without blame.
 - **The band follows the engine's last index read** (`CHAIN_REFRESH_MS`). Between an oracle move
   and the next refresh, matches can still fail with `PriceOutOfBand`; that costs a failed match,
   no strike. Orders pushed onto the wrong side of the band by an index move are cancelled, not
@@ -497,6 +588,7 @@ chain you run on.
   known accounts are already being checked), forgets a position only after it read as zero on
   three consecutive ticks, backs off (2, 4, … 64 ticks) on a position it could not liquidate,
   uses `isLiquidatableIn` when another market's feed is down, calls `updateFunding` only when
-  the latest block's timestamp is a full interval past `lastFundingTime`, does not hedge or unwind positions it takes over,
+  the latest block's timestamp is a full interval past `lastFundingTime`, closes positions it takes over only through resting reduce-only orders (no hedging elsewhere, no
+  market orders; a position below the minimum order size stays),
   does not check profitability, exposes no metrics endpoint (logs only), and sends its
   transactions without the engine's nonce/fee-bump machinery.

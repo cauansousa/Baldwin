@@ -786,9 +786,12 @@ export class Engine extends EventEmitter<EngineEvents> {
         read(chain.lastFundingTime(marketId)),
         read(chain.openInterest(marketId)),
       ]);
+      // Both views return 0 instead of reverting while the index is unavailable: 0 is
+      // then "unknown", not a price (and not a rate anyone should display).
+      const indexDown = st.index === null;
       st.stats = {
-        markTwap,
-        currentFundingRate,
+        markTwap: markTwap === 0n || indexDown ? null : markTwap,
+        currentFundingRate: indexDown ? null : currentFundingRate,
         lastFundingTime,
         nextFundingTime: lastFundingTime === null ? null : lastFundingTime + this.fundingInterval,
         openInterestLong: oi?.longs ?? null,

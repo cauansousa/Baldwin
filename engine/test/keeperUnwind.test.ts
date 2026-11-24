@@ -398,6 +398,24 @@ describe("funding, open interest, insurance fund and bad debt in the API", () =>
     await app.close();
   });
 
+  it("markTwap and the funding rate are reported as unknown (null) while the index is unavailable: the contract returns 0 then", async () => {
+    const h = harness({ withChain: true, statsRefreshMs: 0 });
+    h.chain.twap = wad(101);
+    h.chain.fundingRate = 5n;
+    await h.engine.refreshChainState();
+    expect(h.engine.getMarkets()[0]).toMatchObject({ markTwap: wad(101), currentFundingRate: 5n });
+    h.chain.indexFails = true;
+    h.chain.twap = 0n;
+    h.chain.fundingRate = 0n;
+    await h.engine.refreshChainState();
+    expect(h.engine.getMarkets()[0]).toMatchObject({ indexPrice: null, markTwap: null, currentFundingRate: null });
+    // a genuine zero rate with a live index stays a zero
+    h.chain.indexFails = false;
+    h.chain.twap = wad(100);
+    await h.engine.refreshChainState();
+    expect(h.engine.getMarkets()[0]).toMatchObject({ markTwap: wad(100), currentFundingRate: 0n });
+  });
+
   it("without a chain reader the fields exist and are null", async () => {
     const h = harness();
     expect(h.engine.getMarkets()[0]).toMatchObject({ indexPrice: null, markTwap: null, currentFundingRate: null, nextFundingTime: null, openInterestLong: null });
