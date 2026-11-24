@@ -84,6 +84,10 @@ interface IExchange {
         uint256 penalty,
         uint256 badDebt
     );
+    /// @dev `badDebtRepaid` is the part of `amount` that cancelled recorded bad debt; the rest
+    ///      went to the insurance fund.
+    event InsuranceDeposit(address indexed from, uint256 amount, uint256 badDebtRepaid);
+    event GuardianUpdated(address indexed guardian);
     event OperatorUpdated(address indexed operator, bool allowed);
     event Paused(bool paused);
 
@@ -95,6 +99,10 @@ interface IExchange {
     /// @notice Bulk on-chain cancel: every order of the caller with nonce < newMinValidNonce
     ///         becomes invalid. Must be strictly greater than the current value.
     function cancelAllOrders(uint256 newMinValidNonce) external;
+
+    // --------------------------------------------------------- permissionless funding of the fund
+    /// @notice Transfer USDC into the insurance fund. Recorded bad debt is repaid first.
+    function depositInsurance(uint256 amount) external;
 
     // ------------------------------------------------------------- operator
     /// @notice Settle a batch. A failing match must NOT revert the batch: it emits
@@ -122,8 +130,17 @@ interface IExchange {
     function freeCollateral(address trader) external view returns (uint256);
     function isLiquidatable(address trader) external view returns (bool);
     function indexPrice(uint32 marketId) external view returns (uint256);
-    /// @notice Last fill price, used with the index price for funding.
+    /// @notice Last fill price. Informational; funding uses markTwap.
     function markPrice(uint32 marketId) external view returns (uint256);
+    /// @notice Time-weighted average fill price over the current funding period so far,
+    ///         or the index price if the market has not traded in it.
+    function markTwap(uint32 marketId) external view returns (uint256);
+    /// @notice Funding rate the current period would apply if accrued now, in WAD per hour
+    ///         (1e18 = 100%); positive means longs pay shorts. Zero if the index is unavailable.
+    function currentFundingRate(uint32 marketId) external view returns (int256);
+    /// @notice Account allowed to pause (but not unpause) the exchange.
+    function guardian() external view returns (address);
+    function totalBadDebt() external view returns (uint256);
     function cumulativeFunding(uint32 marketId) external view returns (int256);
     function openInterest(uint32 marketId) external view returns (uint256 longs, uint256 shorts);
     function insuranceFund() external view returns (uint256);

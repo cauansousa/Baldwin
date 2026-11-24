@@ -35,7 +35,8 @@ The source of truth for the on-chain interface is
   everything signed before a point in time. Only on-chain cancels bind the contract.
 - Fees: maker/taker bps of notional, charged in USDC, paid to the fee recipient.
 - Funding: hourly; rate = clamp((mark − index) / index, ±cap), longs pay shorts when
-  positive. Mark = last fill price. Accrued through a cumulative index, settled into
+  positive. Mark = time-weighted average fill price over the funding period (the index
+  if the market did not trade), so one fill cannot set the rate. Accrued through a cumulative index, settled into
   balance whenever a position is touched.
 - Liquidation: anyone may take over a position of an account below maintenance margin at
   the index price. The liquidator becomes the counterparty, so it needs its own collateral
@@ -45,6 +46,10 @@ The source of truth for the on-chain interface is
   remainder is recorded as bad debt (event) — socialized loss/ADL is out of MVP scope.
 - Oracle: `IOracle.getPrice(marketId) → (priceWad, updatedAt)`; stale prices revert.
   Chainlink adapter for production, mock for tests/local.
+- Insurance fund: anyone may deposit USDC into it (`depositInsurance`); a deposit repays
+  recorded bad debt first. There is no withdrawal.
+- Guardian: an account that can pause but not unpause, so pausing stays fast when the owner
+  sits behind a timelock.
 - Admin: owner adds/updates markets, sets operators, fee recipient, pause. Pause blocks
   settlement of position-increasing matches; deposits, withdrawals, cancels and
   liquidations stay open.
