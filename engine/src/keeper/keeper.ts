@@ -1,5 +1,7 @@
 import { BPS, WAD } from "../../../shared/src/index.ts";
+import { LogPoller } from "../chain/logPoller.ts";
 import { errMessage, silentLogger, type Address, type Logger } from "../types.ts";
+import type { KeeperStateStore } from "./state.ts";
 
 /** Chain access the keeper needs. Injectable so the logic can be tested with a fake. */
 export interface KeeperChain {
@@ -27,8 +29,12 @@ export interface KeeperChain {
 export interface KeeperOptions {
   chain: KeeperChain;
   marketIds: number[];
-  /** First block to scan for events. */
+  /** First block to scan for events when no cursor is stored. Default 0. */
   startBlock?: bigint;
+  /** Where the event cursor and the tracked accounts are kept across restarts. */
+  state?: KeeperStateStore;
+  /** Called on every failed chain query (metrics). */
+  onRpcError?: (e: unknown) => void;
   /** Max block span per log query. Default 2000. */
   maxBlockRange?: bigint;
   /** The keeper's own address: never liquidated by itself. */
@@ -44,7 +50,9 @@ export interface KeeperOptions {
  * Liquidation + funding keeper.
  *
  * Each `tick`:
- *  1. reads new Fill/Liquidation events and records which accounts hold positions;
+ *  1. reads new Fill/Liquidation events (block-range polling with a stored cursor, see
+ *     LogPoller) and records which accounts hold positions; cursor and accounts are
+ *     saved together, so a restart continues without rescanning or forgetting anyone;
  *  2. for every tracked account, drops closed positions, and if `isLiquidatable`
  *     calls `liquidate` on its open positions until the account is healthy again.
  *     The whole position is tried first. In the current Exchange the liquidator takes
@@ -57,7 +65,9 @@ export interface KeeperOptions {
 export class Keeper {
   /** trader (lower-case) -> markets with a possibly open position. */
   private readonly tracked = new Map<string, { trader: Address; markets: Set<number> }>();
-  private nextBlock: bigint;
+  private readonly poller: LogPoller<{ trader: Address; marketId: number }>;
+  private readonly state: KeeperStateStore | undefined;
+  private cursor: bigint | undefined;
   private readonly chain: KeeperChain;
   private readonly marketIds: number[];
   private readonly maxRange: bigint;
@@ -65,13 +75,42 @@ export class Keeper {
   private readonly now: () => number;
   private readonly log: Logger;
   private readonly self: string | undefined;
+  private readonly onRpcError: ((e: unknown) => void) | undefined;
 
   constructor(opts: KeeperOptions) {
     this.chain = opts.chain;
     this.self = opts.self?.toLowerCase();
+    this.onRpcError = opts.onRpcError;
     this.marketIds = opts.marketIds;
-    this.nextBlock = opts.startBlock ?? 0n;
     this.maxRange = opts.maxBlockRange ?? 2000n;
+    this.state = opts.state;
+    const saved = this.state?.load();
+    if (saved) {
+      this.cursor = saved.cursor;
+      for (const t of saved.tracked) this.tracked.set(t.trader.toLowerCase(), { trader: t.trader, markets: new Set(t.markets) });
+    }
+    this.poller = new LogPoller({
+      name: "keeper events",
+      head: () => this.chain.blockNumber(),
+      fetch: (from, to) => this.chain.touchedPositions(from, to),
+      handle: (events) => {
+        for (const { trader, marketId } of events) {
+          const key = trader.toLowerCase();
+          let entry = this.tracked.get(key);
+          if (!entry) this.tracked.set(key, (entry = { trader, markets: new Set() }));
+          entry.markets.add(marketId);
+        }
+      },
+      loadCursor: () => this.cursor,
+      saveCursor: (b) => {
+        this.cursor = b;
+        this.save();
+      },
+      startBlock: opts.startBlock ?? 0n,
+      maxRange: this.maxRange,
+      logger: opts.logger,
+      onError: opts.onRpcError,
+    });
     this.fundingIntervalSec = opts.fundingIntervalSec ?? 3600;
     this.now = opts.now ?? (() => Math.floor(Date.now() / 1000));
     this.log = opts.logger ?? silentLogger;
@@ -91,25 +130,33 @@ export class Keeper {
     try {
       await fn();
     } catch (e) {
+      this.onRpcError?.(e);
       this.log.error(`keeper ${name} failed`, { error: errMessage(e) });
     }
   }
 
-  private async syncEvents(): Promise<void> {
-    const head = await this.chain.blockNumber();
-    while (this.nextBlock <= head) {
-      const to = this.nextBlock + this.maxRange - 1n < head ? this.nextBlock + this.maxRange - 1n : head;
-      for (const { trader, marketId } of await this.chain.touchedPositions(this.nextBlock, to)) {
-        const key = trader.toLowerCase();
-        let entry = this.tracked.get(key);
-        if (!entry) this.tracked.set(key, (entry = { trader, markets: new Set() }));
-        entry.markets.add(marketId);
-      }
-      this.nextBlock = to + 1n;
-    }
+  private save(): void {
+    this.state?.save({ cursor: this.cursor, tracked: [...this.tracked.values()].map((t) => ({ trader: t.trader, markets: [...t.markets] })) });
+  }
+
+  private syncEvents(): Promise<void> {
+    return this.poller.poll();
   }
 
   private async checkLiquidations(): Promise<void> {
+    const before = this.trackedSignature();
+    try {
+      await this.checkAll();
+    } finally {
+      if (this.trackedSignature() !== before) this.save();
+    }
+  }
+
+  private trackedSignature(): string {
+    return [...this.tracked].map(([k, v]) => `${k}:${[...v.markets].join(",")}`).join("|");
+  }
+
+  private async checkAll(): Promise<void> {
     for (const [key, entry] of this.tracked) {
       if (key === this.self) continue;
       try {

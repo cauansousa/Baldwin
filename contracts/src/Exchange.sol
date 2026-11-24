@@ -4,6 +4,7 @@ pragma solidity 0.8.26;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
@@ -29,7 +30,7 @@ import {IOracle} from "./interfaces/IOracle.sol";
 ///    and margin requirements are rounded UP, funding is rounded so that the payer pays
 ///    more / the receiver gets less. Rounding dust stays in the contract unassigned.
 ///    Consequence: `USDC held + totalBadDebt >= sum(accountValue) + insuranceFund`.
-contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
+contract Exchange is IExchange, Ownable2Step, ReentrancyGuard, EIP712 {
     using SafeERC20 for IERC20;
     using SafeCast for uint256;
     using SafeCast for int256;
@@ -52,6 +53,10 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
     uint256 public constant LIQUIDATOR_SHARE_BPS = 5_000;
     /// @notice Upper bound for maker and taker fees.
     uint256 public constant MAX_FEE_BPS = 100;
+    /// @notice Orders must expire, and at most this far in the future. Together with
+    ///         `cancelAllOrders` this bounds how long a signature the trader has lost
+    ///         track of can stay usable.
+    uint256 public constant MAX_ORDER_LIFETIME = 30 days;
     /// @notice Upper bound for `maxFundingRateBps` (1% per hour).
     uint256 public constant MAX_FUNDING_RATE_CAP_BPS = 100;
     /// @notice Gas that must be available before each match of a batch is attempted:
@@ -59,19 +64,20 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
     ///         whole batch reverts, so that an under-gassed transaction cannot make a
     ///         valid match fail with out-of-gas and be reported as `MatchFailed`.
     /// @dev Measured as the gas used by a whole single-match `settleMatches`
-    ///      transaction (optimizer 200 runs, cancun, MockOracle; test "batch gas floor"),
-    ///      which is an upper bound for the match itself. The two most expensive cases
-    ///      found, with both accounts holding a position in every market and cold storage:
-    ///        - both sides flip, with a funding accrual and pending funding to settle:
-    ///          322k gas with 2 markets, 524k with 8 (about 34k per market);
-    ///        - both sides reduce (two valuations per account): 278k with 2 markets,
-    ///          561k with 8 (about 47k per market).
-    ///      The floor is 500k for 2 markets (1.55x the measurement) and 1.1M for 8
-    ///      (1.96x). The per-market figure is deliberately generous because a Chainlink
-    ///      feed costs more than the mock oracle; re-measure with the production oracle.
-    ///      The margin also covers the 1/64 of gas withheld from the inner call.
-    uint256 public constant MATCH_GAS_BASE = 300_000;
-    uint256 public constant MATCH_GAS_PER_MARKET = 100_000;
+    ///      transaction (optimizer 200 runs, cancun; test "batch gas floor, measured"),
+    ///      which is an upper bound for the match itself, with the ChainlinkOracle
+    ///      adapter, mock aggregators and the sequencer uptime check enabled. The two most
+    ///      expensive cases found, with both accounts holding a position in every market,
+    ///      cold storage, a funding accrual and pending funding to settle:
+    ///        - both sides flip:   367k gas with 2 markets, 647k with 8 (~47k per market);
+    ///        - both sides reduce: 408k gas with 2 markets, 810k with 8 (~67k per market;
+    ///          a reducing side is valued twice).
+    ///      The floor is 700k for 2 markets (1.7x the measurement) and 1.6M for 8 (2.0x).
+    ///      The headroom is for real Chainlink feeds, which sit behind a proxy and cost
+    ///      more per read than the mock aggregators, and for the 1/64 of gas withheld
+    ///      from the inner call. Re-measure on a fork before mainnet.
+    uint256 public constant MATCH_GAS_BASE = 400_000;
+    uint256 public constant MATCH_GAS_PER_MARKET = 150_000;
 
     bytes32 public constant ORDER_TYPEHASH = keccak256(
         "Order(address trader,uint32 marketId,bool isBuy,bool reduceOnly,uint256 size,uint256 limitPrice,uint256 nonce,uint64 expiry)"
@@ -102,6 +108,8 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
     mapping(address trader => mapping(uint32 marketId => Position)) private _positions;
     mapping(bytes32 orderHash => uint256) private _filled;
     mapping(address trader => mapping(uint256 nonce => bool)) private _cancelled;
+    /// @dev Orders with a nonce below this value are cancelled (bulk cancel).
+    mapping(address trader => uint256) private _minValidNonce;
     mapping(address => bool) private _operators;
 
     uint256 private _insuranceFund;
@@ -135,6 +143,8 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
     error InvalidSignature();
     error OrderIsCancelled();
     error OrderExpired();
+    error InvalidExpiry();
+    error NonceNotIncreased();
     error OrderTooSmall();
     error FillTooSmall();
     error PriceOutOfBand(uint256 price, uint256 index);
@@ -278,6 +288,15 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
         emit OrderCancelled(msg.sender, nonce);
     }
 
+    /// @inheritdoc IExchange
+    /// @dev The value can only go up, so a bulk cancel can never be undone. Clients are
+    ///      expected to use increasing nonces (e.g. derived from the time of signing).
+    function cancelAllOrders(uint256 newMinValidNonce) external {
+        if (newMinValidNonce <= _minValidNonce[msg.sender]) revert NonceNotIncreased();
+        _minValidNonce[msg.sender] = newMinValidNonce;
+        emit OrdersCancelledBelow(msg.sender, newMinValidNonce);
+    }
+
     // ============================================================= operator
 
     /// @inheritdoc IExchange
@@ -378,8 +397,12 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
         r.orderHash = _hashOrder(order);
         // ECDSA.recover reverts on malformed and high-s (malleable) signatures.
         if (trader == address(0) || ECDSA.recover(r.orderHash, signature) != trader) revert InvalidSignature();
-        if (_cancelled[trader][order.nonce]) revert OrderIsCancelled();
-        if (order.expiry != 0 && block.timestamp > order.expiry) revert OrderExpired();
+        if (_isCancelled(trader, order.nonce)) revert OrderIsCancelled();
+        // Valid through `expiry` inclusive; an order without expiry, or one that expires
+        // more than MAX_ORDER_LIFETIME from now, is not acceptable (yet).
+        if (order.expiry == 0) revert InvalidExpiry();
+        if (block.timestamp > order.expiry) revert OrderExpired();
+        if (order.expiry > block.timestamp + MAX_ORDER_LIFETIME) revert InvalidExpiry();
         if (order.size < market.minOrderSize) revert OrderTooSmall();
         uint256 filled = _filled[r.orderHash] + fillSize;
         if (filled > order.size) revert Overfill();
@@ -824,7 +847,17 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
 
     /// @inheritdoc IExchange
     function isCancelled(address trader, uint256 nonce) external view returns (bool) {
-        return _cancelled[trader][nonce];
+        return _isCancelled(trader, nonce);
+    }
+
+    /// @inheritdoc IExchange
+    function minValidNonce(address trader) external view returns (uint256) {
+        return _minValidNonce[trader];
+    }
+
+    /// @inheritdoc IExchange
+    function maxOrderLifetime() external pure returns (uint256) {
+        return MAX_ORDER_LIFETIME;
     }
 
     /// @inheritdoc IExchange
@@ -851,6 +884,10 @@ contract Exchange is IExchange, Ownable, ReentrancyGuard, EIP712 {
                     )
                 )
             );
+    }
+
+    function _isCancelled(address trader, uint256 nonce) private view returns (bool) {
+        return nonce < _minValidNonce[trader] || _cancelled[trader][nonce];
     }
 
     function _requireMarket(uint32 marketId) private view {

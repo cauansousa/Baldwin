@@ -1,10 +1,10 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { defineChain, isAddress, isHex, type Chain } from "viem";
+import { defineChain, isAddress, isHex, parseEther, type Chain } from "viem";
 import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
 import type { Deployment } from "../../shared/src/index.ts";
-import type { Hex } from "./types.ts";
+import type { Hex, LogLevel } from "./types.ts";
 
 const ENGINE_DIR = fileURLToPath(new URL("..", import.meta.url));
 
@@ -65,6 +65,12 @@ export function loadDeployment(env: Env = process.env): Deployment {
   return d;
 }
 
+/**
+ * The chain is whatever the deployment file says (id) and RPC_URL points to; nothing
+ * is assumed about it beyond EIP-1559 transactions. Fees come from the node
+ * (eth_maxPriorityFeePerGas + base fee) and gas limits from eth_estimateGas, which on
+ * Arbitrum already includes the L1 data cost.
+ */
 export function chainFor(deployment: Deployment, rpcUrl: string): Chain {
   return defineChain({
     id: deployment.chainId,
@@ -77,6 +83,33 @@ export function chainFor(deployment: Deployment, rpcUrl: string): Chain {
 export interface CommonConfig {
   rpcUrl: string;
   deployment: Deployment;
+  logLevel: LogLevel;
+  /** Largest block span per eth_getLogs query. */
+  logMaxBlockRange: bigint;
+}
+
+function common(env: Env): CommonConfig {
+  const level = (env.LOG_LEVEL || "info").toLowerCase();
+  if (!["info", "warn", "error", "silent"].includes(level)) throw new Error("LOG_LEVEL must be info, warn, error or silent");
+  const rpcUrl = env.RPC_URL || "http://127.0.0.1:8545";
+  if (!/^https?:\/\//.test(rpcUrl)) throw new Error("RPC_URL must be an http(s) URL");
+  return {
+    rpcUrl,
+    deployment: loadDeployment(env),
+    logLevel: level as LogLevel,
+    logMaxBlockRange: BigInt(int(env, "LOG_MAX_BLOCK_RANGE", 2000, 1)),
+  };
+}
+
+/** "0.01" (ETH) -> wei. */
+function ethEnv(env: Env, name: string, def: string): bigint {
+  const raw = env[name] === undefined || env[name] === "" ? def : env[name]!;
+  if (!/^[0-9]+(\.[0-9]{1,18})?$/.test(raw)) throw new Error(`${name} must be a decimal amount of ETH`);
+  return parseEther(raw);
+}
+
+function optionalBlock(env: Env, name: string): bigint | undefined {
+  return env[name] === undefined || env[name] === "" ? undefined : BigInt(int(env, name, 0));
 }
 
 export interface EngineConfig extends CommonConfig {
@@ -91,7 +124,21 @@ export interface EngineConfig extends CommonConfig {
   expiryBufferSec: number;
   minTimeToExpirySec: number;
   maxTimeToExpirySec: number;
-  deadNoncesPath: string;
+  /** SQLite file with the engine's durable state. */
+  storePath: string;
+  /** Blocks a settlement must be buried under before fills are reported as confirmed. */
+  confirmations: number;
+  /** /health warns when the operator's ETH balance is below this (wei). */
+  operatorMinBalance: bigint;
+  /** How long SIGTERM waits for the in-flight batch. */
+  shutdownTimeoutMs: number;
+  /** How often on-chain cancel events are polled. */
+  logPollIntervalMs: number;
+  /** First block to scan for cancels when the store has no cursor (default: current head). */
+  startBlock: bigint | undefined;
+  gasLimitCap: bigint;
+  receiptTimeoutMs: number;
+  receiptPollMs: number;
   chainRefreshMs: number;
   faultThreshold: number;
   faultWindowSec: number;
@@ -103,8 +150,7 @@ export interface EngineConfig extends CommonConfig {
 
 export function loadEngineConfig(env: Env = process.env): EngineConfig {
   return {
-    rpcUrl: env.RPC_URL || "http://127.0.0.1:8545",
-    deployment: loadDeployment(env),
+    ...common(env),
     operatorKey: privateKey(env, "OPERATOR_PRIVATE_KEY"),
     port: int(env, "PORT", 8080, 1),
     host: env.HOST || "127.0.0.1",
@@ -116,7 +162,15 @@ export function loadEngineConfig(env: Env = process.env): EngineConfig {
     expiryBufferSec: int(env, "EXPIRY_BUFFER_SEC", 30),
     minTimeToExpirySec: int(env, "MIN_TIME_TO_EXPIRY_SEC", 60),
     maxTimeToExpirySec: int(env, "MAX_TIME_TO_EXPIRY_SEC", 7 * 24 * 3600, 1),
-    deadNoncesPath: resolve(ENGINE_DIR, env.DEAD_NONCES_PATH || "data/dead-nonces.jsonl"),
+    storePath: resolve(ENGINE_DIR, env.STORE_PATH || "data/engine.sqlite"),
+    confirmations: int(env, "CONFIRMATIONS", 1, 1),
+    operatorMinBalance: ethEnv(env, "OPERATOR_MIN_BALANCE_ETH", "0.01"),
+    shutdownTimeoutMs: int(env, "SHUTDOWN_TIMEOUT_MS", 30_000, 0),
+    logPollIntervalMs: int(env, "LOG_POLL_INTERVAL_MS", 2000, 100),
+    startBlock: optionalBlock(env, "START_BLOCK"),
+    gasLimitCap: BigInt(int(env, "GAS_LIMIT_CAP", 25_000_000, 21_000)),
+    receiptTimeoutMs: int(env, "RECEIPT_TIMEOUT_MS", 30_000, 100),
+    receiptPollMs: int(env, "RECEIPT_POLL_MS", 500, 10),
     chainRefreshMs: int(env, "CHAIN_REFRESH_MS", 2000, 100),
     faultThreshold: int(env, "FAULT_THRESHOLD", 3, 1),
     faultWindowSec: int(env, "FAULT_WINDOW_SEC", 600, 1),
@@ -133,16 +187,18 @@ export interface KeeperConfig extends CommonConfig {
   startBlock: bigint;
   /** Warn at start-up when the keeper's free collateral (USDC units) is below this; 0 disables. */
   minFreeCollateral: bigint;
+  /** JSON file with the keeper's event cursor and tracked accounts. */
+  statePath: string;
 }
 
 export function loadKeeperConfig(env: Env = process.env): KeeperConfig {
   return {
-    rpcUrl: env.RPC_URL || "http://127.0.0.1:8545",
-    deployment: loadDeployment(env),
+    ...common(env),
     keeperKey: privateKey(env, "KEEPER_PRIVATE_KEY"),
     pollIntervalMs: int(env, "KEEPER_POLL_INTERVAL_MS", 5000, 100),
     fundingIntervalSec: int(env, "FUNDING_INTERVAL_SEC", 3600, 1),
     startBlock: BigInt(int(env, "KEEPER_START_BLOCK", 0)),
     minFreeCollateral: bigintEnv(env, "KEEPER_MIN_FREE_COLLATERAL", 1n),
+    statePath: resolve(ENGINE_DIR, env.KEEPER_STATE_PATH || "data/keeper-state.json"),
   };
 }

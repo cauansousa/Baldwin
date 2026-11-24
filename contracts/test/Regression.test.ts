@@ -3,7 +3,7 @@
 import { expect } from "chai";
 import { ethers } from "hardhat";
 import { loadFixture, takeSnapshot, time } from "@nomicfoundation/hardhat-network-helpers";
-import { BTC, BTC_PRICE, ETH, HOUR, MAX_PRICE_AGE, deployFixture, marketConfig, usdc, wad } from "./helpers";
+import { BTC, BTC_PRICE, Ctx, ETH, HOUR, MAX_PRICE_AGE, deployFixture, marketConfig, usdc, wad } from "./helpers";
 
 const ONE = wad(1);
 const MAX = ethers.MaxUint256;
@@ -250,7 +250,7 @@ describe("Review regressions", () => {
       await exchange.connect(alice).deposit(usdc(50_000));
       await exchange.connect(bob).deposit(usdc(50_000));
       const floor = (await exchange.MATCH_GAS_BASE()) + (await exchange.MATCH_GAS_PER_MARKET()) * 2n;
-      expect(floor).to.equal(500_000n);
+      expect(floor).to.equal(700_000n);
 
       const m = await ctx.trade(alice, bob, ONE, BTC_PRICE);
       await expect(exchange.connect(ctx.operator).settleMatches([m], { gasLimit: 400_000 })).to.be.revertedWithCustomError(exchange, "InsufficientGas");
@@ -266,54 +266,101 @@ describe("Review regressions", () => {
   describe("L: batch gas floor, measured", () => {
     // The most expensive matches we know: both accounts hold a position in every market;
     // either both flip (with a funding accrual and pending funding), or both reduce.
-    for (const extraMarkets of [0, 6]) {
-      it(`no gas limit turns a valid worst-case match into MatchFailed (${2 + extraMarkets} markets)`, async () => {
-        const { exchange, oracle, ctx, alice, bob } = await loadFixture(deployFixture);
-        for (let i = 0; i < extraMarkets; i++) await exchange.addMarket(marketConfig(`M${i}-USD`));
-        const n = Number(await exchange.marketCount());
-        const refresh = async () => {
-          for (let i = 0; i < n; i++) await oracle.setPrice(i, i === 0 ? BTC_PRICE : wad(2_000));
-        };
-        await refresh();
-        await exchange.connect(alice).deposit(usdc(5_000_000));
-        await exchange.connect(bob).deposit(usdc(5_000_000));
-        for (let i = 0; i < n; i++) {
-          await ctx.settleOk([await ctx.trade(alice, bob, ONE, i === 0 ? wad(52_000) : wad(2_080), { marketId: i })]);
-        }
-        await time.increase(HOUR + 5);
-        await refresh();
-        for (let i = 1; i < n; i++) await exchange.updateFunding(i);
-        const floor = (await exchange.MATCH_GAS_BASE()) + (await exchange.MATCH_GAS_PER_MARKET()) * BigInt(n);
+    // Measured with the mock oracle and with the Chainlink adapter (mock aggregators,
+    // sequencer uptime feed enabled), which is what production uses.
+    const MARKET_PRICE = (i: number) => (i === 0 ? 50_000n : 2_000n);
 
-        const cases = {
-          "flip both": await ctx.trade(bob, alice, wad(3), wad(50_500)),
-          "reduce both": await ctx.trade(bob, alice, wad("0.5"), wad(50_500)),
-        };
-        for (const [label, m] of Object.entries(cases)) {
-          const snapshot = await takeSnapshot();
-          const receipt = await ctx.settleOk([m]);
-          await snapshot.restore();
-          // the floor has real headroom over the measured cost of the whole transaction
-          expect(receipt.gasUsed * 13n, `${label}: headroom`).to.be.lt(floor * 10n);
+    async function mockOracleSetup(extraMarkets: number) {
+      const f = await deployFixture();
+      for (let i = 0; i < extraMarkets; i++) await f.exchange.addMarket(marketConfig(`M${i}-USD`));
+      const n = 2 + extraMarkets;
+      const refresh = async () => {
+        for (let i = 0; i < n; i++) await f.oracle.setPrice(i, wad(MARKET_PRICE(i)));
+      };
+      return { exchange: f.exchange, ctx: f.ctx, alice: f.alice, bob: f.bob, n, refresh };
+    }
 
-          let reverted = 0;
-          let settled = 0;
-          for (let gasLimit = 150_000n; gasLimit <= floor + 300_000n; gasLimit += 25_000n) {
-            const s = await takeSnapshot();
-            try {
-              const r = (await (await exchange.connect(ctx.operator).settleMatches([m], { gasLimit })).wait())!;
-              expect(ctx.failures(r), `${label} with gas limit ${gasLimit}`).to.deep.equal([]);
-              settled++;
-            } catch (e) {
-              if ((e as Error).name === "AssertionError") throw e;
-              reverted++;
-            }
-            await s.restore();
+    async function chainlinkSetup(extraMarkets: number) {
+      const [owner, operator, feeRecipient, alice, bob] = await ethers.getSigners();
+      const n = 2 + extraMarkets;
+      const Agg = await ethers.getContractFactory("MockAggregator");
+      const token = await (await ethers.getContractFactory("MockUSDC")).deploy();
+      const sequencer = await Agg.deploy(0);
+      const start = await time.latest();
+      await sequencer.setRound(0, start - 100_000, start - 100_000);
+      const oracle = await (await ethers.getContractFactory("ChainlinkOracle")).deploy(owner.address, await sequencer.getAddress(), 3600);
+      const exchange = await (
+        await ethers.getContractFactory("Exchange")
+      ).deploy(await token.getAddress(), await oracle.getAddress(), owner.address, feeRecipient.address, 3600, 10, 500);
+      const aggs = [];
+      for (let i = 0; i < n; i++) {
+        const agg = await Agg.deploy(8);
+        await oracle.setFeed(i, await agg.getAddress(), 3600);
+        await exchange.addMarket(marketConfig(`M${i}-USD`));
+        aggs.push(agg);
+      }
+      const refresh = async () => {
+        for (let i = 0; i < n; i++) await aggs[i].set(MARKET_PRICE(i) * 10n ** 8n, await time.latest());
+      };
+      await exchange.setOperator(operator.address, true);
+      for (const s of [alice, bob]) {
+        await token.mint(s.address, usdc(10_000_000));
+        await token.connect(s).approve(await exchange.getAddress(), MAX);
+      }
+      const expiry = (await time.latest()) + 20 * 24 * HOUR;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const ctx = new Ctx(exchange as any, undefined as any, token as any, operator, expiry);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return { exchange: exchange as any as Awaited<ReturnType<typeof mockOracleSetup>>["exchange"], ctx, alice, bob, n, refresh };
+    }
+
+    const setups = { "mock oracle": mockOracleSetup, "Chainlink adapter + sequencer feed": chainlinkSetup };
+    for (const [oracleKind, setup] of Object.entries(setups)) {
+      for (const extraMarkets of [0, 6]) {
+        it(`no gas limit turns a valid worst-case match into MatchFailed (${oracleKind}, ${2 + extraMarkets} markets)`, async () => {
+          const { exchange, ctx, alice, bob, n, refresh } = await setup(extraMarkets);
+          await refresh();
+          await exchange.connect(alice).deposit(usdc(5_000_000));
+          await exchange.connect(bob).deposit(usdc(5_000_000));
+          for (let i = 0; i < n; i++) {
+            await ctx.settleOk([await ctx.trade(alice, bob, ONE, (wad(MARKET_PRICE(i)) * 104n) / 100n, { marketId: i })]);
           }
-          expect(reverted, label).to.be.gt(0);
-          expect(settled, label).to.be.gt(0);
-        }
-      });
+          await time.increase(HOUR + 5);
+          await refresh();
+          for (let i = 1; i < n; i++) await exchange.updateFunding(i);
+          const floor = (await exchange.MATCH_GAS_BASE()) + (await exchange.MATCH_GAS_PER_MARKET()) * BigInt(n);
+
+          const cases = {
+            "flip both": await ctx.trade(bob, alice, wad(3), wad(50_500)),
+            "reduce both": await ctx.trade(bob, alice, wad("0.5"), wad(50_500)),
+          };
+          for (const [label, m] of Object.entries(cases)) {
+            const snapshot = await takeSnapshot();
+            const receipt = await ctx.settleOk([m]);
+            await snapshot.restore();
+            if (process.env.GAS_DEBUG) console.log(`        ${oracleKind}, ${n} markets, ${label}: ${receipt.gasUsed} gas (floor ${floor})`);
+            // the floor has real headroom over the measured cost of the whole transaction
+            expect(receipt.gasUsed * 13n, `${label}: headroom`).to.be.lt(floor * 10n);
+
+            let reverted = 0;
+            let settled = 0;
+            for (let gasLimit = 150_000n; gasLimit <= floor + 300_000n; gasLimit += 25_000n) {
+              const s = await takeSnapshot();
+              try {
+                const r = (await (await exchange.connect(ctx.operator).settleMatches([m], { gasLimit })).wait())!;
+                expect(ctx.failures(r), `${label} with gas limit ${gasLimit}`).to.deep.equal([]);
+                settled++;
+              } catch (e) {
+                if ((e as Error).name === "AssertionError") throw e;
+                reverted++;
+              }
+              await s.restore();
+            }
+            expect(reverted, label).to.be.gt(0);
+            expect(settled, label).to.be.gt(0);
+          }
+        });
+      }
     }
   });
 

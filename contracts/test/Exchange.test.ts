@@ -113,6 +113,30 @@ describe("Exchange", () => {
       await expect(exchange.setOperator(ethers.ZeroAddress, true)).to.be.revertedWithCustomError(exchange, "ZeroAddress");
     });
 
+    it("ownership is transferred in two steps", async () => {
+      const { exchange, owner, stranger, carol: multisig } = await loadFixture(deployFixture);
+      await expect(exchange.connect(stranger).transferOwnership(stranger.address)).to.be.revertedWithCustomError(exchange, "OwnableUnauthorizedAccount");
+      await expect(exchange.transferOwnership(multisig.address)).to.emit(exchange, "OwnershipTransferStarted").withArgs(owner.address, multisig.address);
+      // nothing changes until the new owner accepts
+      expect(await exchange.owner()).to.equal(owner.address);
+      expect(await exchange.pendingOwner()).to.equal(multisig.address);
+      await expect(exchange.connect(multisig).setPaused(true)).to.be.revertedWithCustomError(exchange, "OwnableUnauthorizedAccount");
+      await exchange.setPaused(true);
+      await exchange.setPaused(false);
+      await expect(exchange.connect(stranger).acceptOwnership()).to.be.revertedWithCustomError(exchange, "OwnableUnauthorizedAccount");
+
+      // a mistyped address can be corrected by starting again
+      await exchange.transferOwnership(stranger.address);
+      await expect(exchange.connect(multisig).acceptOwnership()).to.be.revertedWithCustomError(exchange, "OwnableUnauthorizedAccount");
+      await exchange.transferOwnership(multisig.address);
+
+      await expect(exchange.connect(multisig).acceptOwnership()).to.emit(exchange, "OwnershipTransferred").withArgs(owner.address, multisig.address);
+      expect(await exchange.owner()).to.equal(multisig.address);
+      expect(await exchange.pendingOwner()).to.equal(ethers.ZeroAddress);
+      await expect(exchange.setPaused(true)).to.be.revertedWithCustomError(exchange, "OwnableUnauthorizedAccount");
+      await exchange.connect(multisig).setPaused(true);
+    });
+
     it("validates market parameters", async () => {
       const { exchange } = await loadFixture(deployFixture);
       const bad = [
@@ -357,6 +381,93 @@ describe("Exchange", () => {
       const taker = ctx.order(bob, false, ONE, BTC_PRICE, { nonce: 9 });
       await exchange.connect(bob).cancelOrder(9);
       expect(await ctx.settleError(await ctx.match(alice, ctx.order(alice, true, ONE, BTC_PRICE), bob, taker, ONE))).to.equal("OrderIsCancelled");
+    });
+
+    it("bulk cancel invalidates every order below minValidNonce and can only go up", async () => {
+      const { exchange, ctx, alice, bob } = await loadFixture(deployFixture);
+      await exchange.connect(alice).deposit(usdc(50_000));
+      await exchange.connect(bob).deposit(usdc(50_000));
+      const size = wad("0.1");
+      const sell = () => ctx.order(bob, false, size, BTC_PRICE);
+      const old1 = ctx.order(alice, true, size, BTC_PRICE, { nonce: 1_000 });
+      const old2 = ctx.order(alice, true, size, BTC_PRICE, { nonce: 1_499 });
+      const edge = ctx.order(alice, true, size, BTC_PRICE, { nonce: 1_500 });
+      const newer = ctx.order(alice, true, size, BTC_PRICE, { nonce: 2_000 });
+      // partially filled before the cancel
+      await ctx.settleOk([await ctx.match(alice, old1, bob, sell(), wad("0.05"))]);
+
+      expect(await exchange.minValidNonce(alice.address)).to.equal(0);
+      expect(await exchange.isCancelled(alice.address, 1_000)).to.equal(false);
+      await expect(exchange.connect(alice).cancelAllOrders(0)).to.be.revertedWithCustomError(exchange, "NonceNotIncreased");
+      await expect(exchange.connect(alice).cancelAllOrders(1_500)).to.emit(exchange, "OrdersCancelledBelow").withArgs(alice.address, 1_500);
+      expect(await exchange.minValidNonce(alice.address)).to.equal(1_500);
+
+      // cannot be lowered or repeated, only raised
+      await expect(exchange.connect(alice).cancelAllOrders(1_499)).to.be.revertedWithCustomError(exchange, "NonceNotIncreased");
+      await expect(exchange.connect(alice).cancelAllOrders(1_500)).to.be.revertedWithCustomError(exchange, "NonceNotIncreased");
+      await expect(exchange.connect(alice).cancelAllOrders(1)).to.be.revertedWithCustomError(exchange, "NonceNotIncreased");
+
+      expect(await exchange.isCancelled(alice.address, 0)).to.equal(true);
+      expect(await exchange.isCancelled(alice.address, 1_000)).to.equal(true);
+      expect(await exchange.isCancelled(alice.address, 1_499)).to.equal(true);
+      expect(await exchange.isCancelled(alice.address, 1_500)).to.equal(false);
+      // other traders are unaffected
+      expect(await exchange.isCancelled(bob.address, 1)).to.equal(false);
+      expect(await exchange.minValidNonce(bob.address)).to.equal(0);
+
+      // orders signed before the bulk cancel are dead, as maker or as taker, filled or not
+      expect(await ctx.settleError(await ctx.match(alice, old1, bob, sell(), wad("0.05")))).to.equal("OrderIsCancelled");
+      expect(await ctx.settleError(await ctx.match(alice, old2, bob, sell(), size))).to.equal("OrderIsCancelled");
+      expect(await ctx.settleError(await ctx.match(bob, sell(), alice, old2, size))).to.equal("OrderIsCancelled");
+      // nonces at or above the threshold work
+      expect(await ctx.settleError(await ctx.match(alice, edge, bob, sell(), size))).to.equal("");
+      expect(await ctx.settleError(await ctx.match(alice, newer, bob, sell(), wad("0.05")))).to.equal("");
+
+      // individual cancels still work above the threshold and both show in isCancelled
+      await exchange.connect(alice).cancelOrder(2_000);
+      expect(await exchange.isCancelled(alice.address, 2_000)).to.equal(true);
+      expect(await ctx.settleError(await ctx.match(alice, newer, bob, sell(), wad("0.05")))).to.equal("OrderIsCancelled");
+
+      // raising again kills more; the maximum value kills everything below it
+      await exchange.connect(alice).cancelAllOrders(ethers.MaxUint256);
+      const late = ctx.order(alice, true, size, BTC_PRICE, { nonce: ethers.MaxUint256 - 1n });
+      expect(await ctx.settleError(await ctx.match(alice, late, bob, sell(), size))).to.equal("OrderIsCancelled");
+      await expect(exchange.connect(alice).cancelAllOrders(ethers.MaxUint256)).to.be.revertedWithCustomError(exchange, "NonceNotIncreased");
+    });
+
+    it("orders must expire, at most maxOrderLifetime ahead", async () => {
+      const { exchange, ctx, alice, bob } = await loadFixture(deployFixture);
+      await exchange.connect(alice).deposit(usdc(50_000));
+      await exchange.connect(bob).deposit(usdc(50_000));
+      const LIFETIME = 30 * 24 * 3600;
+      expect(await exchange.maxOrderLifetime()).to.equal(LIFETIME);
+      expect(await exchange.MAX_ORDER_LIFETIME()).to.equal(LIFETIME);
+      const size = wad("0.1");
+      const sell = (o = {}) => ctx.order(bob, false, size, BTC_PRICE, o);
+      const buy = (o = {}) => ctx.order(alice, true, size, BTC_PRICE, o);
+
+      // no expiry
+      expect(await ctx.settleError(await ctx.match(alice, buy({ expiry: 0 }), bob, sell(), size))).to.equal("InvalidExpiry");
+      expect(await ctx.settleError(await ctx.match(alice, buy(), bob, sell({ expiry: 0 }), size))).to.equal("InvalidExpiry");
+
+      // too far ahead: exactly now + lifetime is fine, one second more is not
+      const t = (await time.latest()) + 10;
+      const atLimit = await ctx.match(alice, buy({ expiry: t + LIFETIME }), bob, sell(), size);
+      const beyond = await ctx.match(alice, buy({ expiry: t + LIFETIME + 1 }), bob, sell(), size);
+      const beyondTaker = await ctx.match(alice, buy(), bob, sell({ expiry: t + LIFETIME + 1 }), size);
+      await time.setNextBlockTimestamp(t);
+      const receipt = (await (await ctx.settle([beyond, beyondTaker, atLimit])).wait())!;
+      expect(ctx.failures(receipt)).to.deep.equal([
+        { index: 0, error: "InvalidExpiry" },
+        { index: 1, error: "InvalidExpiry" },
+      ]);
+      // An order dated too far ahead is not dead: it becomes fillable once its expiry is within range.
+      await time.setNextBlockTimestamp(t + 1);
+      expect(await ctx.settleError(beyond)).to.equal("");
+
+      // already expired
+      const past = await ctx.match(alice, buy({ expiry: t - 100 }), bob, sell(), size);
+      expect(await ctx.settleError(past)).to.equal("OrderExpired");
     });
 
     it("enforces expiry (inclusive)", async () => {

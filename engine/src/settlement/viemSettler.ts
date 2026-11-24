@@ -10,7 +10,8 @@ import {
   type PublicClient,
 } from "viem";
 import { exchangeAbi } from "../abi.ts";
-import { errMessage, silentLogger, type Address, type Hex, type Logger, type Match } from "../types.ts";
+import type { KeyValueStore } from "../store/types.ts";
+import { errMessage, jsonReplacer, silentLogger, type Address, type Hex, type Logger, type Match } from "../types.ts";
 import { BatchRevertedError, type Batch, type MatchResult, type Settler } from "./types.ts";
 
 export interface RpcLog {
@@ -22,6 +23,8 @@ export interface RpcLog {
 export interface RpcReceipt {
   status: "success" | "reverted";
   logs: RpcLog[];
+  blockNumber: bigint;
+  blockHash: Hex;
 }
 
 /** The few RPC calls the settler needs; narrow so the retry logic can be tested with a fake. */
@@ -36,6 +39,8 @@ export interface SettlerRpc {
   getReceipt(hash: Hex): Promise<RpcReceipt | null>;
   /** `Exchange.filledSize(orderHash)` at the latest block. */
   filledSize(orderHash: Hex): Promise<bigint>;
+  /** Latest block number. */
+  blockNumber(): Promise<bigint>;
 }
 
 export interface ViemSettlerOptions {
@@ -64,6 +69,19 @@ export interface ViemSettlerOptions {
   maxFeePerGasCap?: bigint;
   /** Extra receipt polls before a batch is declared lost to a foreign transaction. Default 5. */
   releasePolls?: number;
+  /**
+   * Blocks a settlement transaction must be buried under (1 = just mined) before its
+   * outcome is reported. Default 1.
+   */
+  confirmations?: number;
+  /** How long one `settle` call waits for the confirmations. Default 600000. */
+  confirmationTimeoutMs?: number;
+  /**
+   * Where the batch in flight is recorded (nonce and signed transactions, written
+   * before the first broadcast), so that a restarted process can establish what
+   * happened to it instead of signing it again.
+   */
+  store?: KeyValueStore;
 }
 
 interface Attempt {
@@ -84,6 +102,32 @@ interface InFlight {
   unminedRounds: number;
   /** On-chain filledSize of every order in the batch, read before the first broadcast. */
   baseline: Map<Hex, bigint>;
+  /**
+   * Hash of the transaction whose (successful) receipt gave the batch its outcome.
+   * Kept until the next batch arrives, so that the same results can be re-derived if
+   * the caller crashed before recording them.
+   */
+  minedHash?: Hex;
+}
+
+const STORE_KEY = "settler.inflight";
+
+function serialize(fl: InFlight): string {
+  return JSON.stringify({ ...fl, baseline: [...fl.baseline] }, jsonReplacer);
+}
+
+function deserialize(raw: string): InFlight {
+  const o = JSON.parse(raw) as Omit<InFlight, "gas" | "attempts" | "baseline"> & {
+    gas: string;
+    attempts: { hash: Hex; raw: Hex; maxFeePerGas: string; maxPriorityFeePerGas: string }[];
+    baseline: [Hex, string][];
+  };
+  return {
+    ...o,
+    gas: BigInt(o.gas),
+    attempts: o.attempts.map((a) => ({ ...a, maxFeePerGas: BigInt(a.maxFeePerGas), maxPriorityFeePerGas: BigInt(a.maxPriorityFeePerGas) })),
+    baseline: new Map(o.baseline.map(([h, v]) => [h, BigInt(v)])),
+  };
 }
 
 /** Broadcast errors that mean the node has (or had) the transaction. */
@@ -114,6 +158,17 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
  * (same nonce) with fees raised by 25%, up to `maxFeePerGasCap`. Broadcast errors do
  * not prevent that: with a shared nonce a replacement is always safe.
  *
+ * Restarts: with a `store`, the binding (nonce, every signed transaction, the
+ * `filledSize` baseline) is written durably before the first broadcast and after
+ * every re-signing. A new process picks it up and continues exactly as above: it
+ * finds the receipt of a transaction it already sent, or re-broadcasts the very same
+ * signed transaction. Once a batch has an outcome its record is kept (with the hash
+ * of the mined transaction) until the next batch arrives, so the outcome can be
+ * re-derived from the receipt if the caller died before recording it.
+ *
+ * Confirmations: the outcome is only reported once the transaction is `confirmations`
+ * blocks deep and its receipt is still there, in the same block.
+ *
  * Nonces: transactions are strictly sequential; the next nonce is
  * max(local counter, chain "pending" count). The operator key must not be used by
  * any other process (run the keeper with its own key).
@@ -132,6 +187,10 @@ export class ViemSettler implements Settler {
   private readonly bumpAfterRounds: number;
   private readonly maxFeePerGasCap: bigint | undefined;
   private readonly releasePolls: number;
+  private readonly confirmations: number;
+  private readonly confirmationTimeoutMs: number;
+  private readonly store: KeyValueStore | undefined;
+  private loaded = false;
 
   private inflight: InFlight | null = null;
   private nextNonce = 0;
@@ -152,6 +211,9 @@ export class ViemSettler implements Settler {
     this.bumpAfterRounds = Math.max(1, opts.bumpAfterRounds ?? 2);
     this.maxFeePerGasCap = opts.maxFeePerGasCap;
     this.releasePolls = opts.releasePolls ?? 5;
+    this.confirmations = Math.max(1, opts.confirmations ?? 1);
+    this.confirmationTimeoutMs = opts.confirmationTimeoutMs ?? 600_000;
+    this.store = opts.store;
   }
 
   async settle(batch: Batch): Promise<MatchResult[]> {
@@ -165,16 +227,42 @@ export class ViemSettler implements Settler {
   }
 
   private async settleInner(batch: Batch): Promise<MatchResult[]> {
+    if (!this.loaded) {
+      this.loaded = true;
+      const raw = this.store?.getMeta(STORE_KEY);
+      if (raw) {
+        this.inflight = deserialize(raw);
+        this.log.info("resuming the settlement batch that was in flight", { batch: this.inflight.batchId, nonce: this.inflight.nonce });
+      }
+    }
     if (this.last?.batchId === batch.id) return this.last.results;
     if (batch.matches.length === 0) return [];
     if (this.inflight && this.inflight.batchId !== batch.id) {
-      throw new Error(`batch ${this.inflight.batchId} is still unresolved; refusing to submit ${batch.id}`);
+      if (this.inflight.minedHash === undefined) {
+        throw new Error(`batch ${this.inflight.batchId} is still unresolved; refusing to submit ${batch.id}`);
+      }
+      // The previous batch had its outcome and the caller has moved on.
+      this.nextNonce = Math.max(this.nextNonce, this.inflight.nonce + 1);
+      this.inflight = null;
+    }
+    if (this.inflight && this.inflight.data !== encodeBatch(batch)) {
+      throw new Error(`recorded in-flight batch ${batch.id} does not match the batch being settled; refusing to continue`);
+    }
+    if (this.inflight?.minedHash !== undefined) {
+      // Outcome known before a restart: derive the same results from the same receipt.
+      const fl = this.inflight;
+      const receipt = await this.rpc.getReceipt(fl.minedHash!);
+      const again = receipt && (await this.confirmed({ hash: fl.minedHash!, receipt }));
+      if (again) return this.finish(batch, fl, again.hash, again.receipt);
+      delete fl.minedHash; // not there (any more): fall through and look for it / re-broadcast
     }
     const fl = this.inflight ?? (await this.prepare(batch));
 
     let lastSendError: unknown;
     for (let round = 0; round < this.maxRounds; round++) {
       if (fl.attempts.length === 0 || fl.unminedRounds >= this.bumpAfterRounds) await this.sign(fl);
+      // Durable before the broadcast: a restarted process must know this transaction exists.
+      this.persist();
       const attempt = fl.attempts[fl.attempts.length - 1]!;
       lastSendError = undefined;
       try {
@@ -184,7 +272,8 @@ export class ViemSettler implements Settler {
         // The node may or may not have it. Never assume: look for a receipt first.
         if (!isAcceptedSendError(e)) lastSendError = e;
       }
-      const mined = await this.waitForReceipt(fl, this.receiptTimeoutMs);
+      const seen = await this.waitForReceipt(fl, this.receiptTimeoutMs);
+      const mined = seen && (await this.confirmed(seen));
       if (mined) return this.finish(batch, fl, mined.hash, mined.receipt);
       // Counted whether or not the broadcast call succeeded: the first call may have
       // delivered the transaction and only its response got lost.
@@ -193,10 +282,12 @@ export class ViemSettler implements Settler {
       // Not mined. If the nonce is gone anyway, find out what happened before deciding.
       const latest = await this.rpc.getNonce(this.account.address, "latest");
       if (latest > fl.nonce) {
-        const late = await this.waitForReceipt(fl, this.pollIntervalMs * this.releasePolls);
+        const lateSeen = await this.waitForReceipt(fl, this.pollIntervalMs * this.releasePolls);
+        const late = lateSeen && (await this.confirmed(lateSeen));
         if (late) return this.finish(batch, fl, late.hash, late.receipt);
         if (await this.batchLeftNoTrace(batch, fl)) {
           this.inflight = null;
+          this.persist();
           this.nextNonce = latest;
           throw new BatchRevertedError(
             `operator nonce ${fl.nonce} was consumed, no transaction of batch ${batch.id} has a receipt and no order of the batch was filled`,
@@ -229,11 +320,7 @@ export class ViemSettler implements Settler {
 
   /** Bind the batch to calldata, a gas limit and a nonce. Nothing is signed yet. */
   private async prepare(batch: Batch): Promise<InFlight> {
-    const data = encodeFunctionData({
-      abi: exchangeAbi,
-      functionName: "settleMatches",
-      args: [batch.matches.map((m) => ({ maker: m.maker, makerSig: m.makerSig, taker: m.taker, takerSig: m.takerSig, fillSize: m.fillSize }))],
-    });
+    const data = encodeBatch(batch);
     const estimate = await this.rpc.estimateGas({ from: this.account.address, to: this.exchange, data });
     // Head-room on top of the estimate: the contract reverts the whole batch with
     // InsufficientGas when less than its per-match floor is left before a match.
@@ -309,17 +396,58 @@ export class ViemSettler implements Settler {
     }
   }
 
-  /** One of the batch's transactions was mined: the outcome is final. */
+  /**
+   * Wait until the transaction is `confirmations` blocks deep. Returns null if its
+   * receipt disappeared meanwhile (reorg): the caller goes back to looking for it.
+   */
+  private async confirmed(found: { hash: Hex; receipt: RpcReceipt }): Promise<{ hash: Hex; receipt: RpcReceipt } | null> {
+    if (this.confirmations <= 1) return found;
+    const deadline = Date.now() + this.confirmationTimeoutMs;
+    for (;;) {
+      const head = await this.rpc.blockNumber();
+      if (head >= found.receipt.blockNumber + BigInt(this.confirmations - 1)) {
+        const again = await this.rpc.getReceipt(found.hash);
+        if (!again) {
+          this.log.warn("settlement transaction disappeared before it was confirmed (reorg)", { txHash: found.hash });
+          return null;
+        }
+        if (again.blockHash === found.receipt.blockHash) return { hash: found.hash, receipt: again };
+        found = { hash: found.hash, receipt: again }; // re-mined in another block: count from there
+        continue;
+      }
+      if (Date.now() >= deadline) throw new Error(`transaction ${found.hash} is mined but not yet ${this.confirmations} blocks deep`);
+      await sleep(this.pollIntervalMs);
+    }
+  }
+
+  private persist(): void {
+    this.store?.setMeta(STORE_KEY, this.inflight ? serialize(this.inflight) : "");
+  }
+
+  /** One of the batch's transactions was mined (and confirmed): the outcome is final. */
   private finish(batch: Batch, fl: InFlight, txHash: Hex, receipt: RpcReceipt): MatchResult[] {
-    this.inflight = null;
-    this.nextNonce = fl.nonce + 1;
+    this.nextNonce = Math.max(this.nextNonce, fl.nonce + 1);
     if (receipt.status !== "success") {
+      // Nothing was applied; a retry gets a fresh nonce and a fresh transaction.
+      this.inflight = null;
+      this.persist();
       throw new BatchRevertedError(`settleMatches transaction ${txHash} reverted`, txHash);
     }
+    fl.minedHash = txHash;
+    this.inflight = fl;
+    this.persist();
     const results = parseSettlementLogs(batch.matches, receipt.logs, this.exchange, txHash, this.log);
     this.last = { batchId: batch.id, results };
     return results;
   }
+}
+
+function encodeBatch(batch: Batch): Hex {
+  return encodeFunctionData({
+    abi: exchangeAbi,
+    functionName: "settleMatches",
+    args: [batch.matches.map((m) => ({ maker: m.maker, makerSig: m.makerSig, taker: m.taker, takerSig: m.takerSig, fillSize: m.fillSize }))],
+  });
 }
 
 /**
@@ -381,6 +509,7 @@ export function parseSettlementLogs(matches: Match[], logs: RpcLog[], exchange: 
 /** SettlerRpc backed by a viem public client. */
 export function viemSettlerRpc(client: PublicClient, exchange: Address): SettlerRpc {
   return {
+    blockNumber: () => client.getBlockNumber({ cacheTime: 0 }),
     filledSize: (orderHash) => client.readContract({ address: exchange, abi: exchangeAbi, functionName: "filledSize", args: [orderHash] }),
     getNonce: (address, tag) => client.getTransactionCount({ address, blockTag: tag }),
     async estimateGas({ from, to, data }) {
@@ -403,7 +532,12 @@ export function viemSettlerRpc(client: PublicClient, exchange: Address): Settler
     async getReceipt(hash) {
       try {
         const r = await client.getTransactionReceipt({ hash });
-        return { status: r.status, logs: r.logs.map((l) => ({ address: l.address, topics: [...l.topics], data: l.data })) };
+        return {
+          status: r.status,
+          logs: r.logs.map((l) => ({ address: l.address, topics: [...l.topics], data: l.data })),
+          blockNumber: r.blockNumber,
+          blockHash: r.blockHash,
+        };
       } catch (e) {
         if (e instanceof TransactionReceiptNotFoundError) return null;
         throw e;

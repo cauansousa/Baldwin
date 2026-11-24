@@ -231,6 +231,30 @@ export class OrderBook {
     return { accepted: true, seq, fills, rested, cancelled, ...(cancelled > 0n ? { cancelReason } : {}), expired };
   }
 
+  /**
+   * Put a resting order back exactly as it was persisted (same `seq`), without
+   * matching. Only for rebuilding a book that was uncrossed when it was saved.
+   */
+  load(order: BookOrder, seq: bigint, remaining: bigint): void {
+    if (remaining <= 0n) throw new Error("load: remaining must be positive");
+    if (this.byId.has(order.id)) throw new Error("load: duplicate order");
+    this.insert({ ...order, remaining, seq });
+    this.reserveSeq(seq);
+  }
+
+  /** Make sure future orders get a time priority after `seq`. */
+  reserveSeq(seq: bigint): void {
+    if (seq >= this.nextSeq) this.nextSeq = seq + 1n;
+  }
+
+  /** Change the resting quantity of an order in place (priority kept). Removes it at 0. */
+  setRemaining(id: string, remaining: bigint): void {
+    const o = this.byId.get(id);
+    if (!o) return;
+    if (remaining <= 0n) this.remove(o);
+    else o.remaining = remaining;
+  }
+
   /** Remove an order. Returns the quantity that was resting, or null if unknown. */
   cancel(id: string): bigint | null {
     const o = this.byId.get(id);

@@ -9,9 +9,11 @@ External interface (fixed, shared with the engine and the web app):
 |---|---|
 | `src/Exchange.sol` | The exchange |
 | `src/interfaces/IOracle.sol` | `getPrice(marketId) -> (priceWad, updatedAt)` |
-| `src/oracles/ChainlinkOracle.sol` | Chainlink adapter (one USD feed per market, normalized to 18 decimals) |
+| `src/oracles/ChainlinkOracle.sol` | Chainlink adapter: one USD feed per market, normalized to 18 decimals, per-feed staleness limit, optional L2 sequencer uptime check |
 | `src/mocks/*` | Test/local only: `MockUSDC` (open mint), `MockOracle` (open price setter), test doubles |
-| `scripts/deploy.ts` | Local/test deployment with mocks |
+| `scripts/deploy.ts` | Local deployment with mocks |
+| `scripts/deploy-testnet.ts` | Testnet deployment against real USDC and Chainlink feeds (Arbitrum Sepolia) |
+| `scripts/dry-run-mocks.ts` | Stand-ins for the external contracts, to rehearse the testnet deployment locally |
 
 ## Build, test, deploy
 
@@ -34,7 +36,61 @@ is for mocks only.
 Constructor: `Exchange(usdc, oracle, owner, feeRecipient, maxPriceAge, maxFundingRateBps,
 maxPriceDeviationBps)`; the funding cap may be at most 100 bps per hour.
 Admin functions (not part of `IExchange`): `addMarket`, `updateMarket`, `setOperator`,
-`setFeeRecipient`, `setPaused`.
+`setFeeRecipient`, `setPaused`, and the two-step `transferOwnership` / `acceptOwnership`.
+
+## Testnet deployment (Arbitrum Sepolia)
+
+`scripts/deploy-testnet.ts` deploys `ChainlinkOracle` and `Exchange` against an existing
+USDC token and existing Chainlink feeds. It deploys no mocks and mints nothing.
+
+1. `cp .env.example .env` and fill it in (`.env` is git-ignored and loaded by
+   `hardhat.config.ts`). Look the external addresses up yourself; none are hard-coded:
+   - `USDC_ADDRESS`: Circle's "USDC on test networks" page, Arbitrum Sepolia;
+   - `BTC_USD_FEED`, `ETH_USD_FEED` and their heartbeats (for `*_MAX_STALENESS`, use
+     heartbeat plus a margin): Chainlink's price feed address list, Arbitrum Sepolia;
+   - `SEQUENCER_UPTIME_FEED` (optional): Chainlink's "L2 Sequencer Uptime Feeds" page;
+   - `OWNER_ADDRESS` (multisig), `OPERATOR_ADDRESS` (the engine's key), `FEE_RECIPIENT`.
+2. Fund the deployer with a little Sepolia ETH on Arbitrum Sepolia.
+3. `npm run deploy:testnet` (= `hardhat run scripts/deploy-testnet.ts --network arbitrumSepolia`).
+   Before the first transaction the script refuses to continue if
+   - a required variable is missing or malformed, or the parameters break a contract rule;
+   - the RPC is not chain 421614 (or is a known mainnet);
+   - USDC, a feed or the sequencer feed has no code; the owner has no code
+     (unless `ALLOW_EOA_OWNER=true`);
+   - USDC does not have 6 decimals;
+   - a feed's answer is not positive, is older than its staleness limit, is outside a
+     plausible range, or the two feeds look swapped; the sequencer is down or inside the
+     grace period.
+
+   Then it deploys, sets the feeds, adds BTC-USD (0) and ETH-USD (1), reads the index
+   price of both through the exchange, sets the operator, starts the ownership transfer
+   of both contracts and writes `deployments/arbitrumSepolia.json`.
+4. **The multisig must call `acceptOwnership()` on the Exchange and on the
+   ChainlinkOracle.** Until then the deployer key is still the owner of both.
+5. Verify the sources with the two commands the script prints, e.g.
+   `npx hardhat verify --network arbitrumSepolia <exchange> <usdc> <oracle> <deployer> <feeRecipient> <maxPriceAge> <fundingCap> <band>`
+   (needs `ETHERSCAN_API_KEY`).
+6. Point the engine and the web app at `deployments/arbitrumSepolia.json`. The operator
+   account needs ETH for gas; a keeper that liquidates needs USDC deposited.
+
+### Dry run
+
+The whole path (env loading, the `arbitrumSepolia` network entry, private-key account,
+chain-id check, preflight, deployment, output file) can be rehearsed against a local node
+that reports chain id 421614:
+
+```sh
+HARDHAT_CHAIN_ID=421614 npx hardhat node --port 8555            # terminal 1
+# terminal 2 (the key is hardhat's public test account #0)
+export ARBITRUM_SEPOLIA_RPC_URL=http://127.0.0.1:8555
+export DEPLOYER_PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+npx hardhat run scripts/dry-run-mocks.ts --network arbitrumSepolia > /tmp/dry.env
+set -a; . /tmp/dry.env; set +a
+DEPLOYMENT_FILE=/tmp/dry-deployment.json npm run deploy:testnet
+```
+
+`test/DeployTestnet.test.ts` runs the same script in-process on every `npm test`,
+including each refusal.
 
 ## How it works
 
@@ -49,8 +105,14 @@ Admin functions (not part of `IExchange`): `addMarket`, `updateMarket`, `setOper
   left, otherwise the whole batch reverts with `InsufficientGas` (an under-gassed
   transaction must not be able to report valid matches as failed). The price is the
   maker's `limitPrice` and must be within the taker's limit. Order hash = EIP-712 digest;
-  fills are tracked per hash, `cancelOrder(nonce)` kills every order of the caller with
-  that nonce. Only 65-byte, low-s EOA signatures are accepted.
+  fills are tracked per hash. Only 65-byte, low-s EOA signatures are accepted.
+- **Order lifetime and cancellation.** Every order needs an `expiry` that is not zero and
+  at most `maxOrderLifetime()` (30 days) ahead of the block in which it is filled
+  (`InvalidExpiry`; an order dated further ahead becomes fillable once inside the window),
+  and it is dead after its expiry (`OrderExpired`). `cancelOrder(nonce)` kills every order
+  of the caller with that nonce; `cancelAllOrders(n)` kills every order with a nonce below
+  `n` and can only be raised. Both make `isCancelled` true and fills fail with
+  `OrderIsCancelled`. Clients must therefore use increasing nonces.
 - **Price band.** Every fill needs a fresh index price and must satisfy
   `|price − index| × 10000 ≤ index × maxPriceDeviationBps` (inclusive), else
   `PriceOutOfBand(price, index)`. This stops accounts from moving equity between them
@@ -104,10 +166,13 @@ Admin functions (not part of `IExchange`): `addMarket`, `updateMarket`, `setOper
 - **Owner**: fully trusted for parameters. It can add/update markets (margins, fees up to
   1%, penalty up to the maintenance margin, caps), set operators and the fee recipient,
   and pause. Raising the maintenance margin makes accounts liquidatable, so the owner can
-  effectively take traders' margin; it must be a multisig behind a timelock.
+  effectively take traders' margin; it must be a multisig behind a timelock. Ownership
+  moves in two steps (`Ownable2Step`): the new owner has to accept.
 - **Oracle**: fully trusted. A wrong price lets positions be opened, liquidated and profits
   withdrawn at that price. The oracle address is immutable in the exchange; the Chainlink
-  adapter's owner chooses the feeds.
+  adapter's owner chooses the feeds and their staleness limits (two-step ownership too).
+  The adapter reverts while the L2 sequencer is down and for a grace period after it is
+  back, which freezes fills, liquidations and withdrawals of accounts with positions.
 - **Collateral token**: assumed to be a standard 6-decimal ERC-20 without transfer fees,
   rebasing or hooks. (USDC is upgradeable and can blacklist addresses, including this
   contract.)
@@ -132,15 +197,17 @@ Admin functions (not part of `IExchange`): `addMarket`, `updateMarket`, `setOper
   charged for time beyond 8 hours without an accrual, nor while the index price is stale,
   and anyone may trigger that zero-rate accrual while the oracle is stale.
 - **Off-chain cancels are not binding on-chain.** A cancel sent only to the engine (or an
-  order the engine dropped) can still be settled by the operator as long as the signature
-  is valid; only `cancelOrder` on-chain or an expiry ends an order, and `expiry = 0`
-  (never) is allowed.
+  order the engine dropped) can still be settled by the operator while the signature is
+  valid. What bounds this now: every order expires within 30 days at most, and
+  `cancelOrder` / `cancelAllOrders` on-chain end it immediately. `cancelAllOrders` only
+  helps if the client's nonces increase over time.
 - **The operator picks the maker side** of two crossing orders and thereby the price
   (within both limits and the band) and who pays which fee.
 - **Fee changes apply to resting orders**: an order signed under one fee schedule is
   charged the fees in force when it is filled (at most 1%).
-- **Oracle**: one global `maxPriceAge` for all feeds; no L2 sequencer-uptime check, no
-  deviation/circuit breaker, no fallback feed. A market whose oracle call reverts freezes
+- **Oracle**: no deviation check/circuit breaker and no fallback feed. The sequencer
+  check and the feed reads were only tested against mock aggregators, never against the
+  real feeds. A market whose oracle call reverts (including sequencer downtime) freezes
   withdrawals and liquidations of every account that has a position in it. The oracle
   cannot be replaced without redeploying the exchange.
 - **Gap risk**: unrealized profit is withdrawable immediately, while the losing side pays
@@ -154,13 +221,16 @@ Admin functions (not part of `IExchange`): `addMarket`, `updateMarket`, `setOper
   closed with an order of at least the minimum size that is filled for exactly the
   position. A reducing fill worth less than a few millionths of a USDC can be rejected
   for an account under initial margin, because fee rounding outweighs the margin released.
-- The batch gas floor was measured with the mock oracle and must be re-measured with the
-  production oracle; it grows with the number of markets.
+- The batch gas floor (700k gas for 2 markets) was measured with the Chainlink adapter
+  over mock aggregators; real feeds sit behind a proxy and cost more per read. Re-measure
+  on a fork or on the testnet. It grows with the number of markets.
 - EOA signatures only (no ERC-1271 smart accounts, no compact signatures). Orders have no
   time-in-force or post-only semantics on-chain; nonces are only cancellation handles.
+  `renounceOwnership` is not disabled.
 - Every margin check loops over all markets (one storage read each, plus an oracle call
   per open position), so gas grows with the number of markets.
-- Owner is a single-step `Ownable` key; no timelock, no parameter change delays, no
-  two-step ownership transfer. Pause has no guardian role.
-- `deployments/localhost.json` and the deploy script are for mocks only; a production
-  deployment script (real USDC, Chainlink feeds, sane `maxPriceAge`) does not exist yet.
+- No timelock and no parameter change delays; pause has no guardian role. Until the
+  multisig accepts ownership after a deployment, a single deployer key is the owner.
+- The testnet deployment script has only run against a local node with stand-in
+  contracts. It has not run against Arbitrum Sepolia, and source verification
+  (`hardhat verify`) has not been tried. There is no mainnet deployment script.

@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {IOracle} from "../interfaces/IOracle.sol";
 
 /// @dev Minimal subset of Chainlink's AggregatorV3Interface.
@@ -16,35 +17,62 @@ interface AggregatorV3Interface {
 
 /// @title ChainlinkOracle
 /// @notice Maps each market to a Chainlink USD feed and normalizes answers to WAD.
+///         On an L2 it can additionally consult Chainlink's sequencer uptime feed.
 /// @dev The owner chooses the feeds and is therefore fully trusted for prices.
-contract ChainlinkOracle is IOracle, Ownable {
+///
+///      getPrice reverts (instead of returning a flagged value) when
+///       - the market has no feed,
+///       - the sequencer is down, its feed has no round yet, or it came back less than
+///         `sequencerGracePeriod` ago,
+///       - the answer is not positive, the round is incomplete or dated in the future,
+///       - the answer is older than the market's `maxStaleness` (the feed's heartbeat
+///         plus a margin). The exchange applies its own global maxPriceAge on top.
+contract ChainlinkOracle is IOracle, Ownable2Step {
     struct Feed {
         AggregatorV3Interface aggregator;
         uint8 decimals;
+        uint32 maxStaleness; // seconds
     }
+
+    /// @notice Chainlink L2 sequencer uptime feed (answer 0 = up, 1 = down);
+    ///         address(0) disables the check (L1, or chains without such a feed).
+    AggregatorV3Interface public immutable sequencerUptimeFeed;
+    /// @notice Seconds after the sequencer came back up during which prices are still
+    ///         rejected, so that feeds and users can catch up before liquidations resume.
+    uint256 public immutable sequencerGracePeriod;
 
     mapping(uint32 marketId => Feed) private _feeds;
 
-    event FeedSet(uint32 indexed marketId, address aggregator, uint8 decimals);
+    event FeedSet(uint32 indexed marketId, address aggregator, uint8 decimals, uint32 maxStaleness);
 
     error FeedNotSet(uint32 marketId);
     error InvalidFeed();
     error InvalidAnswer(uint32 marketId);
+    error FeedStale(uint32 marketId, uint256 updatedAt);
+    error SequencerDown();
+    error SequencerGracePeriodNotOver();
 
-    constructor(address owner_) Ownable(owner_) {}
-
-    /// @notice Set (or replace) the feed of a market. Decimals are read once and cached.
-    function setFeed(uint32 marketId, address aggregator) external onlyOwner {
-        if (aggregator == address(0)) revert InvalidFeed();
-        uint8 feedDecimals = AggregatorV3Interface(aggregator).decimals();
-        if (feedDecimals > 36) revert InvalidFeed();
-        _feeds[marketId] = Feed(AggregatorV3Interface(aggregator), feedDecimals);
-        emit FeedSet(marketId, aggregator, feedDecimals);
+    constructor(address owner_, address sequencerUptimeFeed_, uint256 sequencerGracePeriod_) Ownable(owner_) {
+        sequencerUptimeFeed = AggregatorV3Interface(sequencerUptimeFeed_);
+        sequencerGracePeriod = sequencerGracePeriod_;
     }
 
-    function feedOf(uint32 marketId) external view returns (address aggregator, uint8 feedDecimals) {
+    /// @notice Set (or replace) the feed of a market. Decimals are read once and cached.
+    /// @param maxStaleness seconds after which an answer of this feed is rejected; use the
+    ///        feed's heartbeat plus a margin.
+    function setFeed(uint32 marketId, address aggregator, uint32 maxStaleness) external onlyOwner {
+        if (aggregator == address(0) || maxStaleness == 0) revert InvalidFeed();
+        uint8 feedDecimals = AggregatorV3Interface(aggregator).decimals();
+        if (feedDecimals > 36) revert InvalidFeed();
+        _feeds[marketId] = Feed(AggregatorV3Interface(aggregator), feedDecimals, maxStaleness);
+        emit FeedSet(marketId, aggregator, feedDecimals, maxStaleness);
+    }
+
+    function feedOf(
+        uint32 marketId
+    ) external view returns (address aggregator, uint8 feedDecimals, uint32 maxStaleness) {
         Feed storage feed = _feeds[marketId];
-        return (address(feed.aggregator), feed.decimals);
+        return (address(feed.aggregator), feed.decimals, feed.maxStaleness);
     }
 
     /// @inheritdoc IOracle
@@ -52,11 +80,14 @@ contract ChainlinkOracle is IOracle, Ownable {
         Feed memory feed = _feeds[marketId];
         if (address(feed.aggregator) == address(0)) revert FeedNotSet(marketId);
 
+        _requireSequencerUp();
+
         int256 answer;
         (, answer, , updatedAt, ) = feed.aggregator.latestRoundData();
         // updatedAt == 0 means the round is not complete; a timestamp in the future
         // cannot be a real observation.
         if (answer <= 0 || updatedAt == 0 || updatedAt > block.timestamp) revert InvalidAnswer(marketId);
+        if (block.timestamp - updatedAt > feed.maxStaleness) revert FeedStale(marketId, updatedAt);
 
         if (feed.decimals <= 18) {
             priceWad = uint256(answer) * 10 ** (18 - feed.decimals);
@@ -65,5 +96,17 @@ contract ChainlinkOracle is IOracle, Ownable {
         }
         // A positive answer can only truncate to zero with >18 feed decimals.
         if (priceWad == 0) revert InvalidAnswer(marketId);
+    }
+
+    /// @dev Chainlink's documented L2 pattern: answer 0 means the sequencer is up and
+    ///      `startedAt` is when that status began. While the sequencer is down, L2 prices
+    ///      can be stale without looking stale; right after it comes back, users need
+    ///      time to react before their positions are judged at the new prices.
+    function _requireSequencerUp() private view {
+        if (address(sequencerUptimeFeed) == address(0)) return;
+        (, int256 answer, uint256 startedAt, , ) = sequencerUptimeFeed.latestRoundData();
+        // startedAt == 0: the uptime feed has not been initialized on this chain yet.
+        if (answer != 0 || startedAt == 0 || startedAt > block.timestamp) revert SequencerDown();
+        if (block.timestamp - startedAt <= sequencerGracePeriod) revert SequencerGracePeriodNotOver();
     }
 }

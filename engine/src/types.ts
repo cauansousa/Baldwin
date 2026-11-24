@@ -47,11 +47,23 @@ export function jsonReplacer(_key: string, value: unknown): unknown {
   return typeof value === "bigint" ? value.toString() : value;
 }
 
-export const consoleLogger: Logger = {
-  info: (msg, ctx) => console.log(JSON.stringify({ level: "info", time: new Date().toISOString(), msg, ...ctx }, jsonReplacer)),
-  warn: (msg, ctx) => console.warn(JSON.stringify({ level: "warn", time: new Date().toISOString(), msg, ...ctx }, jsonReplacer)),
-  error: (msg, ctx) => console.error(JSON.stringify({ level: "error", time: new Date().toISOString(), msg, ...ctx }, jsonReplacer)),
-};
+export type LogLevel = "info" | "warn" | "error" | "silent";
+const LEVELS: Record<LogLevel, number> = { info: 0, warn: 1, error: 2, silent: 3 };
+
+/**
+ * Structured logs: one JSON object per line with `level`, `time`, `msg`, an optional
+ * `component`, and the context fields. info goes to stdout, warn and error to stderr.
+ */
+export function createLogger(minLevel: LogLevel = "info", component?: string): Logger {
+  const write = (level: "info" | "warn" | "error") => (msg: string, ctx?: Record<string, unknown>) => {
+    if (LEVELS[level] < LEVELS[minLevel]) return;
+    const line = JSON.stringify({ level, time: new Date().toISOString(), ...(component ? { component } : {}), msg, ...ctx }, jsonReplacer);
+    (level === "info" ? process.stdout : process.stderr).write(line + "\n");
+  };
+  return { info: write("info"), warn: write("warn"), error: write("error") };
+}
+
+export const consoleLogger: Logger = createLogger("info");
 
 export function errMessage(e: unknown): string {
   if (e instanceof Error) return (e as { shortMessage?: string }).shortMessage ?? e.message;

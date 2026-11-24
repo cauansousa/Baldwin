@@ -1,5 +1,6 @@
-import { decodeErrorResult, isAddressEqual, parseAbi } from "viem";
+import { decodeErrorResult, isAddressEqual } from "viem";
 import { BPS, WAD } from "../../../shared/src/index.ts";
+import { exchangeAbi } from "../abi.ts";
 import type { Band } from "../book/orderbook.ts";
 import type { ChainReader } from "../chain/types.ts";
 import type { Hex, MarketConfig, Match, Order } from "../types.ts";
@@ -42,23 +43,7 @@ export interface Verdict {
 
 export const UNATTRIBUTED: Verdict = { maker: { atFault: false }, taker: { atFault: false } };
 
-/**
- * Custom errors of the Exchange as they can appear in MatchFailed.reason. Only the
- * first four are in the shared ABI; the rest mirror Exchange.sol and are used
- * opportunistically: unknown revert data falls through to the view-based diagnosis.
- */
-const ERRORS = parseAbi([
-  "error InsufficientMargin(address trader)",
-  "error NegativeAccountValue(address trader)",
-  "error ReduceOnlyViolated(address trader)",
-  "error PriceOutOfBand(uint256 price, uint256 index)",
-  "error StalePrice(uint32 marketId)",
-  "error OnlyReducingAllowed()",
-  "error OpenInterestCapExceeded()",
-  "error FillTooSmall()",
-]);
-
-type ErrorName = (typeof ERRORS)[number]["name"];
+type ErrorName = Extract<(typeof exchangeAbi)[number], { type: "error" }>["name"];
 
 const TRADER_ERROR_TEXT: Partial<Record<ErrorName, string>> = {
   InsufficientMargin: "insufficient margin",
@@ -75,11 +60,15 @@ const GLOBAL_ERROR_TEXT: Partial<Record<ErrorName, string>> = {
   FillTooSmall: "fill below the minimum size",
 };
 
-/** Attribution from the revert data alone: a named trader, or a recognised global condition. */
+/**
+ * Attribution from the revert data alone (errors as declared in the shared ABI): a
+ * named trader, or a recognised global condition. Anything else (OrderIsCancelled,
+ * OrderExpired, unknown data, ...) returns null and is diagnosed from contract views.
+ */
 export function attributeFromRevert(match: Match, reason: Hex): Verdict | null {
   let err;
   try {
-    err = decodeErrorResult({ abi: ERRORS, data: reason });
+    err = decodeErrorResult({ abi: exchangeAbi, data: reason });
   } catch {
     return null;
   }

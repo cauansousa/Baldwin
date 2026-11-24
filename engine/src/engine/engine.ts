@@ -3,6 +3,8 @@ import { OrderBook, type Band, type BookFill, type BookOrder, type CancelReason,
 import type { ChainReader } from "../chain/types.ts";
 import { hashOrder, verifyCancelSignature, verifyOrderSignature, type Domain } from "../signing.ts";
 import { BatchRevertedError, type Batch, type MatchResult, type Settler } from "../settlement/types.ts";
+import { Metrics } from "../metrics.ts";
+import type { EngineStore, StoredMatch, StoredOrder } from "../store/types.ts";
 import { errMessage, silentLogger, type Address, type Hex, type Logger, type MarketConfig, type Match, type Order } from "../types.ts";
 import { MemoryDeadNonceStore, type DeadNonceStore } from "./deadNonces.ts";
 import { attributeFromRevert, classifyFailure, priceBand, requiredCollateral, UNATTRIBUTED, type MarginMarket, type OpenExposure, type Verdict } from "./reconcile.ts";
@@ -90,6 +92,8 @@ export type EngineErrorCode =
   | "INSUFFICIENT_MARGIN"
   | "POST_ONLY_WOULD_CROSS"
   | "CHAIN_UNAVAILABLE"
+  | "STORE_UNAVAILABLE"
+  | "SHUTTING_DOWN"
   | "NOT_FOUND";
 
 const HTTP_STATUS: Record<EngineErrorCode, number> = {
@@ -112,6 +116,8 @@ const HTTP_STATUS: Record<EngineErrorCode, number> = {
   INSUFFICIENT_MARGIN: 422,
   POST_ONLY_WOULD_CROSS: 422,
   CHAIN_UNAVAILABLE: 503,
+  STORE_UNAVAILABLE: 503,
+  SHUTTING_DOWN: 503,
   NOT_FOUND: 404,
 };
 
@@ -148,8 +154,14 @@ export interface EngineOptions {
   minTimeToExpirySec?: number;
   /** Maximum time to expiry at intake; also bounds the dead-nonce set. Default 7 days. */
   maxTimeToExpirySec?: number;
-  /** Durable set of dead (trader, nonce) pairs. Default: in memory only. */
+  /** Durable set of dead (trader, nonce) pairs. Default: `store` if given, else in memory only. */
   deadNonces?: DeadNonceStore;
+  /**
+   * Durable engine state. When given, the constructor rebuilds orders, books, unsettled
+   * matches and trades from it; call `recover()` before taking orders.
+   */
+  store?: EngineStore;
+  metrics?: Metrics;
   /** At-fault on-chain failures within `faultWindowSec` after which a trader's new orders are refused. Default 3. */
   faultThreshold?: number;
   /** Default 600. */
@@ -243,6 +255,16 @@ export class Engine extends EventEmitter<EngineEvents> {
   /** trader:nonce -> hash of the order that uses it. */
   private readonly usedNonces = new Map<string, Hex>();
   private readonly dead: DeadNonceStore;
+  private readonly store: EngineStore | undefined;
+  readonly metrics: Metrics;
+  /** trader -> nonce below which every order is cancelled on-chain (cancelAllOrders). */
+  private readonly minValidNonce = new Map<string, bigint>();
+  private readonly dirty = new Set<OrderRecord>();
+  private pendingWrite = emptyWrite();
+  private persistedCounters = "";
+  private storeBroken = false;
+  private draining = false;
+  private sweeps = 0;
   /** Orders currently between validation and the book (hash -> order as submitted). */
   private readonly intake = new Map<Hex, Order>();
   private readonly traderLocks = new Map<string, Promise<unknown>>();
@@ -302,7 +324,21 @@ export class Engine extends EventEmitter<EngineEvents> {
     const minTtl = BigInt(opts.minTimeToExpirySec ?? 60);
     this.minTimeToExpiry = minTtl > this.expiryBuffer ? minTtl : this.expiryBuffer;
     this.maxTimeToExpiry = BigInt(opts.maxTimeToExpirySec ?? 7 * 24 * 3600);
-    this.dead = opts.deadNonces ?? new MemoryDeadNonceStore();
+    this.store = opts.store;
+    this.dead = opts.deadNonces ?? opts.store ?? new MemoryDeadNonceStore();
+    this.metrics = opts.metrics ?? new Metrics();
+    this.metrics.counter("orders_accepted_total", "Orders accepted into the engine");
+    this.metrics.counter("orders_rejected_total", "Orders refused at intake, by error code");
+    this.metrics.counter("orders_cancelled_total", "Cancels processed (signed Cancel or on-chain)");
+    this.metrics.counter("matches_settled_total", "Matches confirmed on-chain");
+    this.metrics.counter("matches_failed_total", "Matches that failed on-chain");
+    this.metrics.counter("batches_total", "settleMatches batches with a final outcome");
+    this.metrics.counter("batch_errors_total", "Settlement attempts that ended in an error and were retried");
+    this.metrics.histogram("batch_latency_seconds", "Time from handing a batch to the settler to its final outcome", [0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300]);
+    this.metrics.gauge("settlement_queue_depth", "Matches waiting for or in settlement", () => this.queue.length + (this.current?.matches.length ?? 0));
+    this.metrics.gauge("settlement_stalled", "1 while a batch is being retried after an error", () => (this.stalled ? 1 : 0));
+    this.metrics.gauge("resting_orders", "Orders resting in all books", () => [...this.books.values()].reduce((n, b) => n + b.size, 0));
+    this.metrics.gauge("exchange_paused", "1 if the engine believes the exchange is paused", () => (this.exchangePaused ? 1 : 0));
     this.faultThreshold = opts.faultThreshold ?? 3;
     this.faultWindowSec = opts.faultWindowSec ?? 600;
     this.maxChainStateAgeMs = opts.maxChainStateAgeMs ?? 30_000;
@@ -319,6 +355,161 @@ export class Engine extends EventEmitter<EngineEvents> {
       this.marketState.set(m.marketId, { index: null, band: undefined });
     }
     this.marketsAt = Date.now();
+    if (this.store) this.loadFromStore(this.store);
+  }
+
+  // ---------------------------------------------------------------- persistence
+
+  /** Rebuild in-memory state from the store: same orders, same time priority, same unsettled matches. */
+  private loadFromStore(store: EngineStore): void {
+    const snap = store.load();
+    for (const o of snap.orders) {
+      const market = this.markets.get(o.order.marketId);
+      if (!market) {
+        this.log.warn("stored order for a market that no longer exists; ignored", { orderHash: o.hash, marketId: o.order.marketId });
+        continue;
+      }
+      const traderKey = o.order.trader.toLowerCase();
+      const rec: OrderRecord = { ...o, traderKey, reduceOnly: o.order.reduceOnly };
+      this.orders.set(rec.hash, rec);
+      this.usedNonces.set(nonceKey(traderKey, rec.order.nonce), rec.hash);
+      let set = this.ordersByTrader.get(traderKey);
+      if (!set) this.ordersByTrader.set(traderKey, (set = new Set()));
+      set.add(rec.hash);
+      const book = this.books.get(rec.order.marketId)!;
+      book.reserveSeq(rec.seq);
+      if (!rec.closed && rec.remaining > 0n) book.load(this.toBookOrder(rec), rec.seq, rec.remaining);
+    }
+    for (const m of snap.matches) {
+      const maker = this.orders.get(m.makerHash);
+      const taker = this.orders.get(m.takerHash);
+      if (!maker || !taker) throw new Error(`store is inconsistent: match ${m.id} refers to an unknown order`);
+      const match: Match = {
+        id: m.id,
+        marketId: m.marketId,
+        maker: maker.order,
+        makerSig: maker.signature,
+        makerHash: maker.hash,
+        taker: taker.order,
+        takerSig: taker.signature,
+        takerHash: taker.hash,
+        fillSize: m.fillSize,
+        price: m.price,
+      };
+      if (m.batchId === null) this.queue.push(match);
+      else if (!this.current || this.current.id === m.batchId) (this.current ??= { id: m.batchId, matches: [] }).matches.push(match);
+      else throw new Error(`store is inconsistent: more than one batch in flight (${this.current.id}, ${m.batchId})`);
+    }
+    for (const t of snap.trades) {
+      const list = this.trades.get(t.marketId);
+      if (!list) continue;
+      list.push(t);
+      if (list.length > this.tradeHistory) list.shift();
+      this.lastPrice.set(t.marketId, t.price);
+    }
+    for (const { trader, nonce } of snap.minValidNonces) this.minValidNonce.set(trader.toLowerCase(), nonce);
+    const counters = JSON.parse(store.getMeta("engine.counters") ?? "{}") as { matchSeq?: number; batchSeq?: number; tradeSeq?: number };
+    this.matchSeq = counters.matchSeq ?? 0;
+    this.batchSeq = counters.batchSeq ?? 0;
+    this.tradeSeq = counters.tradeSeq ?? 0;
+    this.persistedCounters = this.countersJson();
+    if (snap.orders.length > 0) {
+      this.log.info("state restored from store", {
+        orders: snap.orders.length,
+        resting: [...this.books.values()].reduce((n, b) => n + b.size, 0),
+        queuedMatches: this.queue.length,
+        inFlightBatch: this.current ? `${this.current.id} (${this.current.matches.length} matches)` : null,
+      });
+    }
+  }
+
+  /**
+   * Bring restored state in line with the chain. Call once after construction and
+   * before taking orders:
+   *  1. the batch that was in flight when the process died, and every match that was
+   *     queued, is driven to its real on-chain outcome through the settler (which
+   *     looks its own transactions up by hash - nothing is assumed, nothing is sent twice);
+   *  2. every resting order is checked against `filledSize` and `isCancelled`
+   *     (which covers `cancelAllOrders`) and expiry, and corrected to what the chain says.
+   * Rejects if the chain cannot be read; the caller should not start serving then.
+   */
+  async recover(): Promise<void> {
+    await this.refreshChainState();
+    if (this.current || this.queue.length > 0) {
+      this.kick();
+      await this.idle();
+    }
+    const chain = this.chain;
+    if (chain) {
+      const resting = [...this.orders.values()].filter((r) => !r.closed && r.remaining > 0n);
+      for (let i = 0; i < resting.length; i += 20) {
+        const chunk = resting.slice(i, i + 20);
+        const facts = await Promise.all(
+          chunk.map(async (r) => ({ filled: await chain.filledSize(r.hash), cancelled: await chain.isCancelled(r.order.trader, r.order.nonce) })),
+        );
+        chunk.forEach((rec, k) => {
+          const { filled, cancelled } = facts[k]!;
+          if (rec.closed || rec.remaining === 0n) return;
+          if (cancelled) {
+            this.cancelNonce(rec.order.trader, rec.order.nonce, "cancelled on-chain");
+            return;
+          }
+          if (filled === rec.filled) return;
+          this.log.warn("order fill state differs from the chain; using the chain's", { orderHash: rec.hash, engine: rec.filled, chain: filled });
+          const remaining = rec.order.size - filled - rec.pending;
+          rec.filled = filled;
+          rec.remaining = remaining > 0n ? remaining : 0n;
+          this.books.get(rec.order.marketId)!.setRemaining(rec.hash, rec.remaining);
+          this.touch(rec);
+        });
+      }
+    }
+    this.sweepExpired();
+    this.flush();
+    for (const marketId of this.books.keys()) this.emit("book", marketId);
+  }
+
+  private touch(rec: OrderRecord): void {
+    if (this.store) this.dirty.add(rec);
+  }
+
+  private countersJson(): string {
+    return JSON.stringify({ matchSeq: this.matchSeq, batchSeq: this.batchSeq, tradeSeq: this.tradeSeq });
+  }
+
+  /**
+   * Write everything the current operation changed in one atomic, durable commit.
+   * Returns false (and halts order intake) if the store refuses; the changes are kept
+   * and written by the next successful flush.
+   */
+  private flush(): boolean {
+    const store = this.store;
+    if (!store) return true;
+    const w = this.pendingWrite;
+    const counters = this.countersJson();
+    if (this.dirty.size === 0 && w.addMatches.length === 0 && w.removeMatches.length === 0 && w.trades.length === 0 && w.minValidNonces.length === 0 && !w.batched && counters === this.persistedCounters) {
+      return !this.storeBroken;
+    }
+    try {
+      store.commit({
+        orders: [...this.dirty].map(toStored),
+        addMatches: w.addMatches,
+        batched: w.batched,
+        removeMatches: w.removeMatches,
+        trades: w.trades,
+        minValidNonces: w.minValidNonces,
+        meta: { "engine.counters": counters },
+      });
+    } catch (e) {
+      this.storeBroken = true;
+      this.log.error("could not persist engine state; order intake halted", { error: errMessage(e) });
+      return false;
+    }
+    this.dirty.clear();
+    this.pendingWrite = emptyWrite();
+    this.persistedCounters = counters;
+    this.storeBroken = false;
+    return true;
   }
 
   // ------------------------------------------------------------------ lifecycle
@@ -335,14 +526,34 @@ export class Engine extends EventEmitter<EngineEvents> {
     }
   }
 
-  /** Stop timers and the settlement loop (the batch in flight, if any, is awaited). */
-  async stop(): Promise<void> {
-    this.stopped = true;
+  /**
+   * Shut down: refuse new orders at once, give matches already queued or in flight
+   * up to `drainTimeoutMs` to reach their on-chain outcome, then stop. Whatever is
+   * still unresolved stays in the store and is resolved by `recover()` on the next start.
+   */
+  async stop(drainTimeoutMs = 0): Promise<void> {
+    this.draining = true;
     if (this.sweepTimer) clearInterval(this.sweepTimer);
     if (this.refreshTimer) clearInterval(this.refreshTimer);
     this.sweepTimer = this.refreshTimer = null;
+    if (drainTimeoutMs > 0 && this.loop) {
+      let timer: NodeJS.Timeout | undefined;
+      const timedOut = await Promise.race([
+        this.idle().then(() => false),
+        new Promise<boolean>((r) => (timer = setTimeout(() => r(true), drainTimeoutMs))),
+      ]);
+      clearTimeout(timer);
+      if (timedOut) this.log.warn("shutdown: settlement did not finish in time; it will be resolved on the next start", this.settlementStatus() as never);
+    }
+    this.stopped = true;
     this.wakeRetry?.();
-    await this.loop;
+    if (drainTimeoutMs > 0) {
+      // Do not hang on a settler that is still waiting for a receipt.
+      await Promise.race([this.loop, new Promise((r) => setTimeout(r, 1000).unref())]);
+    } else {
+      await this.loop;
+    }
+    this.flush();
   }
 
   /**
@@ -391,6 +602,7 @@ export class Engine extends EventEmitter<EngineEvents> {
         this.applyBookEffects(marketId, { fills: [], expired: [], cancelled: pruned.map((o) => ({ ...o, reason: "price_band" as const })) });
         this.emit("book", marketId);
       }
+      this.flush();
     } catch (e) {
       this.log.error("error while enforcing price bands", { error: errMessage(e) });
     }
@@ -487,6 +699,17 @@ export class Engine extends EventEmitter<EngineEvents> {
   // --------------------------------------------------------------------- intake
 
   async submit(req: SubmitRequest): Promise<SubmitResult> {
+    try {
+      const res = await this.submitInner(req);
+      this.metrics.inc("orders_accepted_total");
+      return res;
+    } catch (e) {
+      this.metrics.inc("orders_rejected_total", { code: e instanceof EngineError ? e.code : "INTERNAL" });
+      throw e;
+    }
+  }
+
+  private async submitInner(req: SubmitRequest): Promise<SubmitResult> {
     const { order } = req;
     const postOnly = req.postOnly ?? false;
     const ioc = req.ioc ?? false;
@@ -494,6 +717,8 @@ export class Engine extends EventEmitter<EngineEvents> {
     const market = this.markets.get(order.marketId);
     if (!market) throw new EngineError("UNKNOWN_MARKET", `unknown market ${order.marketId}`);
     if (!market.active) throw new EngineError("MARKET_INACTIVE", `market ${order.marketId} is not active`);
+    if (this.draining) throw new EngineError("SHUTTING_DOWN", "engine is shutting down; not accepting orders");
+    if (this.storeBroken) throw new EngineError("STORE_UNAVAILABLE", "engine state cannot be persisted; not accepting orders");
     if (this.stalled) {
       // Do not pile up matches while their settlement outcome cannot be determined.
       throw new EngineError("CHAIN_UNAVAILABLE", "settlement is stalled; not accepting orders");
@@ -547,8 +772,23 @@ export class Engine extends EventEmitter<EngineEvents> {
     }
   }
 
-  /** Final checks and the book update. Synchronous: nothing can interleave. */
+  /**
+   * Final checks and the book update. Synchronous: nothing can interleave. The result
+   * is durable in the store before it is returned.
+   */
   private insert(req: SubmitRequest, hash: Hex, priorFilled: bigint): SubmitResult {
+    let ok = false;
+    try {
+      const res = this.insertInner(req, hash, priorFilled);
+      ok = true;
+      if (!this.flush()) throw new EngineError("STORE_UNAVAILABLE", "the order could not be persisted; its state is unknown, query it before retrying");
+      return res;
+    } finally {
+      if (!ok) this.flush();
+    }
+  }
+
+  private insertInner(req: SubmitRequest, hash: Hex, priorFilled: bigint): SubmitResult {
     const { order } = req;
     const postOnly = req.postOnly ?? false;
     const ioc = req.ioc ?? false;
@@ -604,6 +844,7 @@ export class Engine extends EventEmitter<EngineEvents> {
       createdAt: Date.now(),
     };
     this.orders.set(hash, rec);
+    this.touch(rec);
     this.usedNonces.set(nonceKey(traderKey, order.nonce), hash);
     let set = this.ordersByTrader.get(traderKey);
     if (!set) this.ordersByTrader.set(traderKey, (set = new Set()));
@@ -677,8 +918,32 @@ export class Engine extends EventEmitter<EngineEvents> {
     // Without a known expiry keep the entry for as long as any acceptable order could live.
     const until = expiry ?? rec?.order.expiry ?? BigInt(this.clock()) + this.maxTimeToExpiry + 1n;
     this.dead.add(trader, nonce, until);
+    this.metrics.inc("orders_cancelled_total");
     if (!rec || rec.userCancelled) return;
+    this.cancelRecord(rec, reason);
+    this.flush();
+  }
+
+  /**
+   * On-chain `cancelAllOrders`: every order of the trader with nonce < `minValid` is
+   * dead. Resting ones leave the book now; later submissions are refused.
+   */
+  cancelBelow(trader: Address, minValid: bigint, reason = "cancelled on-chain (cancelAllOrders)"): void {
+    const traderKey = trader.toLowerCase();
+    if ((this.minValidNonce.get(traderKey) ?? 0n) >= minValid) return;
+    this.minValidNonce.set(traderKey, minValid);
+    this.pendingWrite.minValidNonces.push({ trader, nonce: minValid });
+    this.metrics.inc("orders_cancelled_total");
+    for (const hash of this.ordersByTrader.get(traderKey) ?? []) {
+      const rec = this.orders.get(hash)!;
+      if (rec.order.nonce < minValid && !rec.userCancelled) this.cancelRecord(rec, reason);
+    }
+    this.flush();
+  }
+
+  private cancelRecord(rec: OrderRecord, reason: string): void {
     rec.userCancelled = true;
+    this.touch(rec);
     if (rec.closed) return;
     if (rec.remaining > 0n) {
       this.books.get(rec.order.marketId)!.cancel(rec.hash);
@@ -691,16 +956,35 @@ export class Engine extends EventEmitter<EngineEvents> {
   /** Drop expired resting orders from every book. */
   sweepExpired(): void {
     const now = this.bookNow();
-    this.dead.prune(BigInt(this.clock()));
     for (const [marketId, book] of this.books) {
       const expired = book.pruneExpired(now);
       if (expired.length === 0) continue;
       this.applyBookEffects(marketId, { fills: [], expired });
       this.emit("book", marketId);
     }
+    this.flush();
+    if (++this.sweeps % 60 === 0) this.pruneFinished();
   }
 
-  // ------------------------------------------------------------------ internals
+  /**
+   * Forget orders that are finished and past their expiry (they can no longer be
+   * submitted or settled), in memory and in the store, and expired dead nonces.
+   */
+  pruneFinished(): void {
+    const now = BigInt(this.clock());
+    for (const [hash, rec] of this.orders) {
+      if (rec.order.expiry > now || rec.pending > 0n || (rec.remaining > 0n && !rec.closed) || this.dirty.has(rec)) continue;
+      this.orders.delete(hash);
+      this.usedNonces.delete(nonceKey(rec.traderKey, rec.order.nonce));
+      this.ordersByTrader.get(rec.traderKey)?.delete(hash);
+    }
+    try {
+      this.dead.prune(now);
+      this.store?.pruneFinished(now, this.tradeHistory);
+    } catch (e) {
+      this.log.warn("store pruning failed", { error: errMessage(e) });
+    }
+  }
 
   private bookNow(): bigint {
     return BigInt(this.clock()) + this.expiryBuffer;
@@ -712,6 +996,9 @@ export class Engine extends EventEmitter<EngineEvents> {
 
   private checkNotSeen(hash: Hex, order: Order): void {
     if (this.orders.has(hash)) throw new EngineError("DUPLICATE_ORDER", "order already submitted");
+    if (order.nonce < (this.minValidNonce.get(order.trader.toLowerCase()) ?? 0n)) {
+      throw new EngineError("NONCE_CANCELLED", "nonce is below the trader's on-chain minValidNonce (cancelAllOrders)");
+    }
     if (this.dead.has(order.trader, order.nonce)) {
       throw new EngineError("NONCE_CANCELLED", "this nonce was cancelled or its order was closed; sign a new order");
     }
@@ -762,6 +1049,7 @@ export class Engine extends EventEmitter<EngineEvents> {
   private close(rec: OrderRecord, status: "cancelled" | "expired" | "rejected", reason: string): void {
     if (rec.closed) return;
     rec.closed = { status, reason };
+    this.touch(rec);
     if (status !== "expired") this.markDead(rec.order);
   }
 
@@ -863,9 +1151,12 @@ export class Engine extends EventEmitter<EngineEvents> {
       for (const rec of [maker, taker]) {
         rec.remaining -= f.size;
         rec.pending += f.size;
+        this.touch(rec);
       }
+      const id = `m${++this.matchSeq}`;
+      this.pendingWrite.addMatches.push({ id, marketId, makerHash: maker.hash, takerHash: taker.hash, fillSize: f.size, price: f.price, batchId: null });
       this.queue.push({
-        id: `m${++this.matchSeq}`,
+        id,
         marketId,
         maker: maker.order,
         makerSig: maker.signature,
@@ -908,14 +1199,31 @@ export class Engine extends EventEmitter<EngineEvents> {
     await Promise.resolve();
     let reverts = 0;
     while (!this.stopped && (this.current || this.queue.length > 0)) {
-      this.current ??= { id: `b${++this.batchSeq}`, matches: this.queue.splice(0, this.maxBatchSize) };
+      if (!this.current) {
+        this.current = { id: `b${++this.batchSeq}`, matches: this.queue.splice(0, this.maxBatchSize) };
+        // Durable before anything is broadcast: after a crash these matches are known
+        // to belong to this batch, whose fate the settler can establish.
+        this.pendingWrite.batched = { batchId: this.current.id, ids: this.current.matches.map((m) => m.id) };
+        if (!this.flush()) {
+          this.queue.unshift(...this.current.matches);
+          this.current = null;
+          this.pendingWrite.batched = null;
+          this.batchSeq--;
+          this.stalled = true;
+          this.lastError = "engine state cannot be persisted";
+          await this.retryPause();
+          continue;
+        }
+      }
       const batch = this.current;
+      const startedAt = Date.now();
       let results: MatchResult[];
       try {
         results = await this.settler.settle(batch);
         if (results.length !== batch.matches.length) throw new Error("settler returned a wrong number of results");
       } catch (e) {
         this.lastError = errMessage(e);
+        this.metrics.inc("batch_errors_total");
         if (e instanceof BatchRevertedError && ++reverts >= this.maxBatchReverts) {
           // Definitively not settled, repeatedly: give up on these matches.
           this.log.error("batch reverted repeatedly; failing its matches", { batch: batch.id, error: this.lastError });
@@ -943,6 +1251,7 @@ export class Engine extends EventEmitter<EngineEvents> {
       // The outcome is final from here on: the batch must never be handed to the settler again.
       this.current = null;
       this.applyResults(batch, results, verdicts);
+      this.metrics.observe("batch_latency_seconds", (Date.now() - startedAt) / 1000);
       reverts = 0;
       this.stalled = false;
       this.lastError = null;
@@ -990,6 +1299,9 @@ export class Engine extends EventEmitter<EngineEvents> {
         this.log.error("error while applying a settlement result", { batch: batch.id, match: m.id, error: errMessage(e) });
       }
     });
+    this.pendingWrite.removeMatches.push(...batch.matches.map((m) => m.id));
+    this.metrics.inc("batches_total");
+    this.flush();
     for (const marketId of touched) this.emit("book", marketId);
   }
 
@@ -999,8 +1311,10 @@ export class Engine extends EventEmitter<EngineEvents> {
       rec.pending -= m.fillSize;
       rec.filled += m.fillSize;
       rec.strikes = 0;
+      this.touch(rec);
     }
     this.settledCount++;
+    this.metrics.inc("matches_settled_total");
     this.lastPrice.set(m.marketId, m.price);
     const trade: Trade = {
       id: `t${++this.tradeSeq}`,
@@ -1017,6 +1331,7 @@ export class Engine extends EventEmitter<EngineEvents> {
     };
     const list = this.trades.get(m.marketId)!;
     list.push(trade);
+    this.pendingWrite.trades.push(trade);
     if (list.length > this.tradeHistory) list.splice(0, list.length - this.tradeHistory);
     this.emit("trade", trade);
   }
@@ -1039,6 +1354,9 @@ export class Engine extends EventEmitter<EngineEvents> {
     const taker = this.orders.get(m.takerHash)!;
     maker.pending -= m.fillSize;
     taker.pending -= m.fillSize;
+    this.touch(maker);
+    this.touch(taker);
+    this.metrics.inc("matches_failed_total");
     this.log.warn("match failed on-chain", {
       match: m.id,
       makerOrderHash: m.makerHash,
@@ -1083,11 +1401,13 @@ export class Engine extends EventEmitter<EngineEvents> {
     if (rec.closed) return;
     if (rec.remaining > 0n) this.books.get(rec.order.marketId)!.cancel(rec.hash);
     rec.remaining = 0n;
+    this.touch(rec);
     this.close(rec, status, reason);
   }
 
   /** Return `size` of an undone match to an innocent order, if it is still eligible. */
   private giveBack(rec: OrderRecord, size: bigint): void {
+    this.touch(rec);
     if (rec.closed) return;
     if (rec.userCancelled) {
       this.close(rec, "cancelled", "cancelled by trader");
@@ -1121,4 +1441,32 @@ export class Engine extends EventEmitter<EngineEvents> {
     rec.remaining += size;
     this.applyBookEffects(marketId, book.restore(this.toBookOrder(rec), rec.seq, size, opts));
   }
+}
+
+function emptyWrite() {
+  return {
+    addMatches: [] as StoredMatch[],
+    removeMatches: [] as string[],
+    trades: [] as Trade[],
+    minValidNonces: [] as { trader: Address; nonce: bigint }[],
+    batched: null as { batchId: string; ids: string[] } | null,
+  };
+}
+
+function toStored(rec: OrderRecord): StoredOrder {
+  return {
+    hash: rec.hash,
+    order: rec.order,
+    signature: rec.signature,
+    postOnly: rec.postOnly,
+    ioc: rec.ioc,
+    seq: rec.seq,
+    createdAt: rec.createdAt,
+    remaining: rec.remaining,
+    pending: rec.pending,
+    filled: rec.filled,
+    userCancelled: rec.userCancelled,
+    strikes: rec.strikes,
+    ...(rec.closed ? { closed: rec.closed } : {}),
+  };
 }

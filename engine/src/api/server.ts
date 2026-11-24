@@ -16,8 +16,11 @@ export interface ServerOptions {
   /** WebSocket connections allowed in total (default 1000) and per IP (default 10). */
   wsMaxConnections?: number;
   wsMaxConnectionsPerIp?: number;
-  /** Extra fields for GET /health. */
-  info?: Record<string, unknown>;
+  /**
+   * Extra fields for GET /health; a function is evaluated per request. A `warnings`
+   * array in it is merged into the response's `warnings`.
+   */
+  info?: Record<string, unknown> | (() => Record<string, unknown>);
   logger?: boolean;
 }
 
@@ -59,7 +62,18 @@ export async function buildServer(engine: Engine, opts: ServerOptions = {}): Pro
 
   app.get("/health", async () => {
     const settlement = engine.settlementStatus();
-    return { ok: !settlement.stalled, ...opts.info, settlement, chain: engine.chainStatus() };
+    const { warnings: extra, ...info } = (typeof opts.info === "function" ? opts.info() : (opts.info ?? {})) as { warnings?: string[] };
+    const warnings = [...(extra ?? [])];
+    if (settlement.stalled) warnings.push(`settlement is stalled: ${settlement.lastError ?? "unknown error"}`);
+    const chain = engine.chainStatus();
+    if (chain?.paused) warnings.push("exchange is paused");
+    for (const m of chain?.markets ?? []) if (m.indexPrice === null) warnings.push(`no index price for market ${m.marketId}: market halted`);
+    return { ok: !settlement.stalled, ...info, warnings, settlement, chain };
+  });
+
+  // Prometheus text exposition format.
+  app.get("/metrics", async (_req, reply) => {
+    return reply.header("content-type", "text/plain; version=0.0.4; charset=utf-8").serializer((x: unknown) => String(x)).send(engine.metrics.render());
   });
 
   app.get("/markets", async () => engine.getMarkets());

@@ -78,7 +78,9 @@ export async function deployFixture() {
     await token.connect(s).approve(await exchange.getAddress(), ethers.MaxUint256);
   }
 
-  const ctx = new Ctx(exchange, oracle, token, operator);
+  // Orders must expire within 30 days; tests never move time forward by more than a few days.
+  const defaultExpiry = (await ethers.provider.getBlock("latest"))!.timestamp + 20 * 24 * HOUR;
+  const ctx = new Ctx(exchange, oracle, token, operator, defaultExpiry);
   return { owner, operator, feeRecipient, alice, bob, carol, dave, liquidator, stranger, token, oracle, exchange, ctx };
 }
 
@@ -90,6 +92,7 @@ export class Ctx {
     public oracle: MockOracle,
     public token: MockUSDC,
     public operator: HardhatEthersSigner,
+    public defaultExpiry: number,
   ) {}
 
   order(trader: HardhatEthersSigner, isBuy: boolean, size: bigint, limitPrice: bigint, o: Partial<Order> = {}): Order {
@@ -101,7 +104,7 @@ export class Ctx {
       size,
       limitPrice,
       nonce: this.nonce++,
-      expiry: 0,
+      expiry: this.defaultExpiry,
       ...o,
     };
   }
