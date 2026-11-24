@@ -130,4 +130,6 @@ export interface Deployment {
   usdc: `0x${string}`;
   oracle: `0x${string}`;
   markets: { marketId: number; symbol: string }[];
+  /** Block the Exchange was created in; where event readers start. Absent on local deployments. */
+  deploymentBlock?: number;
 }

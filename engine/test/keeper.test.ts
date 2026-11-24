@@ -27,6 +27,9 @@ class FakeKeeperChain implements KeeperChain {
   async isLiquidatable(trader: Address) {
     return this.liquidatable.has(trader);
   }
+  async isLiquidatableIn(trader: Address) {
+    return this.liquidatable.has(trader);
+  }
   /** Largest size the liquidator can take over (as the contract would enforce through margin). */
   capacity: bigint | null = null;
   free = 0n;
@@ -72,7 +75,7 @@ describe("Keeper", () => {
     chain.events = [{ block: 3n, trader: alice.address, marketId: 1 }, { block: 22n, trader: bob.address, marketId: 1 }];
     chain.positions.set(`${alice.address}:1`, 5n);
     chain.positions.set(`${bob.address}:1`, -5n);
-    const keeper = new Keeper({ chain, marketIds: [1], maxBlockRange: 10n });
+    const keeper = new Keeper({ chain, headLag: 0n, overlap: 0n, untrackAfterZeroReads: 1, marketIds: [1], maxBlockRange: 10n });
     await keeper.tick();
     expect(chain.queries).toEqual([[0n, 9n], [10n, 19n], [20n, 25n]]);
     expect(keeper.trackedAccounts().sort()).toEqual([alice.address, bob.address].sort());
@@ -93,7 +96,7 @@ describe("Keeper", () => {
     chain.positions.set(`${alice.address}:1`, 5n);
     chain.positions.set(`${alice.address}:2`, -3n);
     chain.positions.set(`${bob.address}:1`, -5n);
-    const keeper = new Keeper({ chain, marketIds: [1, 2] });
+    const keeper = new Keeper({ chain, headLag: 0n, overlap: 0n, untrackAfterZeroReads: 1, marketIds: [1, 2] });
     await keeper.tick();
     expect(chain.liquidations).toEqual([]);
 
@@ -115,7 +118,7 @@ describe("Keeper", () => {
     chain.liquidatable.add(alice.address);
     chain.capacity = 5n * WAD;
     chain.free = 100_000_000n; // 100 USDC -> 90 budget -> 450 notional at 20% -> 4.5 units at price 100
-    const keeper = new Keeper({ chain, marketIds: [1] });
+    const keeper = new Keeper({ chain, headLag: 0n, overlap: 0n, untrackAfterZeroReads: 1, marketIds: [1] });
     await keeper.tick();
     expect(chain.liquidations).toEqual([[alice.address, 1, (45n * WAD) / 10n]]);
     expect(chain.positions.get(`${alice.address}:1`)).toBe((-55n * WAD) / 10n);
@@ -126,37 +129,33 @@ describe("Keeper", () => {
     chain.events = [{ block: 1n, trader: bob.address, marketId: 1 }];
     chain.positions.set(`${bob.address}:1`, 5n);
     chain.liquidatable.add(bob.address);
-    const keeper = new Keeper({ chain, marketIds: [1], self: bob.address });
+    const keeper = new Keeper({ chain, headLag: 0n, overlap: 0n, untrackAfterZeroReads: 1, marketIds: [1], self: bob.address });
     await keeper.tick();
     expect(chain.liquidations).toEqual([]);
   });
 
-  it("schedules funding from the on-chain lastFundingTime: no call before the interval, one when due, retry after a failure", async () => {
+  it("schedules funding from the on-chain lastFundingTime against chain time: no call before the interval, one when due, retry after a failure", async () => {
     const chain = new FakeKeeperChain();
     chain.time = 10_000n;
     chain.lastFunding.set(1, 9_000n); // 1000 s ago
     chain.lastFunding.set(2, 6_400n); // exactly one interval ago
-    let now = 10_000;
-    chain.wall = () => now;
-    const keeper = new Keeper({ chain, marketIds: [1, 2], fundingIntervalSec: 3600, now: () => now });
+    const keeper = new Keeper({ chain, headLag: 0n, overlap: 0n, marketIds: [1, 2], fundingIntervalSec: 3600, now: () => 99_999_999 });
     await keeper.tick();
     expect(chain.funding).toEqual([2]); // a freshly started keeper does not call what is not due
     await keeper.tick();
     expect(chain.funding).toEqual([2]);
-    // market 1 becomes due by wall clock even if no block has been mined since
-    now = 12_600;
+    chain.time = 12_600n; // market 1 becomes due
     chain.fundingFails = true;
     await keeper.tick();
     expect(chain.funding).toEqual([2]);
     chain.fundingFails = false;
     await keeper.tick();
     expect(chain.funding).toEqual([2, 1]);
-    // someone else updated funding in the meantime: the keeper follows the chain, not its own clock
+    // someone else updated funding in the meantime: the keeper follows the chain
     chain.lastFunding.set(2, 12_000n);
-    now = 13_700; // 3700 s after the keeper's own call for market 2, but only 1700 s after the on-chain one
+    chain.time = 13_700n; // 3700 s after the keeper's own call for market 2, but only 1700 s after the on-chain one
     await keeper.tick();
     expect(chain.funding).toEqual([2, 1]);
-    // chain time ahead of the wall clock counts too
     chain.time = 15_600n;
     await keeper.tick();
     expect(chain.funding).toEqual([2, 1, 2]);

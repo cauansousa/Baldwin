@@ -34,14 +34,17 @@ describe("order intake", () => {
     expect(h.engine.getOrderBook(1, 10).bids).toEqual([]);
   });
 
-  it("rejects duplicates, also when submitted concurrently", async () => {
+  it("the identical signed order is accepted once; submitting it again (also concurrently) returns its state", async () => {
     const h = harness();
     const order = makeOrder(alice, true, 100, 1);
     const signature = await signOrder(alice, order);
-    const results = await Promise.all([code(h.engine.submit({ order, signature })), code(h.engine.submit({ order, signature }))]);
-    expect(results.sort()).toEqual(["DUPLICATE_ORDER", "OK"]);
-    expect(await code(h.engine.submit({ order, signature }))).toBe("DUPLICATE_ORDER");
+    const results = await Promise.all([h.engine.submit({ order, signature }), h.engine.submit({ order, signature })]);
+    expect(results.map((r) => r.duplicate === true).sort()).toEqual([false, true]);
+    expect(results[0]!.orderHash).toBe(results[1]!.orderHash);
+    expect(await h.engine.submit({ order, signature })).toMatchObject({ duplicate: true, status: "open", remaining: wad(1), fills: [] });
     expect(h.engine.getOrderBook(1, 10).bids).toEqual([{ price: wad(100), size: wad(1) }]);
+    // a duplicate with a wrong signature is refused like any other
+    expect(await code(h.engine.submit({ order, signature: await signOrder(bob, order) }))).toBe("BAD_SIGNATURE");
   });
 
   it("rejects expired orders, including those expiring within the safety buffer", async () => {

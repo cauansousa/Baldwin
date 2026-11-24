@@ -26,7 +26,7 @@ const ENGINE_CODE_MESSAGES: Record<string, string> = {
   TRADER_SUSPENDED: "Sua conta está temporariamente suspensa no motor: várias ordens suas falharam on-chain. Tente mais tarde.",
   EXCHANGE_PAUSED: "A exchange está pausada: só ordens de redução de posição são aceitas.",
   MARKET_HALTED: "Mercado suspenso: sem preço índice recente. Novas ordens não são aceitas no momento.",
-  DUPLICATE_ORDER: "Esta ordem já foi enviada.",
+  DUPLICATE_ORDER: "Já existe uma ordem igual no livro.",
   NONCE_CANCELLED: "O nonce desta ordem já foi cancelado. Envie uma nova ordem.",
   NONCE_REUSED: "Nonce já usado por outra ordem. Envie de novo.",
   BAD_SIGNATURE: "Assinatura inválida. Confira a conta e a rede da carteira.",
@@ -40,9 +40,9 @@ const ENGINE_CODE_MESSAGES: Record<string, string> = {
   RECOVERING: "O motor está se sincronizando com a blockchain após reiniciar e não aceitou a ordem. Tente de novo em instantes.",
   REDUCE_ONLY_EXCEEDS_POSITION: "Ordem somente-redução maior que a posição (somada às outras ordens de redução abertas).",
   CHAIN_UNAVAILABLE: "O motor não consegue falar com a blockchain no momento. Tente de novo em instantes.",
-  RATE_LIMITED: "Muitas requisições. Tente novamente em instantes.",
+  RATE_LIMITED: "Muitas requisições em pouco tempo (limite por conexão e por conta). Aguarde alguns segundos e tente de novo.",
   NOT_FOUND: "Ordem não encontrada no motor.",
-  INTERNAL: "Erro interno do motor. Tente de novo em instantes.",
+  INTERNAL: "Erro interno do motor; não se sabe se a requisição teve efeito.",
 };
 
 /** Codes whose English server detail adds useful specifics to the generic translation. */

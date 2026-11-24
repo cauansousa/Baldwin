@@ -208,25 +208,26 @@ describe("submitting an order whose outcome may be unknown", () => {
   const timeout = () => new DOMException("The operation timed out.", "TimeoutError");
   const noSleep = async () => {};
 
-  it("classifies failures", () => {
-    expect(classifySubmitFailure(new EngineError(400, "x", "INVALID_ORDER"))).toBe("not_accepted");
-    expect(classifySubmitFailure(new EngineError(422, "x", "INSUFFICIENT_MARGIN"))).toBe("not_accepted");
-    expect(classifySubmitFailure(new EngineError(429, "x", "RATE_LIMITED"))).toBe("not_accepted");
-    for (const code of ["SHUTTING_DOWN", "EXCHANGE_PAUSED", "MARKET_HALTED", "RECOVERING"]) {
-      expect(classifySubmitFailure(new EngineError(503, "x", code)), code).toBe("not_accepted");
+  it("classifies failures: the engine's `outcome` is trusted, unknown is the fallback", () => {
+    // Bodies with outcome (every engine error has one).
+    expect(classifySubmitFailure(new EngineError(422, "x", "INSUFFICIENT_MARGIN", "not_applied"))).toBe("not_accepted");
+    for (const code of ["STORE_UNAVAILABLE", "CHAIN_UNAVAILABLE", "MARKET_HALTED", "EXCHANGE_PAUSED", "RECOVERING", "SHUTTING_DOWN"]) {
+      expect(classifySubmitFailure(new EngineError(503, "x", code, "not_applied")), code).toBe("not_accepted");
     }
-    expect(classifySubmitFailure(new EngineError(503, "x", "STATE_UNKNOWN"))).toBe("unknown");
-    expect(classifySubmitFailure(new EngineError(503, "x", "STORE_UNAVAILABLE"))).toBe("unknown");
-    // An explicit verdict from the engine wins over the code tables.
-    expect(classifySubmitFailure(new EngineError(503, "x", "STORE_UNAVAILABLE", "not_applied"))).toBe("not_accepted");
-    expect(classifySubmitFailure(new EngineError(503, "x", "SHUTTING_DOWN", "unknown"))).toBe("unknown");
-    expect(parseEngineError(503, { error: { code: "STATE_UNKNOWN", message: "m", outcome: "unknown" } }, "").outcome).toBe("unknown");
-    expect(parseEngineError(503, { error: { code: "X", message: "m" } }, "").outcome).toBeUndefined();
-    expect(classifySubmitFailure(new EngineError(503, "x", "SOME_FUTURE_CODE"))).toBe("unknown");
-    expect(classifySubmitFailure(new EngineError(500, "x"))).toBe("unknown");
+    expect(classifySubmitFailure(new EngineError(503, "x", "STATE_UNKNOWN", "unknown"))).toBe("unknown");
+    expect(classifySubmitFailure(new EngineError(500, "x", "INTERNAL", "unknown"))).toBe("unknown");
+    expect(classifySubmitFailure(new EngineError(400, "x", "WHATEVER", "unknown"))).toBe("unknown");
+    // Bodies without it (proxy error page, older engine): 5xx is unknown whatever the code says.
+    expect(classifySubmitFailure(new EngineError(503, "x", "SHUTTING_DOWN"))).toBe("unknown");
     expect(classifySubmitFailure(new EngineError(502, "x"))).toBe("unknown");
+    expect(classifySubmitFailure(new EngineError(400, "x", "INVALID_ORDER"))).toBe("not_accepted");
+    // Timeouts and network errors.
     expect(classifySubmitFailure(timeout())).toBe("unknown");
     expect(classifySubmitFailure(new TypeError("Failed to fetch"))).toBe("unknown");
+    // The outcome is read from the error body.
+    expect(parseEngineError(503, { error: { code: "STATE_UNKNOWN", message: "m", outcome: "unknown" } }, "").outcome).toBe("unknown");
+    expect(parseEngineError(503, { error: { code: "RECOVERING", message: "m", outcome: "not_applied" } }, "").outcome).toBe("not_applied");
+    expect(parseEngineError(503, { error: { code: "X", message: "m", outcome: "bogus" } }, "").outcome).toBeUndefined();
   });
 
   it("resubmits the identical request after a timeout and a state-unknown 503 until the engine answers", async () => {
@@ -235,7 +236,7 @@ describe("submitting an order whose outcome may be unknown", () => {
         throw timeout();
       },
       () => {
-        throw new EngineError(503, "x", "STATE_UNKNOWN");
+        throw new EngineError(503, "x", "STATE_UNKNOWN", "unknown");
       },
       () => "open",
     ];
@@ -257,7 +258,7 @@ describe("submitting an order whose outcome may be unknown", () => {
 
   it("stops at once when the engine definitely refused", async () => {
     let calls = 0;
-    const refused = new EngineError(503, "x", "SHUTTING_DOWN");
+    const refused = new EngineError(503, "x", "SHUTTING_DOWN", "not_applied");
     const outcome = await submitUntilKnown(
       async () => {
         calls++;
@@ -265,28 +266,21 @@ describe("submitting an order whose outcome may be unknown", () => {
       },
       { sleep: noSleep },
     );
-    expect(outcome).toEqual({ kind: "not_accepted", error: refused });
+    expect(outcome).toEqual({ kind: "not_accepted", error: refused, resubmission: false });
     expect(calls).toBe(1);
   });
 
-  it("a duplicate answer on a resubmission means the first attempt arrived", async () => {
+  it("a refusal on a resubmission is flagged: the order may have arrived and been closed meanwhile", async () => {
     let calls = 0;
+    const closed = new EngineError(409, "x", "NONCE_CANCELLED", "not_applied");
     const outcome = await submitUntilKnown<string>(
       async () => {
         if (calls++ === 0) throw timeout();
-        throw new EngineError(409, "x", "DUPLICATE_ORDER");
+        throw closed;
       },
       { sleep: noSleep },
     );
-    expect(outcome).toEqual({ kind: "accepted", value: undefined });
-    // ... but on the first attempt a duplicate is an ordinary refusal.
-    const first = await submitUntilKnown(
-      async () => {
-        throw new EngineError(409, "x", "DUPLICATE_ORDER");
-      },
-      { sleep: noSleep },
-    );
-    expect(first.kind).toBe("not_accepted");
+    expect(outcome).toEqual({ kind: "not_accepted", error: closed, resubmission: true });
   });
 
   it("gives up as unknown, never as refused, when every attempt is inconclusive", async () => {

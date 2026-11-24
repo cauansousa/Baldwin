@@ -1,5 +1,6 @@
 import { EngineError, parseEngineError } from "../lib/errors";
 import {
+  normalizeCancelResult,
   normalizeHealth,
   normalizeMarkets,
   normalizeOpenOrders,
@@ -138,8 +139,9 @@ export function createHttpEngine(baseUrl: string): EngineApi {
       const body = { order, signature, ...(postOnly ? { postOnly: true } : {}), ...(ioc ? { ioc: true } : {}) };
       return normalizePostOrderResult(await request(baseUrl, "/orders", { method: "POST", body: JSON.stringify(body) }));
     },
-    async cancelOrder(orderHash, signature) {
-      await request(baseUrl, `/orders/${orderHash}`, { method: "DELETE", body: JSON.stringify({ signature }) });
+    async cancelOrder(orderHash, signature, trader, nonce) {
+      const body = JSON.stringify({ signature, trader, nonce: nonce.toString() });
+      return normalizeCancelResult(await request(baseUrl, `/orders/${orderHash}`, { method: "DELETE", body }));
     },
     openFeed: (marketId, handlers) => openFeed(baseUrl, marketId, handlers),
   };

@@ -208,7 +208,11 @@ describe("scripts/deploy-testnet.ts", () => {
     // the Deployment file, in the shape of shared/src/index.ts
     const written = JSON.parse(fs.readFileSync(file, "utf8"));
     expect(written).to.deep.equal(result.deployment);
-    expect(Object.keys(written)).to.deep.equal(["chainId", "exchange", "usdc", "oracle", "markets"]);
+    expect(Object.keys(written)).to.deep.equal(["chainId", "exchange", "usdc", "oracle", "markets", "deploymentBlock"]);
+    // the block the Exchange was created in, so event readers know where to start
+    expect(written.deploymentBlock).to.be.a("number").and.to.be.greaterThan(0);
+    expect((await ethers.provider.getCode(written.exchange, written.deploymentBlock)).length).to.be.greaterThan(2);
+    expect(await ethers.provider.getCode(written.exchange, written.deploymentBlock - 1)).to.equal("0x");
     expect(written.chainId).to.equal(31337);
     expect(written.usdc).to.equal(await token.getAddress());
     expect(written.markets).to.deep.equal([

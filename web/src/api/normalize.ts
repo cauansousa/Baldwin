@@ -2,7 +2,7 @@
 // decimal strings (docs/SPEC.md).
 
 import { bigintFromJson } from "../lib/units";
-import type { BookLevel, EngineHealth, MarketInfo, OpenOrder, OrderBook, PostOrderResult, Trade } from "./types";
+import type { BookLevel, CancelResult, EngineHealth, MarketInfo, OpenOrder, OrderBook, PostOrderResult, Trade } from "./types";
 
 type Json = Record<string, unknown>;
 
@@ -34,7 +34,15 @@ export function normalizeHealth(value: unknown): EngineHealth {
       return [];
     }
   });
-  return { ok: v.ok !== false, paused: typeof chain?.paused === "boolean" ? chain.paused : undefined, markets };
+  const settlement = isObject(v.settlement) ? v.settlement : {};
+  const recovering = v.recovering === true || settlement.recovering === true;
+  return {
+    ok: v.ok !== false,
+    recovering,
+    stalled: typeof settlement.stalled === "boolean" ? settlement.stalled : v.ok === false && !recovering,
+    paused: typeof chain?.paused === "boolean" ? chain.paused : undefined,
+    markets,
+  };
 }
 
 export function normalizeMarkets(value: unknown): MarketInfo[] {
@@ -195,5 +203,22 @@ export function normalizePostOrderResult(value: unknown): PostOrderResult {
     status: String(v.status ?? ""),
     reason: typeof v.reason === "string" && v.reason ? v.reason : undefined,
     fills,
+    duplicate: v.duplicate === true,
+    remaining: optionalBigint(v.remaining),
+    pending: optionalBigint(v.pending),
+    filled: optionalBigint(v.filled),
   };
+}
+
+function optionalBigint(value: unknown): bigint | undefined {
+  try {
+    return value === undefined || value === null ? undefined : bigintFromJson(value, "amount");
+  } catch {
+    return undefined;
+  }
+}
+
+export function normalizeCancelResult(value: unknown): CancelResult {
+  const v = isObject(value) ? value : {};
+  return { status: String(v.status ?? ""), known: v.known !== false };
 }

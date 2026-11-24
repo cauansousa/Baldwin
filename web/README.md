@@ -71,7 +71,7 @@ To check a build locally: `npm run preview` serves `dist/`.
 book, trades, open orders) and a fake EIP-1193 provider that answers contract reads, "mines"
 approve/deposit/withdraw/mint/cancel instantly and returns dummy signatures. Engine failures can be
 injected from the URL: `?mockSubmit=timeout,unknown` (order registered, answer lost, then idempotent
-success), `?mockSubmit=lost`, `?mockSubmit=refused`, `?mockCancel=fail`. It exists to develop
+success), `?mockSubmit=lost`, `?mockSubmit=refused`, `?mockCancel=fail`, `?mockCancel=notfound`. It exists to develop
 and screenshot the UI without a backend. It only works under the dev server and is not included in
 production bundles. `VITE_MOCK=1 VITE_CHAIN_ID=421614 npx vite` shows the testnet variant of the UI.
 
@@ -97,12 +97,18 @@ Protocol constants, ABIs and EIP-712 types come from `../shared/src/index.ts` (a
   engine honours it). "On-chain" calls `cancelOrder(nonce)` and "Cancelar todas on-chain" calls
   `cancelAllOrders(newMinValidNonce)` with a value above every nonce this browser signed; only these bind
   the contract. New orders always get a nonce at or above the on-chain `minValidNonce`.
-- Submitting: an order is signed once. If the engine's answer is lost (timeout, network error, a
-  5xx that does not clearly say "not accepted"), the **same signed order** is resubmitted with
-  backoff (the engine is idempotent by order hash) and nothing else can be signed meanwhile. If it
-  still cannot be confirmed, the user chooses: resubmit, discard (signs a `Cancel` for the engine;
-  the order is only forgotten once the engine confirms) or cancel on-chain. The signed order lives
-  in memory only: reloading the page forgets it, so check "open orders" after a reload.
+- Submitting: an order is signed once. Every engine error carries `outcome`: `not_applied` means
+  nothing changed (the signed order is dropped, a new one may be signed); `unknown` — also assumed
+  for timeouts, network errors and 5xx bodies without the field — means the order may be live. Then
+  the **same signed order** is resubmitted with backoff (the engine is idempotent by order hash and
+  answers 200 with `duplicate: true` and the order's current state) and nothing else can be signed
+  meanwhile. If it still cannot be confirmed, the user chooses: resubmit, discard (signs a `Cancel`
+  and sends `{ signature, trader, nonce }`; the engine answers 200 even for an order it never saw,
+  recording the nonce as dead — only a 200 resolves it, a 404 does not) or cancel on-chain. The
+  signed order lives in memory only: reloading the page forgets it, so check "open orders" then.
+- On-chain cancels bind from the moment the transaction confirms; the engine notices a couple of
+  blocks later. Until then such an order stays in the list labelled "cancelada on-chain · motor
+  atualizando".
 - Nonces: `ms timestamp << 64 | 64 random bits`, never below the on-chain `minValidNonce` and never
   beyond the contract's bound `((chain time + 1 day) in ms) << 64`. The highest nonce handed to
   the wallet is remembered per account in `localStorage` so a bulk cancel covers earlier sessions

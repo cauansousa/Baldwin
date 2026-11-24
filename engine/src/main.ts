@@ -1,4 +1,5 @@
-import { createPublicClient, formatEther, parseAbi, type PublicClient } from "viem";
+import { createPublicClient, formatEther, type PublicClient } from "viem";
+import { exchangeAbi } from "./abi.ts";
 import { buildServer } from "./api/server.ts";
 import { cancelWatcher } from "./chain/cancelWatcher.ts";
 import { rpcTransport } from "./chain/transport.ts";
@@ -45,15 +46,14 @@ async function main(): Promise<void> {
   const markets = await Promise.all(deployment.markets.map((m) => chain.getMarket(m.marketId)));
   const marketCount = await chain.marketCount();
 
-  // The contract's per-match gas floor. Its constants are public but not part of the
-  // shared interface, so read them if they are there and use the configured values otherwise.
-  const floorAbi = parseAbi(["function MATCH_GAS_BASE() view returns (uint256)", "function MATCH_GAS_PER_MARKET() view returns (uint256)"]);
+  // The contract's per-match gas floor, read from its public constants; the configured
+  // values are the fallback for a contract that does not expose them.
   let floorBase = cfg.matchGasFloorBase;
   let floorPerMarket = cfg.matchGasFloorPerMarket;
   try {
     [floorBase, floorPerMarket] = await Promise.all([
-      client.readContract({ address: deployment.exchange, abi: floorAbi, functionName: "MATCH_GAS_BASE" }),
-      client.readContract({ address: deployment.exchange, abi: floorAbi, functionName: "MATCH_GAS_PER_MARKET" }),
+      client.readContract({ address: deployment.exchange, abi: exchangeAbi, functionName: "MATCH_GAS_BASE" }),
+      client.readContract({ address: deployment.exchange, abi: exchangeAbi, functionName: "MATCH_GAS_PER_MARKET" }),
     ]);
   } catch {
     log.warn("could not read the contract's match gas floor; using MATCH_GAS_FLOOR_BASE / MATCH_GAS_FLOOR_PER_MARKET", {
@@ -64,7 +64,8 @@ async function main(): Promise<void> {
   const gasFloorPerMatch = floorBase + floorPerMarket * BigInt(marketCount);
 
   // ---- durable state, settlement, engine
-  const store = new SqliteStore(cfg.storePath);
+  // Exclusive: a second engine process on the same file fails here instead of fighting this one.
+  const store = new SqliteStore(cfg.storePath, { exclusive: true });
   const settler = new ViemSettler({
     rpc: viemSettlerRpc(client, deployment.exchange),
     account,
@@ -93,12 +94,11 @@ async function main(): Promise<void> {
     faultThreshold: cfg.faultThreshold,
     faultWindowSec: cfg.faultWindowSec,
     maxBatchSize: cfg.maxBatchSize,
+    intakeTimeoutMs: cfg.intakeTimeoutMs,
+    traderOrdersPerMinute: cfg.traderOrdersPerMinute,
+    preTradeCacheMs: cfg.preTradeCacheMs,
     logger: log,
   });
-
-  // Restored orders and the batch that was in flight are reconciled with the chain,
-  // and cancels that happened while the engine was down are applied, before the API opens.
-  await engine.recover();
   const watcher = cancelWatcher({
     client,
     exchange: deployment.exchange,
@@ -107,11 +107,10 @@ async function main(): Promise<void> {
     logger: log,
     startBlock: cfg.startBlock,
     maxRange: cfg.logMaxBlockRange,
-    overlap: BigInt(Math.max(0, cfg.confirmations - 1)),
+    headLag: cfg.logHeadLag,
+    // Always re-read a few blocks; more when fills wait for several confirmations.
+    overlap: cfg.logRescan > BigInt(cfg.confirmations) ? cfg.logRescan : BigInt(cfg.confirmations),
   });
-  await watcher.catchUp();
-  watcher.start(cfg.logPollIntervalMs);
-  engine.start(1000, cfg.chainRefreshMs);
 
   // ---- operator balance
   const balanceTimer = setInterval(() => {
@@ -129,12 +128,14 @@ async function main(): Promise<void> {
   metrics.gauge("operator_balance_eth", "ETH balance of the operator account", () => Number(formatEther(operatorBalance)));
   metrics.gauge("cancel_watcher_block", "Last block whose cancel events were processed", () => Number(watcher.position ?? 0n));
 
+  // ---- API: up before recovery, so that /health can say "recovering" (orders are refused until it is done)
   const app = await buildServer(engine, {
     corsOrigin: cfg.corsOrigin,
     rateLimitPerMinute: cfg.rateLimitPerMinute,
     trustProxy: cfg.trustProxy,
     wsMaxConnections: cfg.wsMaxConnections,
     wsMaxConnectionsPerIp: cfg.wsMaxConnectionsPerIp,
+    logger: log,
     info: () => ({
       chainId,
       exchange: deployment.exchange,
@@ -149,6 +150,45 @@ async function main(): Promise<void> {
           : [],
     }),
   });
+
+  // ---- shutdown: stop intake, let the in-flight batch resolve (bounded), flush, exit.
+  // A second signal, or the hard deadline, always ends the process after closing the store.
+  let closing = false;
+  const exitNow = (code: number) => {
+    try {
+      store.close();
+    } catch {
+      // already closed
+    }
+    process.exit(code);
+  };
+  const shutdown = async (signal: string) => {
+    if (closing) {
+      log.warn("second signal: exiting now", { signal });
+      exitNow(1);
+    }
+    closing = true;
+    log.info("shutting down", { signal, drainTimeoutMs: cfg.shutdownTimeoutMs });
+    setTimeout(() => {
+      log.error("shutdown did not finish in time; exiting");
+      exitNow(1);
+    }, cfg.shutdownTimeoutMs + 10_000).unref();
+    try {
+      await engine.stop(cfg.shutdownTimeoutMs);
+      watcher.stop();
+      clearInterval(balanceTimer);
+      // Closes WebSocket clients first, then idle keep-alive connections, then the listener.
+      await Promise.race([app.close(), new Promise((r) => setTimeout(r, 5000).unref())]);
+      log.info("shutdown complete", { ...engine.settlementStatus() });
+    } catch (e) {
+      log.error("error during shutdown", { error: errMessage(e) });
+      exitNow(1);
+    }
+    exitNow(0);
+  };
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+
   await app.listen({ port: cfg.port, host: cfg.host });
   log.info("engine listening", {
     port: cfg.port,
@@ -160,32 +200,33 @@ async function main(): Promise<void> {
     confirmations: cfg.confirmations,
     store: cfg.storePath,
     gasFloorPerMatch,
+    recovering: engine.isRecovering(),
     markets: markets.map((m) => m.symbol),
   });
   if (operatorBalance < cfg.operatorMinBalance) {
     log.warn("operator ETH balance is low", { operator: account.address, balanceEth: formatEther(operatorBalance), thresholdEth: formatEther(cfg.operatorMinBalance) });
   }
 
-  // ---- graceful shutdown: stop intake, let the in-flight batch resolve (bounded), flush, exit
-  let closing = false;
-  const shutdown = async (signal: string) => {
+  // ---- recovery, bounded: cancels first (chain views and replayed events), then the
+  // batch that was in flight and queued matches, then fill state. If the chain cannot
+  // be reached for RECOVERY_TIMEOUT_MS the process exits non-zero and the process
+  // manager starts it again.
+  let recoveryTimer: NodeJS.Timeout | undefined;
+  const timedOut = new Promise<never>((_, reject) => {
+    recoveryTimer = setTimeout(() => reject(new Error(`start-up recovery did not finish within ${cfg.recoveryTimeoutMs} ms`)), cfg.recoveryTimeoutMs);
+  });
+  try {
+    await Promise.race([engine.recover({ replayCancels: () => watcher.catchUp() }), timedOut]);
+  } catch (e) {
     if (closing) return;
-    closing = true;
-    log.info("shutting down", { signal, drainTimeoutMs: cfg.shutdownTimeoutMs });
-    try {
-      await engine.stop(cfg.shutdownTimeoutMs);
-      watcher.stop();
-      clearInterval(balanceTimer);
-      await app.close();
-      store.close();
-      log.info("shutdown complete", { ...engine.settlementStatus() });
-    } catch (e) {
-      log.error("error during shutdown", { error: errMessage(e) });
-    }
-    process.exit(0);
-  };
-  process.on("SIGINT", () => void shutdown("SIGINT"));
-  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+    log.error("fatal: start-up recovery failed", { error: errMessage(e) });
+    exitNow(1);
+  } finally {
+    clearTimeout(recoveryTimer);
+  }
+  watcher.start(cfg.logPollIntervalMs);
+  engine.start(1000, cfg.chainRefreshMs);
+  log.info("recovery complete; accepting orders", { ...engine.settlementStatus() });
 }
 
 main().catch((e) => {

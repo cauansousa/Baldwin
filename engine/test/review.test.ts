@@ -5,8 +5,8 @@ import { join } from "node:path";
 import { encodeErrorResult, parseAbi } from "viem";
 import { describe, expect, it } from "vitest";
 import { accountFromKey, privateKey } from "../src/config.ts";
-import { MemoryDeadNonceStore } from "../src/engine/deadNonces.ts";
 import { SqliteStore } from "../src/store/sqliteStore.ts";
+import type { Commit } from "../src/store/types.ts";
 import { Engine, EngineError } from "../src/engine/engine.ts";
 import { FakeSettler } from "../src/settlement/fakeSettler.ts";
 import { hashOrder } from "../src/signing.ts";
@@ -48,23 +48,26 @@ describe("1: dead nonces survive a restart", () => {
     chain.filled.set(aHash, wad(1));
     const publicCalldata = settler1.calls[0]!.matches[0]!;
     expect((await e1.cancel(aHash, await signCancel(alice, alice.address, aOrder.nonce))).status).toBe("cancelled");
-    // durable at the moment the cancel is acknowledged: another connection to the file sees it
+    // durable at the moment the cancel is acknowledged: another connection to the file sees both facts
     const peek = new SqliteStore(path);
-    expect(peek.has(alice.address, aOrder.nonce)).toBe(true);
+    expect(peek.hasDeadNonce(alice.address, aOrder.nonce)).toBe(true);
+    expect(peek.load().orders.find((o) => o.hash === aHash)).toMatchObject({ remaining: 0n, userCancelled: true, closed: { status: "cancelled" } });
     peek.close();
     // the process dies without any shutdown
 
     const e2 = new Engine({ domain: DOMAIN, markets: [MARKET], settler: new FakeSettler(), chain, store: new SqliteStore(path), now: () => 2000 });
     await e2.recover();
-    expect(["NONCE_CANCELLED", "DUPLICATE_ORDER"]).toContain(await code(e2.submit({ order: publicCalldata.maker, signature: publicCalldata.makerSig })));
+    // the identical order is answered with its (cancelled) state; it does not come back
+    const again = await e2.submit({ order: publicCalldata.maker, signature: publicCalldata.makerSig });
+    expect(again).toMatchObject({ duplicate: true, status: "cancelled", remaining: 0n });
     expect(e2.getOrderBook(1, 10).bids).toEqual([]);
   });
 
   it("R1b: an IOC order's unfilled remainder cannot be re-posted as a resting order after a restart", async () => {
-    const dead = new MemoryDeadNonceStore(); // stands for the persisted set
+    const store = new SqliteStore(":memory:");
     const chain = new FakeChain();
     const settler1 = new FakeSettler();
-    const e1 = new Engine({ domain: DOMAIN, markets: [MARKET], settler: settler1, chain, deadNonces: dead, now: () => 1000 });
+    const e1 = new Engine({ domain: DOMAIN, markets: [MARKET], settler: settler1, chain, store, now: () => 1000 });
     const mk = makeOrder(bob, false, 100, 1);
     await e1.submit({ order: mk, signature: await signOrder(bob, mk) });
     const ioc = makeOrder(alice, true, 100, 10);
@@ -72,59 +75,148 @@ describe("1: dead nonces survive a restart", () => {
     await e1.idle();
     chain.filled.set(hashOrder(DOMAIN, ioc), wad(1));
     const pub = settler1.calls[0]!.matches[0]!;
-    const e2 = new Engine({ domain: DOMAIN, markets: [MARKET], settler: new FakeSettler(), chain, deadNonces: dead, now: () => 2000 });
-    expect(await code(e2.submit({ order: pub.taker, signature: pub.takerSig }))).toBe("NONCE_CANCELLED");
+    const e2 = new Engine({ domain: DOMAIN, markets: [MARKET], settler: new FakeSettler(), chain, store, now: () => 2000 });
+    await e2.recover();
+    expect(await e2.submit({ order: pub.taker, signature: pub.takerSig })).toMatchObject({ duplicate: true, status: "cancelled" }); // no ioc flag this time
     expect(e2.getOrderBook(1, 10).bids).toEqual([]);
+    // even with the order record gone (pruned, lost), the dead nonce alone refuses it
+    expect(store.hasDeadNonce(alice.address, ioc.nonce)).toBe(true);
   });
 
   it("an IOC order is dead from the moment it is accepted, even if it matched fully", async () => {
-    const dead = new MemoryDeadNonceStore();
-    const h = harness({ deadNonces: dead });
+    const store = new SqliteStore(":memory:");
+    const h = harness({ store });
     await h.place(alice, false, 100, 1);
     const ioc = makeOrder(bob, true, 100, 1);
     await h.engine.submit({ order: ioc, signature: await signOrder(bob, ioc), ioc: true });
-    expect(dead.has(bob.address, ioc.nonce)).toBe(true);
+    expect(store.hasDeadNonce(bob.address, ioc.nonce)).toBe(true);
   });
 
   it("orders rejected after an on-chain failure, and self-trade / band remainders, are dead too", async () => {
-    const dead = new MemoryDeadNonceStore();
-    const h = harness({ deadNonces: dead, withChain: true });
+    const store = new SqliteStore(":memory:");
+    const h = harness({ store, withChain: true });
     const maker = makeOrder(alice, false, 100, 1);
     await h.engine.submit({ order: maker, signature: await signOrder(alice, maker) });
     h.settler.failWhen = () => blame(alice.address);
     await h.place(bob, true, 100, 1);
     await h.engine.idle();
-    expect(dead.has(alice.address, maker.nonce)).toBe(true);
+    expect(store.hasDeadNonce(alice.address, maker.nonce)).toBe(true);
     const offMarket = makeOrder(carol, true, 150, 1); // above the band: remainder cancelled
     expect((await h.engine.submit({ order: offMarket, signature: await signOrder(carol, offMarket) })).status).toBe("cancelled");
-    expect(dead.has(carol.address, offMarket.nonce)).toBe(true);
+    expect(store.hasDeadNonce(carol.address, offMarket.nonce)).toBe(true);
+    // a different order reusing a dead nonce is refused
+    const reuse = makeOrder(carol, true, 100, 1, { nonce: offMarket.nonce });
+    expect(await code(h.engine.submit({ order: reuse, signature: await signOrder(carol, reuse) }))).toBe("NONCE_CANCELLED");
   });
 
-  it("the store forgets dead nonces only once their expiry has passed", () => {
-    const s1 = new SqliteStore(tmpFile());
-    s1.add(alice.address, 1n, 1500n);
-    s1.add(alice.address, 2n, 5000n);
-    s1.add(bob.address, 1n, 5000n);
-    s1.prune(2000n);
-    expect(s1.has(alice.address, 1n)).toBe(false); // expired: the order is dead on-chain anyway
-    expect(s1.has(alice.address, 2n)).toBe(true);
-    expect(s1.has(bob.address, 1n)).toBe(true);
-    expect(s1.has(bob.address, 2n)).toBe(false);
-    s1.prune(5000n);
-    expect(s1.has(bob.address, 1n)).toBe(false);
-    s1.close();
+  it("dead nonces are forgotten only once their expiry has passed", async () => {
+    const store = new SqliteStore(":memory:");
+    const h = harness({ store, expiryBufferSec: 0 });
+    const soon = makeOrder(alice, true, 100, 1, { expiry: 1500n });
+    const later = makeOrder(alice, true, 100, 1, { expiry: 5000n });
+    for (const o of [soon, later]) {
+      const r = await h.engine.submit({ order: o, signature: await signOrder(alice, o) });
+      await h.engine.cancel(r.orderHash, await signCancel(alice, alice.address, o.nonce));
+    }
+    h.clock.now = 2000;
+    h.engine.pruneFinished();
+    expect(store.hasDeadNonce(alice.address, soon.nonce)).toBe(false); // expired: the order is dead on-chain anyway
+    expect(store.hasDeadNonce(alice.address, later.nonce)).toBe(true);
   });
 
-  it("a cancel that cannot be made durable is not acknowledged and changes nothing", async () => {
-    const dead = new MemoryDeadNonceStore();
-    const h = harness({ deadNonces: dead });
-    const order = makeOrder(alice, true, 100, 1);
+  it("F1: a cancel whose commit fails is NOT acknowledged, and nothing changed - in memory or on disk", async () => {
+    const path = tmpFile();
+    const store = new SqliteStore(path);
+    const h = harness({ store });
+    const order = makeOrder(alice, false, 100, 1);
     const r = await h.engine.submit({ order, signature: await signOrder(alice, order) });
-    dead.add = () => {
-      throw new Error("ENOSPC");
+    const commit = store.commit.bind(store);
+    store.commit = () => {
+      throw new Error("disk full");
     };
-    await expect(h.engine.cancel(r.orderHash, await signCancel(alice, alice.address, order.nonce))).rejects.toThrow("ENOSPC");
-    expect(h.engine.getOrder(r.orderHash)!.status).toBe("open");
+    const sig = await signCancel(alice, alice.address, order.nonce);
+    const e = await h.engine.cancel(r.orderHash, sig).catch((x) => x);
+    expect(e).toMatchObject({ code: "STORE_UNAVAILABLE", httpStatus: 503, outcome: "not_applied" });
+    expect(h.engine.getOrder(r.orderHash)).toMatchObject({ status: "open", remaining: wad(1) });
+    expect(h.engine.getOrderBook(1, 10).asks).toEqual([{ price: wad(100), size: wad(1) }]);
+    expect(store.hasDeadNonce(alice.address, order.nonce)).toBe(false); // no half-written cancel
+    // a restart shows the same thing the client was told: the order is still open
+    const e2 = new Engine({ domain: DOMAIN, markets: [MARKET], settler: new FakeSettler(), store: new SqliteStore(path), now: () => 1000 });
+    await e2.recover();
+    expect(e2.getOrder(r.orderHash)!.status).toBe("open");
+    // once the store works again the same cancel goes through, atomically
+    store.commit = commit;
+    expect((await h.engine.cancel(r.orderHash, sig)).status).toBe("cancelled");
+    const peek = new SqliteStore(path);
+    expect(peek.hasDeadNonce(alice.address, order.nonce)).toBe(true);
+    expect(peek.load().orders[0]).toMatchObject({ remaining: 0n, closed: { status: "cancelled" } });
+    peek.close();
+  });
+
+  it("F1: the dead nonce and the order's cancelled state are one commit", async () => {
+    const store = new SqliteStore(":memory:");
+    const h = harness({ store });
+    const order = makeOrder(alice, false, 100, 1);
+    const r = await h.engine.submit({ order, signature: await signOrder(alice, order) });
+    const commits: Commit[] = [];
+    const commit = store.commit.bind(store);
+    store.commit = (c) => {
+      commits.push(c);
+      commit(c);
+    };
+    await h.engine.cancel(r.orderHash, await signCancel(alice, alice.address, order.nonce));
+    expect(commits).toHaveLength(1);
+    expect(commits[0]!.deadNonces).toEqual([{ trader: alice.address, nonce: order.nonce, expiry: order.expiry }]);
+    expect(commits[0]!.orders).toEqual([expect.objectContaining({ hash: r.orderHash, remaining: 0n, userCancelled: true, closed: { status: "cancelled", reason: "cancelled by trader" } })]);
+  });
+
+  it("F1: second line of defence - a stored order that rests although its nonce is dead is closed on load", async () => {
+    // A store in the state the old two-commit cancel could leave behind.
+    const path = tmpFile();
+    const store = new SqliteStore(path);
+    const h = harness({ store });
+    const order = makeOrder(alice, false, 100, 1);
+    const r = await h.engine.submit({ order, signature: await signOrder(alice, order) });
+    const other = await h.place(bob, false, 101, 1);
+    store.commit({ orders: [], addMatches: [], batched: null, removeMatches: [], trades: [], minValidNonces: [], deadNonces: [{ trader: alice.address, nonce: order.nonce, expiry: order.expiry }], meta: {} });
+
+    const settler = new FakeSettler();
+    const e2 = new Engine({ domain: DOMAIN, markets: [MARKET], settler, store: new SqliteStore(path), now: () => 1000 });
+    expect(e2.getOrder(r.orderHash)).toMatchObject({ status: "cancelled", remaining: 0n });
+    await e2.recover();
+    expect(e2.getOrderBook(1, 10).asks).toEqual([{ price: wad(101), size: wad(1) }]);
+    expect(e2.getOrder(other.orderHash)!.status).toBe("open");
+    const taker = makeOrder(carol, true, 101, 1);
+    const t = await e2.submit({ order: taker, signature: await signOrder(carol, taker) });
+    await e2.idle();
+    expect(t.fills.map((f) => f.makerOrderHash)).toEqual([other.orderHash]); // the cancelled order did not fill
+    // and the correction was written back
+    const peek = new SqliteStore(path);
+    expect(peek.load().orders.find((o) => o.hash === r.orderHash)).toMatchObject({ remaining: 0n, closed: { status: "cancelled" } });
+    peek.close();
+  });
+
+  it("a signed Cancel for an order the engine has not seen kills the nonce durably, so the order cannot land afterwards", async () => {
+    const store = new SqliteStore(":memory:");
+    const h = harness({ store });
+    const order = makeOrder(alice, true, 100, 1); // signed, still in transit
+    const hash = hashOrder(DOMAIN, order);
+    const sig = await signCancel(alice, alice.address, order.nonce);
+    // without trader and nonce the signature cannot be checked: 404
+    expect(await code(h.engine.cancel(hash, sig))).toBe("NOT_FOUND");
+    // somebody else's signature is refused
+    expect(await code(h.engine.cancel(hash, await signCancel(bob, alice.address, order.nonce), { trader: alice.address, nonce: order.nonce }))).toBe("BAD_SIGNATURE");
+    expect(store.hasDeadNonce(alice.address, order.nonce)).toBe(false);
+    expect(await h.engine.cancel(hash, sig, { trader: alice.address, nonce: order.nonce })).toEqual({ orderHash: hash, status: "cancelled", known: false });
+    expect(store.hasDeadNonce(alice.address, order.nonce)).toBe(true);
+    expect(await code(h.engine.submit({ order, signature: await signOrder(alice, order) }))).toBe("NONCE_CANCELLED");
+    expect(h.engine.getOrderBook(1, 10).bids).toEqual([]);
+    // if the commit fails, the cancel is not acknowledged
+    store.commit = () => {
+      throw new Error("disk full");
+    };
+    const next = makeOrder(alice, true, 100, 1);
+    expect(await h.engine.cancel(hashOrder(DOMAIN, next), await signCancel(alice, alice.address, next.nonce), { trader: alice.address, nonce: next.nonce }).catch((x) => x)).toMatchObject({ code: "STORE_UNAVAILABLE" });
   });
 
   it("refuses nonces that cancelAllOrders could never reach", async () => {

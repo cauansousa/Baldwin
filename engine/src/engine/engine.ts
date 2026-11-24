@@ -567,7 +567,7 @@ export class Engine extends EventEmitter<EngineEvents> {
     const w = this.pendingWrite;
     const counters = this.countersJson();
     if (this.dirty.size === 0 && w.addMatches.length === 0 && w.removeMatches.length === 0 && w.trades.length === 0 && w.minValidNonces.length === 0 && w.dead.length === 0 && !w.batched && counters === this.persistedCounters) {
-      return !this.storeBroken;
+      return true; // nothing is waiting to be written
     }
     try {
       store.commit({
@@ -592,6 +592,19 @@ export class Engine extends EventEmitter<EngineEvents> {
     return true;
   }
 
+  /** After a failed write: find out whether the store works again, and if so write what was held back. */
+  private healStore(): void {
+    if (!this.store || !this.storeBroken) return;
+    try {
+      this.store.setMeta("engine.heartbeat", String(Date.now()));
+    } catch {
+      return;
+    }
+    this.storeBroken = false;
+    this.log.info("store is writable again");
+    this.flush();
+  }
+
   /**
    * Make a change durable BEFORE it is applied in memory. Used where the client is
    * told "done" (cancels): if the store refuses, nothing has changed anywhere.
@@ -600,9 +613,11 @@ export class Engine extends EventEmitter<EngineEvents> {
     const store = this.store;
     if (!store) return;
     // Earlier changes must be on disk first, or this commit would describe a state the store never had.
+    if (this.storeBroken) this.healStore();
     if (!this.flush()) throw new EngineError("STORE_UNAVAILABLE", "engine state cannot be persisted; nothing was changed");
     try {
       store.commit({ orders: [], addMatches: [], batched: null, removeMatches: [], trades: [], minValidNonces: [], deadNonces: [], meta: {}, ...c });
+      this.storeBroken = false;
     } catch (e) {
       this.storeBroken = true;
       this.log.error("could not persist a cancel; nothing was changed", { error: errMessage(e) });
@@ -1056,10 +1071,23 @@ export class Engine extends EventEmitter<EngineEvents> {
    * The (trader, nonce) pair is durably recorded as dead before this resolves. Works
    * for an order that is still in its intake checks: it will then not enter the book.
    */
-  async cancel(orderHash: Hex, signature: string): Promise<OrderView> {
+  async cancel(orderHash: Hex, signature: string, hint?: { trader: Address; nonce: bigint }): Promise<OrderView | { orderHash: Hex; status: "cancelled"; known: false }> {
     const hash = orderHash.toLowerCase() as Hex;
     const order = this.orders.get(hash)?.order ?? this.intake.get(hash);
-    if (!order) throw new EngineError("NOT_FOUND", "unknown order");
+    if (!order) {
+      // The engine has never seen this order (it may still be on its way here). With
+      // the trader and nonce the Cancel signature can be checked on its own, and the
+      // nonce is made dead - durably, before answering - so the order cannot land later.
+      if (!hint) throw new EngineError("NOT_FOUND", "unknown order; send trader and nonce with the signature to cancel an order the engine has not received");
+      if (!(await verifyCancelSignature(this.domain, hint.trader, hint.nonce, signature))) {
+        throw new EngineError("BAD_SIGNATURE", "signature is not a canonical EIP-712 Cancel signature by the given trader for the given nonce");
+      }
+      this.cancelNonce(hint.trader, hint.nonce, "cancelled by trader");
+      // The nonce may belong to an order known under another hash than the one in the URL.
+      const other = this.usedNonces.get(nonceKey(hint.trader.toLowerCase(), hint.nonce));
+      const rec = other && this.orders.get(other);
+      return rec ? this.view(rec) : { orderHash: hash, status: "cancelled", known: false };
+    }
     if (!(await verifyCancelSignature(this.domain, order.trader, order.nonce, signature))) {
       throw new EngineError("BAD_SIGNATURE", "signature is not a canonical EIP-712 Cancel signature by the order's trader");
     }
@@ -1158,6 +1186,7 @@ export class Engine extends EventEmitter<EngineEvents> {
       this.applyBookEffects(marketId, { fills: [], expired });
       this.emit("book", marketId);
     }
+    this.healStore();
     this.flush();
     if (++this.sweeps % 60 === 0) this.pruneFinished();
   }

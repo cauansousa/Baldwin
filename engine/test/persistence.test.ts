@@ -88,7 +88,7 @@ describe("restart", () => {
     const t2 = await p2.place(bob, true, 100, 1);
     expect(t2.fills.map((f) => f.makerOrderHash)).toEqual([second.orderHash, late.orderHash]);
     // duplicates of restored orders are still recognised
-    expect(await code(p2.engine.submit({ order: first.order, signature: await signOrder(alice, first.order) }))).toBe("DUPLICATE_ORDER");
+    expect(await p2.engine.submit({ order: first.order, signature: await signOrder(alice, first.order) })).toMatchObject({ duplicate: true, status: "filled" });
   });
 
   it("an accepted order is on disk before the client gets its answer", async () => {
@@ -263,7 +263,7 @@ describe("restart", () => {
     await p2.engine.recover();
     expect(p2.engine.getOrderBook(1, 10)).toMatchObject({ bids: [], asks: [] });
     for (const [acct, o] of [[alice, resting.order], [bob, ioc.order]] as const) {
-      expect(["NONCE_CANCELLED", "DUPLICATE_ORDER"]).toContain(await code(p2.engine.submit({ order: o, signature: await signOrder(acct, o) })));
+      expect(await p2.engine.submit({ order: o, signature: await signOrder(acct, o) })).toMatchObject({ duplicate: true, status: "cancelled", remaining: 0n });
     }
     expect(p2.engine.getOrder(resting.orderHash)!.status).toBe("cancelled");
   });
@@ -324,7 +324,7 @@ describe("restart", () => {
       throw new Error("disk full");
     };
     const e = await p1.place(alice, true, 100, 1).catch((x) => x);
-    expect(e).toMatchObject({ code: "STORE_UNAVAILABLE", httpStatus: 503 });
+    expect(e).toMatchObject({ code: "STATE_UNKNOWN", httpStatus: 503, outcome: "unknown" });
     expect(await code(p1.place(bob, true, 100, 1))).toBe("STORE_UNAVAILABLE");
     p1.store.commit = commit;
     p1.engine.sweepExpired(); // any later flush writes what was held back
@@ -450,6 +450,7 @@ describe("store", () => {
       removeMatches: [],
       trades: [{ id: "t1", marketId: 1, price: 2n ** 100n, size: 9n, takerIsBuy: true, maker: alice.address, taker: bob.address, makerOrderHash: hash, takerOrderHash: hash, txHash: "0x01", timestamp: 77 }],
       minValidNonces: [{ trader: alice.address, nonce: 2n ** 80n }],
+      deadNonces: [{ trader: bob.address, nonce: 5n, expiry: 99n }],
       meta: { k: "v" },
     });
     const snap = store.load();
@@ -457,6 +458,7 @@ describe("store", () => {
     expect(snap.matches).toEqual([{ id: "m12", marketId: 1, makerHash: hash, takerHash: hash, fillSize: 2n ** 128n, price: 2n ** 129n, batchId: "b3" }]);
     expect(snap.trades[0]).toMatchObject({ price: 2n ** 100n, size: 9n, txHash: "0x01" });
     expect(snap.minValidNonces).toEqual([{ trader: alice.address.toLowerCase(), nonce: 2n ** 80n }]);
+    expect(snap.deadNonces).toEqual([{ trader: bob.address.toLowerCase(), nonce: 5n, expiry: 99n }]);
     expect(store.getMeta("k")).toBe("v");
     store.close();
   });
@@ -466,7 +468,7 @@ describe("store", () => {
     const order = makeOrder(alice, true, 100, 1);
     const good = { hash: hashOrder(DOMAIN, order), order, signature: "0x" as const, postOnly: false, ioc: false, seq: 1n, createdAt: 1, remaining: 1n, pending: 0n, filled: 0n, userCancelled: false, strikes: 0 };
     const bad = { ...good, hash: null as never };
-    expect(() => store.commit({ orders: [good, bad], addMatches: [], batched: null, removeMatches: [], trades: [], minValidNonces: [], meta: { x: "1" } })).toThrow();
+    expect(() => store.commit({ orders: [good, bad], addMatches: [], batched: null, removeMatches: [], trades: [], minValidNonces: [], deadNonces: [], meta: { x: "1" } })).toThrow();
     expect(store.load().orders).toEqual([]);
     expect(store.getMeta("x")).toBeUndefined();
     store.close();

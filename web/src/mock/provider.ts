@@ -10,6 +10,8 @@ import * as state from "./state";
 const exchangeAbi = parseAbi(EXCHANGE_ABI);
 const erc20Abi = parseAbi(ERC20_ABI);
 
+/** The engine notices on-chain cancels a couple of blocks late; the mock imitates that. */
+const ENGINE_LAG_MS = 4000;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const sameAddress = (a?: string, b?: string) => !!a && !!b && a.toLowerCase() === b.toLowerCase();
 const startedAt = Date.now();
@@ -133,12 +135,12 @@ function sendTransaction(to: string | undefined, data: Hex) {
       a.walletUsdc += amount;
     } else if (call.functionName === "cancelOrder") {
       a.cancelledNonces.add(call.args[0]);
-      state.dropDeadOrders();
+      setTimeout(state.dropDeadOrders, ENGINE_LAG_MS);
     } else if (call.functionName === "cancelAllOrders") {
       if (call.args[0] <= a.minValidNonce) throw new RpcError(3, "execution reverted: NonceNotIncreased()");
       if (call.args[0] > (BigInt(chainTimeSec() + 86_400) * 1000n) << 64n) throw new RpcError(3, "execution reverted: NonceTooHigh()");
       a.minValidNonce = call.args[0];
-      state.dropDeadOrders();
+      setTimeout(state.dropDeadOrders, ENGINE_LAG_MS);
     } else throw new RpcError(-32601, `mock: exchange.${call.functionName} not implemented`);
     return;
   }

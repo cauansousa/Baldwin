@@ -59,12 +59,28 @@ export interface PostOrderResult {
   /** Why the engine closed the order, when it did. */
   reason?: string;
   fills: { price: bigint; size: bigint }[];
+  /** True when this exact signed order had already been accepted: the fields show its current state. */
+  duplicate: boolean;
+  /** Resting / matched awaiting settlement / confirmed on-chain, WAD. Undefined if the engine did not say. */
+  remaining?: bigint;
+  pending?: bigint;
+  filled?: bigint;
+}
+
+export interface CancelResult {
+  status: string;
+  /** False when the engine had never seen the order and only recorded its nonce as dead. */
+  known: boolean;
 }
 
 /** What GET /health says the engine currently believes. */
 export interface EngineHealth {
   /** False when on-chain settlement is stalled. */
   ok: boolean;
+  /** Reconciling with the chain after a restart: orders are refused for the moment. */
+  recovering: boolean;
+  /** On-chain settlement is stalled. */
+  stalled: boolean;
   /** Undefined when the engine runs without a chain reader. */
   paused?: boolean;
   markets: {
@@ -90,7 +106,11 @@ export interface EngineApi {
   getTrades(marketId: number): Promise<Trade[]>;
   getOpenOrders(trader: `0x${string}`): Promise<OpenOrder[]>;
   postOrder(req: PostOrderRequest): Promise<PostOrderResult>;
-  cancelOrder(orderHash: string, signature: `0x${string}`): Promise<void>;
+  /**
+   * Off-chain cancel. `trader` and `nonce` let the engine verify the signature
+   * and kill the nonce even for an order it has never seen.
+   */
+  cancelOrder(orderHash: string, signature: `0x${string}`, trader: `0x${string}`, nonce: bigint): Promise<CancelResult>;
   /** Opens the live feed for one market; returns a function that closes it. */
   openFeed(marketId: number, handlers: FeedHandlers): () => void;
 }

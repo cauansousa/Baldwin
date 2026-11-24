@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { defineChain, isAddress, isHex, parseEther, type Chain } from "viem";
+import { defineChain, isAddress, isHex, parseEther, parseGwei, type Chain } from "viem";
 import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
 import type { Deployment } from "../../shared/src/index.ts";
 import type { Hex, LogLevel } from "./types.ts";
@@ -86,6 +86,10 @@ export interface CommonConfig {
   logLevel: LogLevel;
   /** Largest block span per eth_getLogs query. */
   logMaxBlockRange: bigint;
+  /** Log queries stop this many blocks short of the head. */
+  logHeadLag: bigint;
+  /** Blocks re-scanned on every log pass. */
+  logRescan: bigint;
 }
 
 function common(env: Env): CommonConfig {
@@ -98,7 +102,21 @@ function common(env: Env): CommonConfig {
     deployment: loadDeployment(env),
     logLevel: level as LogLevel,
     logMaxBlockRange: BigInt(int(env, "LOG_MAX_BLOCK_RANGE", 2000, 1)),
+    logHeadLag: BigInt(int(env, "LOG_HEAD_LAG_BLOCKS", 2, 0)),
+    logRescan: BigInt(int(env, "LOG_RESCAN_BLOCKS", 5, 0)),
   };
+}
+
+/**
+ * MAX_FEE_PER_GAS_GWEI: decimal gwei, default 100; 0 switches the cap off. A cap is on
+ * by default because uncapped bumping of a stuck transaction can outgrow the
+ * operator's balance, after which no replacement is accepted any more.
+ */
+function feeCap(env: Env): bigint | undefined {
+  const raw = env.MAX_FEE_PER_GAS_GWEI === undefined || env.MAX_FEE_PER_GAS_GWEI === "" ? "100" : env.MAX_FEE_PER_GAS_GWEI;
+  if (!/^[0-9]+(\.[0-9]{1,9})?$/.test(raw)) throw new Error("MAX_FEE_PER_GAS_GWEI must be a decimal number of gwei");
+  const wei = parseGwei(raw);
+  return wei === 0n ? undefined : wei;
 }
 
 /** "0.01" (ETH) -> wei. */
@@ -142,6 +160,11 @@ export interface EngineConfig extends CommonConfig {
   matchGasFloorPerMarket: bigint;
   receiptTimeoutMs: number;
   receiptPollMs: number;
+  /** Start-up recovery must finish within this, or the process exits non-zero. */
+  recoveryTimeoutMs: number;
+  intakeTimeoutMs: number;
+  traderOrdersPerMinute: number;
+  preTradeCacheMs: number;
   chainRefreshMs: number;
   faultThreshold: number;
   faultWindowSec: number;
@@ -152,8 +175,9 @@ export interface EngineConfig extends CommonConfig {
 }
 
 export function loadEngineConfig(env: Env = process.env): EngineConfig {
+  const base = common(env);
   return {
-    ...common(env),
+    ...base,
     operatorKey: privateKey(env, "OPERATOR_PRIVATE_KEY"),
     port: int(env, "PORT", 8080, 1),
     host: env.HOST || "127.0.0.1",
@@ -170,16 +194,22 @@ export function loadEngineConfig(env: Env = process.env): EngineConfig {
     operatorMinBalance: ethEnv(env, "OPERATOR_MIN_BALANCE_ETH", "0.01"),
     shutdownTimeoutMs: int(env, "SHUTDOWN_TIMEOUT_MS", 30_000, 0),
     logPollIntervalMs: int(env, "LOG_POLL_INTERVAL_MS", 2000, 100),
-    startBlock: optionalBlock(env, "START_BLOCK"),
+    startBlock:
+      optionalBlock(env, "START_BLOCK") ??
+      (base.deployment.deploymentBlock !== undefined ? BigInt(base.deployment.deploymentBlock) : undefined),
     gasLimitCap: BigInt(int(env, "GAS_LIMIT_CAP", 16_000_000, 21_000)),
     matchGasFloorBase: BigInt(int(env, "MATCH_GAS_FLOOR_BASE", 400_000, 0)),
-    matchGasFloorPerMarket: BigInt(int(env, "MATCH_GAS_FLOOR_PER_MARKET", 150_000, 0)),
+    matchGasFloorPerMarket: BigInt(int(env, "MATCH_GAS_FLOOR_PER_MARKET", 200_000, 0)),
     receiptTimeoutMs: int(env, "RECEIPT_TIMEOUT_MS", 30_000, 100),
     receiptPollMs: int(env, "RECEIPT_POLL_MS", 500, 10),
+    recoveryTimeoutMs: int(env, "RECOVERY_TIMEOUT_MS", 120_000, 1000),
+    intakeTimeoutMs: int(env, "INTAKE_TIMEOUT_MS", 8000, 100),
+    traderOrdersPerMinute: int(env, "TRADER_ORDERS_PER_MINUTE", 600, 0),
+    preTradeCacheMs: int(env, "PRETRADE_CACHE_MS", 1000, 0),
     chainRefreshMs: int(env, "CHAIN_REFRESH_MS", 2000, 100),
     faultThreshold: int(env, "FAULT_THRESHOLD", 3, 1),
     faultWindowSec: int(env, "FAULT_WINDOW_SEC", 600, 1),
-    maxFeePerGasCap: env.MAX_FEE_PER_GAS_GWEI ? BigInt(int(env, "MAX_FEE_PER_GAS_GWEI", 0, 1)) * 10n ** 9n : undefined,
+    maxFeePerGasCap: feeCap(env),
     wsMaxConnections: int(env, "WS_MAX_CONNECTIONS", 1000, 1),
     wsMaxConnectionsPerIp: int(env, "WS_MAX_CONNECTIONS_PER_IP", 10, 1),
   };
@@ -196,13 +226,25 @@ export interface KeeperConfig extends CommonConfig {
   statePath: string;
 }
 
+/** Chain ids of local development nodes (hardhat / anvil / ganache). */
+const LOCAL_CHAIN_IDS = new Set([31337, 1337]);
+
 export function loadKeeperConfig(env: Env = process.env): KeeperConfig {
+  const base = common(env);
+  // On a real network scanning from block 0 is neither quick nor (with most providers)
+  // possible. deploy-testnet.ts records the block; older deployment files need the env var.
+  const deploymentBlock = base.deployment.deploymentBlock;
+  if (!LOCAL_CHAIN_IDS.has(base.deployment.chainId) && !env.KEEPER_START_BLOCK && deploymentBlock === undefined) {
+    throw new Error(
+      `KEEPER_START_BLOCK is required on chain ${base.deployment.chainId} because the deployment file has no deploymentBlock: set it to the block in which the Exchange was deployed (see the deployment transaction on the block explorer)`,
+    );
+  }
   return {
-    ...common(env),
+    ...base,
     keeperKey: privateKey(env, "KEEPER_PRIVATE_KEY"),
     pollIntervalMs: int(env, "KEEPER_POLL_INTERVAL_MS", 5000, 100),
     fundingIntervalSec: int(env, "FUNDING_INTERVAL_SEC", 3600, 1),
-    startBlock: BigInt(int(env, "KEEPER_START_BLOCK", 0)),
+    startBlock: BigInt(int(env, "KEEPER_START_BLOCK", deploymentBlock ?? 0)),
     minFreeCollateral: bigintEnv(env, "KEEPER_MIN_FREE_COLLATERAL", 1n),
     statePath: resolve(ENGINE_DIR, env.KEEPER_STATE_PATH || "data/keeper-state.json"),
   };

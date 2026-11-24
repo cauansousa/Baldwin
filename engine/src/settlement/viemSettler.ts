@@ -65,8 +65,8 @@ export interface ViemSettlerOptions {
   gasLimitCap?: bigint;
   /**
    * Gas the contract insists on having left before each match (currently
-   * 400,000 + 150,000 x marketCount; configurable because it is re-measured when the
-   * contract changes). Every match is budgeted at this. Default 700,000.
+   * 400,000 + 200,000 x marketCount; configurable because it is re-measured when the
+   * contract changes). Every match is budgeted at this. Default 800,000.
    */
   gasFloorPerMatch?: bigint;
   /** Fixed part of the gas budget (intrinsic gas, calldata, loop overhead). Default 300,000. */
@@ -233,7 +233,7 @@ export class ViemSettler implements Settler {
     this.pollIntervalMs = opts.pollIntervalMs ?? 500;
     this.maxRounds = opts.maxRounds ?? 4;
     this.gasLimitCap = opts.gasLimitCap ?? 16_000_000n;
-    this.gasFloorPerMatch = opts.gasFloorPerMatch ?? 700_000n;
+    this.gasFloorPerMatch = opts.gasFloorPerMatch ?? 800_000n;
     this.gasOverhead = opts.gasOverhead ?? 300_000n;
     this.bumpAfterRounds = Math.max(1, opts.bumpAfterRounds ?? 2);
     this.maxFeePerGasCap = opts.maxFeePerGasCap;

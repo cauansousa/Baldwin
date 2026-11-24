@@ -136,13 +136,17 @@ describe("REST API", () => {
     const payload = { order: wire(order), signature: await signOrder(bob, order) };
     const forged = await app.inject({ method: "POST", url: "/orders", payload });
     expect(forged.statusCode).toBe(401);
-    expect(forged.json()).toEqual({ error: { code: "BAD_SIGNATURE", message: expect.any(String) } });
+    expect(forged.json()).toEqual({ error: { code: "BAD_SIGNATURE", message: expect.any(String), outcome: "not_applied" } });
 
     const good = { order: wire(order), signature: await signOrder(alice, order) };
     expect((await app.inject({ method: "POST", url: "/orders", payload: good })).statusCode).toBe(200);
     const dup = await app.inject({ method: "POST", url: "/orders", payload: good });
-    expect(dup.statusCode).toBe(409);
-    expect(dup.json().error.code).toBe("DUPLICATE_ORDER");
+    expect(dup.statusCode).toBe(200);
+    expect(dup.json()).toMatchObject({ duplicate: true, status: "open" });
+    const reused = makeOrder(alice, true, 99, 1, { nonce: order.nonce });
+    const other = await app.inject({ method: "POST", url: "/orders", payload: { order: wire(reused), signature: await signOrder(alice, reused) } });
+    expect(other.statusCode).toBe(409);
+    expect(other.json().error).toMatchObject({ code: "NONCE_REUSED", outcome: "not_applied" });
 
     const crossing = await post(app, bob, false, 100, 1, { postOnly: true });
     expect(crossing.res.statusCode).toBe(422);

@@ -56,6 +56,8 @@ async function main(): Promise<void> {
     self: account.address,
     startBlock: cfg.startBlock,
     maxBlockRange: cfg.logMaxBlockRange,
+    headLag: cfg.logHeadLag,
+    overlap: cfg.logRescan,
     fundingIntervalSec: cfg.fundingIntervalSec,
     state: new FileKeeperState(cfg.statePath),
     logger: log,

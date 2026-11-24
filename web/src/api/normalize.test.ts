@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DATA_MESSAGE_TYPES } from "./http";
-import { isCancellable, normalizeHealth, mergeTrades, normalizeMarkets, normalizeOpenOrders, normalizeOrderBook, normalizeTrades, tryNormalizeOrderBook } from "./normalize";
+import { isCancellable, normalizeCancelResult, normalizeHealth, normalizePostOrderResult, mergeTrades, normalizeMarkets, normalizeOpenOrders, normalizeOrderBook, normalizeTrades, tryNormalizeOrderBook } from "./normalize";
 
 describe("engine payload normalization", () => {
   it("sorts the book and drops empty levels", () => {
@@ -78,6 +78,8 @@ describe("engine payload normalization", () => {
     });
     expect(health).toEqual({
       ok: false,
+      recovering: false,
+      stalled: true,
       paused: true,
       markets: [
         { marketId: 0, indexPrice: 100n, band: { lower: 95n, upper: 105n } },
@@ -85,8 +87,36 @@ describe("engine payload normalization", () => {
       ],
     });
     // Engine without a chain reader, or an unexpected body: nothing is assumed.
-    expect(normalizeHealth({ ok: true, chain: null })).toEqual({ ok: true, paused: undefined, markets: [] });
-    expect(normalizeHealth("nope")).toEqual({ ok: true, paused: undefined, markets: [] });
+    const blank = { ok: true, recovering: false, stalled: false, paused: undefined, markets: [] };
+    expect(normalizeHealth({ ok: true, chain: null })).toEqual(blank);
+    expect(normalizeHealth("nope")).toEqual(blank);
+    // Recovering makes ok false, but that is not a settlement stall.
+    expect(normalizeHealth({ ok: false, recovering: true, settlement: { recovering: true, stalled: false } })).toMatchObject({
+      ok: false,
+      recovering: true,
+      stalled: false,
+    });
+    expect(normalizeHealth({ ok: false })).toMatchObject({ recovering: false, stalled: true });
+  });
+
+  it("reads POST /orders answers, including the idempotent duplicate", () => {
+    const fresh = normalizePostOrderResult({
+      orderHash: "0x1",
+      status: "partially_filled",
+      fills: [{ makerOrderHash: "0xa", takerOrderHash: "0x1", price: "5", size: "2", status: "pending" }],
+      remaining: "8",
+      pending: "2",
+      filled: "0",
+    });
+    expect(fresh).toMatchObject({ status: "partially_filled", duplicate: false, remaining: 8n, pending: 2n, filled: 0n });
+    expect(fresh.fills).toEqual([{ price: 5n, size: 2n }]);
+    const again = normalizePostOrderResult({ orderHash: "0x1", status: "open", fills: [], remaining: "8", pending: "0", filled: "2", duplicate: true });
+    expect(again).toMatchObject({ duplicate: true, status: "open", remaining: 8n, filled: 2n, fills: [] });
+  });
+
+  it("reads DELETE /orders answers: a cancel of an order the engine never saw is still a 200", () => {
+    expect(normalizeCancelResult({ orderHash: "0x1", status: "cancelled", known: false })).toEqual({ status: "cancelled", known: false });
+    expect(normalizeCancelResult({ orderHash: "0x1", status: "cancelled", remaining: "0" })).toEqual({ status: "cancelled", known: true });
   });
 
   it("normalizes markets", () => {

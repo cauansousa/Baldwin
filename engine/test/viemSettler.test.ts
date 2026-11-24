@@ -168,7 +168,7 @@ describe("ViemSettler", () => {
 
     expect(rpc.sent).toHaveLength(1);
     const tx = parseTransaction(rpc.sent[0]!);
-    expect(tx).toMatchObject({ nonce: 7, chainId: DOMAIN.chainId, maxFeePerGas: 100n, maxPriorityFeePerGas: 10n, gas: 3n * 700_000n + 300_000n });
+    expect(tx).toMatchObject({ nonce: 7, chainId: DOMAIN.chainId, maxFeePerGas: 100n, maxPriorityFeePerGas: 10n, gas: 3n * 800_000n + 300_000n });
     expect(tx.to!.toLowerCase()).toBe(EXCHANGE.toLowerCase());
     const call = decodeFunctionData({ abi: exchangeAbi, data: tx.data! });
     expect(call.functionName).toBe("settleMatches");
@@ -269,7 +269,7 @@ describe("ViemSettler", () => {
     low.rpc.gasEstimate = 150_000n;
     low.rpc.onSend = () => ok(matches);
     await low.settler.settle({ id: "b1", matches });
-    expect(parseTransaction(low.rpc.sent[0]!).gas).toBe(4n * 700_000n + 300_000n);
+    expect(parseTransaction(low.rpc.sent[0]!).gas).toBe(4n * 800_000n + 300_000n);
     // an L2 estimate dominated by L1 data cost
     const high = setup();
     high.rpc.gasEstimate = 6_000_000n;
@@ -284,7 +284,7 @@ describe("ViemSettler", () => {
     rpc.estimateError = new Error("transaction gas limit (30311717) is greater than the cap (16777216)");
     rpc.onSend = () => ok(matches);
     expect((await settler.settle({ id: "b1", matches })).map((r) => r.status)).toEqual(["settled", "settled"]);
-    const gas = 2n * 700_000n + 300_000n;
+    const gas = 2n * 800_000n + 300_000n;
     expect(rpc.calls).toEqual([gas]);
     expect(parseTransaction(rpc.sent[0]!).gas).toBe(gas);
     // ... and if that check says the batch reverts, nothing is sent

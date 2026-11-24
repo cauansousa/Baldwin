@@ -52,7 +52,7 @@ export function OpenOrdersTable({ markets, viewer, trader }: Props) {
       const signature = normalizeSignature(
         await signTypedDataAsync(cancelTypedData(config.chainId, config.exchange, trader, o.order.nonce)),
       );
-      await engine.cancelOrder(o.orderHash, signature);
+      await engine.cancelOrder(o.orderHash, signature, trader, o.order.nonce);
     } catch (err) {
       setError(describeError(err));
     } finally {
@@ -65,12 +65,14 @@ export function OpenOrdersTable({ markets, viewer, trader }: Props) {
   const { writeContractAsync } = useWriteContract();
   const tx = useTxFlow();
   const { exchange, chainId } = config;
-  const refreshOrders = () => {
-    const refresh = () => void queryClient.invalidateQueries({ queryKey: queryKeys.openOrders(viewer) });
-    refresh();
-    // The engine learns about on-chain cancels from events, a moment later.
-    setTimeout(refresh, 4000);
-  };
+  const refreshOrders = () => void queryClient.invalidateQueries({ queryKey: queryKeys.openOrders(viewer) });
+
+  // Nonces this tab has seen cancelled in the contract. The engine only learns of an
+  // on-chain cancel a couple of blocks later, so such orders can stay in its list
+  // for a moment; they are labelled instead of being presented as live or as gone.
+  const [cancelledOnChain, setCancelledOnChain] = useState<ReadonlySet<bigint>>(new Set());
+  const [onChainFloor, setOnChainFloor] = useState(0n);
+  const isDeadOnChain = (o: OpenOrder) => cancelledOnChain.has(o.order.nonce) || o.order.nonce < onChainFloor;
 
   async function cancelOnChain(o: OpenOrder) {
     if (!trader || !exchange) return;
@@ -83,9 +85,12 @@ export function OpenOrdersTable({ markets, viewer, trader }: Props) {
             writeContractAsync({ abi: exchangeAbi, address: exchange, chainId, functionName: "cancelOrder", args: [o.order.nonce] }),
         },
       ],
-      "Ordem cancelada on-chain.",
+      "Cancelamento confirmado on-chain: o contrato não aceita mais esta ordem. O motor leva alguns blocos para refletir isso.",
     );
-    if (ok) refreshOrders();
+    if (ok) {
+      setCancelledOnChain((prev) => new Set(prev).add(o.order.nonce));
+      refreshOrders();
+    }
   }
 
   // What the last bulk cancel actually achieved, checked against the contract.
@@ -119,6 +124,7 @@ export function OpenOrdersTable({ markets, viewer, trader }: Props) {
     if (!ok || !plan) return;
     // New orders must use nonces at or above the new minimum.
     nonceStore.recordFloor(trader, plan.value);
+    setOnChainFloor(plan.value);
     refreshOrders();
 
     // Do not take coverage for granted: ask the contract about every order that was listed.
@@ -144,7 +150,7 @@ export function OpenOrdersTable({ markets, viewer, trader }: Props) {
             ok: true,
             text:
               listed.length > 0
-                ? `Verificado no contrato: as ${listed.length} ordem(ns) listada(s) estão canceladas, assim como qualquer outra assinada neste dispositivo até agora.`
+                ? `Verificado no contrato: as ${listed.length} ordem(ns) listada(s) estão canceladas, assim como qualquer outra assinada neste dispositivo até agora. O motor leva alguns blocos para tirá-las da lista.`
                 : "Todas as ordens assinadas neste dispositivo até agora estão canceladas no contrato.",
           },
     );
@@ -172,7 +178,7 @@ export function OpenOrdersTable({ markets, viewer, trader }: Props) {
       {viewer && (
         <p className="footnote panel-hint">
           “Cancelar” é grátis e imediato, mas só retira a ordem do motor; apenas o cancelamento on-chain (custa gás)
-          impede o contrato de aceitá-la.
+          impede o contrato de aceitá-la (vale a partir da confirmação na rede; o motor reflete alguns blocos depois).
         </p>
       )}
       <TxStatus state={tx.state} onDismiss={tx.dismiss} />
@@ -223,7 +229,7 @@ export function OpenOrdersTable({ markets, viewer, trader }: Props) {
                       {formatSize(o.filledSize)}
                       {o.pendingSize > 0n && <span className="muted"> +{formatSize(o.pendingSize)} pend.</span>}
                     </td>
-                    <td>{STATUS_LABELS[o.status] ?? o.status}</td>
+                    <td>{isDeadOnChain(o) ? "Cancelada on-chain · motor atualizando" : (STATUS_LABELS[o.status] ?? o.status)}</td>
                     <td>
                       {[o.order.reduceOnly && "Só redução", o.postOnly && "Post-only", o.ioc && "IOC"]
                         .filter(Boolean)
@@ -234,11 +240,12 @@ export function OpenOrdersTable({ markets, viewer, trader }: Props) {
                     </td>
                     <td className="r">
                       <span className="row-actions">
-                        {isCancellable(o) && (
+                        {isCancellable(o) && !isDeadOnChain(o) && (
                           <button className="btn btn-small" disabled={!trader || cancelling !== undefined} onClick={() => void cancel(o)}>
                             {cancelling === o.orderHash ? "Cancelando…" : "Cancelar"}
                           </button>
                         )}
+                        {!isDeadOnChain(o) && (
                         <button
                           className="btn btn-small btn-ghost"
                           disabled={!canTransact}
@@ -247,6 +254,7 @@ export function OpenOrdersTable({ markets, viewer, trader }: Props) {
                         >
                           On-chain
                         </button>
+                        )}
                       </span>
                     </td>
                   </tr>

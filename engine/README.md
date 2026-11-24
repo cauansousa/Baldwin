@@ -47,35 +47,88 @@ is below `KEEPER_MIN_FREE_COLLATERAL`. It does not unwind what it takes over.
 
 ## API
 
-As in `docs/SPEC.md`. Every bigint is a decimal string. Errors: `{ "error": { "code", "message" } }`.
+As in `docs/SPEC.md`. Every bigint is a decimal string.
 
-- `POST /orders` `{ order, signature, postOnly?, ioc? }` → `{ orderHash, status, fills[], remaining, reason? }`.
+- `POST /orders` `{ order, signature, postOnly?, ioc? }` →
+  `{ orderHash, status, fills[], remaining, pending, filled, reason?, duplicate? }`.
   `fills[]` are the matches made on arrival: `{ makerOrderHash, takerOrderHash, price, size, status: "pending" }`.
   `postOnly` / `ioc` are engine-side flags, not part of the signed order.
-- `DELETE /orders/:orderHash` `{ signature }` (EIP-712 `Cancel(trader, nonce)`) → the order view.
+  **Idempotent by order hash**: see "Retrying" below.
+- `DELETE /orders/:orderHash` `{ signature, trader?, nonce? }` (EIP-712 `Cancel(trader, nonce)`)
+  → the order view. The cancel (dead nonce and the order's new state, one transaction) is on disk
+  before the answer is sent. If the engine does not know the order hash:
+  - with `trader` and `nonce`: the signature is checked against them, the nonce is recorded as
+    dead durably, and the answer is 200 `{ orderHash, status: "cancelled", known: false }` — an
+    order still in transit cannot land afterwards;
+  - without them the signature cannot be checked: 404 `NOT_FOUND`, nothing recorded.
+  Clients should always send `trader` and `nonce`.
 - `GET /orders?trader=0x…` → orders that rest or have matches awaiting settlement:
   `{ orderHash, order, status, remaining, pending, filled, postOnly, ioc, reason?, createdAt }`.
 - `GET /markets`, `GET /orderbook/:marketId?depth=` (default 50, max 500) → `{ marketId, bids: [{price,size}], asks }`,
-  `GET /trades/:marketId?limit=` (newest first), `GET /health`.
+  `GET /trades/:marketId?limit=` (newest first), `GET /health`, `GET /metrics`.
 - `WS /ws`: `{ op: "subscribe"|"unsubscribe", channel: "orderbook"|"trades", marketId }`, `{ op: "ping" }`.
   `orderbook` sends `{ type: "snapshot", channel, marketId, data: { bids, asks } }` on subscribe and after
   every change (full top-50 book each time). `trades` sends a `snapshot` of recent trades, then
-  `{ type: "update", …, data: [trade] }` per confirmed fill.
+  `{ type: "update", …, data: [trade] }` per confirmed fill. Connections are capped per IP and in total.
 
 Order status: `open`, `partially_filled`, `pending_settlement` (fully matched, not yet all confirmed),
 `filled` (fully confirmed on-chain), `cancelled`, `expired`, `rejected` (removed after an on-chain failure).
 
-HTTP codes: 400 malformed/invalid (including a missing or out-of-range expiry), 401 bad signature,
-404 unknown order, 409 duplicate / nonce dead or reused / already filled, 422 post-only would
-cross or is outside the band / insufficient margin / reduce-only without position, 429 rate limit
-or trader suspended, 503 exchange paused, market halted (no index price), chain unreachable or
-settlement stalled.
+### Errors
 
-`GET /health` → `{ ok, warnings[], settlement, chain, operator, operatorBalanceWei, operatorBalanceEth,
-confirmations, cancelWatcherBlock, … }`. `ok` is false while settlement is stalled; `warnings` lists
-a low operator balance, a stalled settlement, a paused exchange and halted markets. `chain` is what
-the engine currently believes: pause flag and, per market, index price and price band.
-`GET /metrics` is Prometheus text (see "Operations"). WebSocket connections are capped per IP and in total.
+Every error is `{ "error": { "code", "message", "outcome" } }`. `outcome` says what the client
+may conclude:
+
+- `not_applied` — the request changed nothing. Fix it or retry it.
+- `unknown` — the request may or may not have taken effect. Only `STATE_UNKNOWN` and `INTERNAL`.
+
+| HTTP | code | outcome | meaning |
+|---|---|---|---|
+| 400 | `BAD_REQUEST` | not_applied | malformed JSON / fields |
+| 400 | `UNKNOWN_MARKET`, `MARKET_INACTIVE`, `INVALID_ORDER`, `BELOW_MIN_SIZE`, `EXPIRED`, `INVALID_EXPIRY` | not_applied | the order itself is unacceptable (`INVALID_ORDER` includes a nonce above `((now + 1 day) in ms) << 64`) |
+| 401 | `BAD_SIGNATURE` | not_applied | order or cancel signature does not match |
+| 404 | `NOT_FOUND` | not_applied | unknown route; cancel of an unknown order without `trader`/`nonce` |
+| 409 | `NONCE_CANCELLED` | not_applied | the nonce is dead (cancelled off-chain or on-chain, below `minValidNonce`, or its order was closed) |
+| 409 | `NONCE_REUSED` | not_applied | a different order of this trader already uses the nonce |
+| 409 | `ALREADY_FILLED` | not_applied | fully filled on-chain |
+| 422 | `POST_ONLY_WOULD_CROSS`, `PRICE_OUTSIDE_BAND` | not_applied | post-only order would take, or is on the wrong side of the band |
+| 422 | `INSUFFICIENT_MARGIN`, `REDUCE_ONLY_NO_POSITION`, `REDUCE_ONLY_EXCEEDS_POSITION` | not_applied | pre-trade checks |
+| 429 | `RATE_LIMITED` | not_applied | per IP (all routes, `Retry-After` set) or per trader (orders) |
+| 429 | `TRADER_SUSPENDED` | not_applied | too many of the trader's orders failed on-chain recently |
+| 503 | `CHAIN_UNAVAILABLE` | not_applied | chain unreadable, chain checks exceeded `INTAKE_TIMEOUT_MS`, or settlement stalled |
+| 503 | `MARKET_HALTED`, `EXCHANGE_PAUSED` | not_applied | no index price for the market / exchange paused (non-reduce-only orders) |
+| 503 | `RECOVERING`, `SHUTTING_DOWN` | not_applied | engine starting up after a restart / shutting down |
+| 503 | `STORE_UNAVAILABLE` | not_applied | the engine cannot persist; for a cancel: the cancel was **not** recorded |
+| 503 | `STATE_UNKNOWN` | **unknown** | the order was processed but could not be persisted |
+| 500 | `INTERNAL` | **unknown** | bug or broken dependency (logged) |
+
+(`DUPLICATE_ORDER` is no longer returned for a resubmission; it remains in the type for the
+order book's own duplicate guard.)
+
+### Retrying
+
+`POST /orders` is idempotent by order hash. Submitting the **identical signed order** again
+returns **200** with the order's current state and `duplicate: true` (`fills` is empty then; use
+`status`, `remaining`, `pending`, `filled`), and changes nothing; the flags of the first submission
+stay in force. So after a timeout, a dropped connection, `STATE_UNKNOWN` or any 5xx a client
+simply sends the same request again:
+
+- 200 without `duplicate` → it was not there before and is accepted now;
+- 200 with `duplicate: true` → the earlier attempt had gone through; this is its state;
+- 409 `NONCE_CANCELLED` → it was cancelled or closed in the meantime (or pruned after expiry: `EXPIRED`).
+
+Server-side time per request is bounded: chain reads and waiting for the trader's earlier
+submissions may take at most `INTAKE_TIMEOUT_MS` (8 s), after which the order is refused with
+`CHAIN_UNAVAILABLE` and is definitely not accepted. `DELETE /orders` is idempotent as well.
+
+### Health
+
+`GET /health` → `{ ok, recovering, warnings[], settlement, chain, operator, operatorBalanceWei,
+operatorBalanceEth, confirmations, cancelWatcherBlock, … }`. `ok` is false while the engine is
+recovering, settlement is stalled or the store is broken. `warnings` lists: recovering, a low
+operator balance, a stalled settlement, the operator being unable to pay for a settlement
+transaction, a transaction stuck at the fee cap, a broken store, a paused exchange, halted markets.
+`chain` is what the engine currently believes: pause flag and, per market, index price and price band.
 
 ## Matching rules
 
@@ -122,8 +175,17 @@ the engine currently believes: pause flag and, per market, index price and price
   the trader's other open orders**: initial margin on the worst-case exposure, plus taker fees
   and the loss of filling at the limit (clamped into the band) rather than at the index.
   Submissions of one trader are processed one at a time so that concurrent orders cannot dodge it.
-- **Suspension:** a trader whose orders were at fault in `FAULT_THRESHOLD` on-chain failures
-  within `FAULT_WINDOW_SEC` gets new orders refused (429) until the window has passed.
+  Reduce-only orders are not margin-checked, but all of a trader's reduce-only orders on one
+  side of a market together may not exceed the position they reduce. Chain reads are reused per
+  trader for `PRETRADE_CACHE_MS`, and orders are also rate-limited per trader address
+  (`TRADER_ORDERS_PER_MINUTE`, counted only for validly signed orders).
+- **Faults and suspension:** when an order fails on-chain through its trader's own doing
+  (margin, reduce-only), the trader's other resting orders that would fail the same way are
+  cancelled at once (margin: all non-reduce-only orders; reduce-only: the reduce-only orders on
+  that side of that market). `FAULT_THRESHOLD` such failures within `FAULT_WINDOW_SEC` suspend
+  the trader: all resting orders are cancelled and new ones refused (429) until the window has
+  passed. An order that merely turns out cancelled, filled or expired on-chain is removed
+  without counting.
 
 ## Dead nonces (what a cancel is worth)
 
@@ -163,28 +225,43 @@ baseline); recent trades; dead nonces and `minValidNonce` per trader; the log cu
 
 Durability guarantees:
 
-- An order is on disk, together with the matches it produced, before `POST /orders` answers. A
-  cancel is on disk before `DELETE /orders/:hash` answers. If the commit fails the client gets
-  503 and intake halts until writes work again.
+- An order is on disk, together with the matches it produced (and, for IOC orders, its dead
+  nonce), in one commit before `POST /orders` answers. If that commit fails the client gets 503
+  `STATE_UNKNOWN`, intake halts (`STORE_UNAVAILABLE`) until writes work again, and nothing of
+  the order is broadcast before it is on disk (a batch is only sent after a successful commit
+  that includes everything pending).
+- A cancel — the dead nonce **and** the order's cancelled state — is one commit, made before
+  anything changes in memory and before `DELETE /orders/:hash` answers. If it fails the client
+  gets 503 `STORE_UNAVAILABLE` and the order is exactly as it was. As a second line of defence,
+  an order found resting in the store although its nonce is dead is closed when the store is loaded.
+- Writes whose failure is not reported to a client (expiry sweeps, band cancels, settlement
+  results) are re-derivable: after a restart the same facts are found again from the chain and
+  the clock. They are retried with the next write.
+- The store file belongs to one engine process: it is opened in exclusive locking mode with a
+  short busy timeout, so a second process pointed at it fails at once.
 - A commit is atomic. After a crash, including in the middle of a write, the store opens at the
   last complete commit; a torn tail of the log is discarded.
 - A settlement transaction is recorded (signed bytes and nonce) **before** it is broadcast, and
   the matches of a batch are marked as belonging to it before the settler is called.
 
-On start-up (`engine.recover()`, before the API opens):
+On start-up the API is opened at once, `GET /health` reports `recovering: true` and orders are
+refused with 503 `RECOVERING` until `engine.recover()` has finished:
 
 1. Orders, books (same time priority), unsettled matches and trades are loaded.
-2. The batch that was in flight when the process died is resolved from the chain: the settler
+2. Cancels first: every resting order is checked against `isCancelled` (covers `cancelOrder`
+   and `cancelAllOrders`), cancel events since the stored cursor are replayed, expired orders
+   are dropped. Nothing cancelled while the engine was down can be matched or re-crossed.
+3. The batch that was in flight when the process died is resolved from the chain: the settler
    looks up the receipts of the transactions it recorded; if none was mined it re-broadcasts the
    same signed transaction (same nonce). If the nonce is gone and no receipt exists, on-chain
    `filledSize` decides whether anything of the batch was applied. Results are then applied
    exactly as in normal operation, so matches that settled are never sent again and matches that
    failed give their liquidity back. Matches that were queued but never sent are sent now.
-3. Every resting order is compared with the chain: `filledSize` (the chain wins), `isCancelled`
-   (covers `cancelOrder` and `cancelAllOrders`) and expiry.
-4. Cancel events since the stored cursor are replayed. Only then does the engine take orders.
+4. Every resting order's fill state is corrected to on-chain `filledSize`.
 
-If the chain cannot be read during this, the process exits instead of serving unverified state.
+If the chain cannot be read, or recovery is not done within `RECOVERY_TIMEOUT_MS` (an in-flight
+batch with the RPC down), the process exits non-zero instead of serving unverified state; the
+process manager starts it again.
 
 Not stored: per-order strike counters are, but trader fault counters and suspensions are not
 (they reset on restart). Losing the file means losing the book and the dead nonces: traders must
@@ -192,15 +269,22 @@ resubmit, and on-chain state (`filledSize`, cancels) is still honoured through t
 
 ## Chain watching
 
-The engine never relies on websocket subscriptions or server-side filters. On-chain cancels are
-read with `eth_getLogs` over block ranges, with the cursor (last fully handled block) in the
-store. The block span is halved when a query is refused (range or response limits, rate limits)
-and grows back after successes; failed passes are retried with exponential backoff up to 30 s.
-The cursor only advances after a range was applied, and applying is idempotent, so a restart
-continues where it stopped and no cancel is missed. With `CONFIRMATIONS > 1` the last
-`CONFIRMATIONS − 1` blocks are scanned again on every pass. A cancel is acted on as soon as it
-is seen (removing an order early is always safe). Pause flag, index prices and market parameters
-are polled (`CHAIN_REFRESH_MS`); every JSON-RPC request is retried a few times by the transport.
+The engine never relies on websocket subscriptions or server-side filters. On-chain cancels
+(`OrderCancelled`, `OrdersCancelledBelow`) are read with `eth_getLogs` over block ranges, with
+the cursor (last fully handled block) in the store.
+
+- The block span is halved when a query is refused (range or response limits, rate limits) and
+  grows back after successes; failed passes are retried with exponential backoff up to 30 s.
+- `eth_getLogs` is not trusted up to the head: a backend that is a block behind the one that
+  reported the head answers with fewer logs and no error. Scanning stops `LOG_HEAD_LAG_BLOCKS`
+  (default 2) short of the head, and every pass reads the last `LOG_RESCAN_BLOCKS` (default 5,
+  at least `CONFIRMATIONS`) blocks again. Events are applied idempotently, so re-reading is harmless.
+  The price is that an on-chain cancel takes effect in the engine `LOG_HEAD_LAG_BLOCKS` blocks
+  late; on a local automine chain set it to 0.
+- The cursor only advances after a range was applied, so a restart continues where it stopped.
+- Pause flag, index prices and market parameters are polled (`CHAIN_REFRESH_MS`); every JSON-RPC
+  request is retried a few times by the transport. RPC URLs never appear in logs or error
+  messages (they commonly carry an API key).
 
 Oracle failures (stale feed, L2 sequencer down or in its grace period, …) make `indexPrice` and
 the account views revert. The engine treats that as "market halted": no new orders for that
@@ -228,16 +312,20 @@ chain you run on.
   stdout, `warn`/`error` on stderr. `LOG_LEVEL` filters.
 - **`GET /health`**: see API. Use `ok` for liveness/readiness and alert on `warnings`.
 - **`GET /metrics`** (Prometheus text, no dependency): `baldwin_orders_accepted_total`,
-  `baldwin_orders_rejected_total{code}`, `baldwin_orders_cancelled_total`,
+  `baldwin_orders_rejected_total{code}`, `baldwin_orders_duplicate_total`, `baldwin_orders_cancelled_total`,
   `baldwin_matches_settled_total`, `baldwin_matches_failed_total`, `baldwin_batches_total`,
   `baldwin_batch_errors_total`, `baldwin_batch_latency_seconds` (histogram),
   `baldwin_settlement_queue_depth`, `baldwin_settlement_stalled`, `baldwin_resting_orders`,
-  `baldwin_exchange_paused`, `baldwin_operator_balance_eth`, `baldwin_rpc_errors_total{method}`,
+  `baldwin_exchange_paused`, `baldwin_settler_insufficient_funds`, `baldwin_settler_fee_cap_reached`,
+  `baldwin_store_broken`, `baldwin_recovering`, `baldwin_operator_balance_eth`, `baldwin_rpc_errors_total{method}`,
   `baldwin_cancel_watcher_block`. The endpoint is not authenticated: expose it to your
   monitoring network only.
 - **Shutdown**: on SIGTERM/SIGINT the engine refuses new orders (503 `SHUTTING_DOWN`; cancels and
-  reads still work), waits up to `SHUTDOWN_TIMEOUT_MS` for the batch in flight, flushes and
-  closes the store and exits. Anything unresolved is picked up by the next start.
+  reads still work), waits up to `SHUTDOWN_TIMEOUT_MS` for the batch in flight, terminates
+  WebSocket clients, closes idle connections and the listener, closes the store and exits.
+  A second signal, or `SHUTDOWN_TIMEOUT_MS` + 10 s, ends the process in any case (the store is
+  closed first). Anything unresolved is picked up by the next start.
+- Unexpected errors in a request (HTTP 500) are written to the JSON log with route and a short stack.
 
 ## Running on testnet (Arbitrum Sepolia)
 
@@ -248,7 +336,10 @@ chain you run on.
    - `OPERATOR_PRIVATE_KEY`: the operator account, funded with Arbitrum Sepolia ETH, used by
      nothing else;
    - `KEEPER_PRIVATE_KEY`: a different account with ETH, and USDC deposited in the Exchange;
-   - `START_BLOCK` and `KEEPER_START_BLOCK`: the Exchange's deployment block;
+   - `KEEPER_START_BLOCK` and `START_BLOCK`: the block in which the Exchange was deployed.
+     Both default to `deploymentBlock` from the deployment file, which
+     `contracts/scripts/deploy-testnet.ts` records. Set them only for a deployment file
+     without it (the keeper then refuses to start on a non-local chain until it is given);
    - `STORE_PATH` / `KEEPER_STATE_PATH` on a persistent disk; `CORS_ORIGIN`; `CONFIRMATIONS`.
    Nothing in the engine is tied to a particular chain: the chain id comes from the deployment
    file, fees are EIP-1559 values from the node, and gas limits come from `eth_estimateGas`,
@@ -272,7 +363,9 @@ chain you run on.
    - `/health`: `ok` false or any `warnings` (stalled settlement, low operator balance, paused
      exchange, halted market);
    - `baldwin_settlement_stalled` = 1 or `baldwin_settlement_queue_depth` growing;
-   - `baldwin_operator_balance_eth` falling towards zero (settlement stops when it is empty);
+   - `baldwin_operator_balance_eth` falling towards zero (settlement stops when it is empty),
+     `baldwin_settler_insufficient_funds` / `baldwin_settler_fee_cap_reached` = 1,
+     `baldwin_store_broken` = 1, `baldwin_recovering` staying at 1;
    - `rate(baldwin_rpc_errors_total)` and `baldwin_cancel_watcher_block` not advancing (RPC trouble);
    - `rate(baldwin_matches_failed_total)` against `…_settled_total` (stale band, unfunded makers);
    - `baldwin_batch_latency_seconds` (inclusion time), `rate(baldwin_batch_errors_total)`;
@@ -302,17 +395,26 @@ chain you run on.
      other; else a global condition seen in views (paused, index unreadable, price outside the
      band, open interest at the cap); else, as a last resort, a margin estimate per side.
    What happens to the orders:
-   - **At fault** → removed for good (`rejected`), nonce dead, counted against the trader.
+   - **At fault** → removed for good (`rejected`), nonce dead. If the cause is the trader's own
+     doing (margin, reduce-only) it counts against the trader and their similar resting orders
+     are pulled (see "Faults and suspension"); an order that was merely cancelled, filled or
+     expired on-chain is removed without counting.
    - **Innocent** → gets the size back. A resting order returns with its original time priority;
      if orders that arrived in the meantime now cross it, they are matched right away (older
-     order is the maker). An IOC order is matched once more against the remaining book and
-     whatever is left is cancelled. Not given back: orders the trader cancelled meanwhile,
-     expired orders, orders now on the wrong side of the band.
-   - **Global condition** → the taker is cancelled (not its fault, no penalty), the maker gets
-     its size back, **no strike**.
+     order is the maker; a post-only order is never made the taker). An IOC order is matched
+     once more against the remaining book and whatever is left is cancelled. Not given back:
+     orders the trader cancelled meanwhile, expired orders, orders now on the wrong side of the band.
+   - **Global condition** → nobody is at fault, **no strike**, and only the failed fill is
+     undone. If the taker no longer rests (fully matched, or IOC), the maker gets the size back
+     and the taker's failed slice is dropped. If the taker still rests, re-posting the slice
+     would re-match the same pair at once and fail again, so the slice is dropped on **both**
+     sides and both orders keep everything else they have resting.
+   - **`FillTooSmall`** (a sub-minimum fill only fails when an earlier fill of the order it was
+     to complete has failed) → both sides get the size back and are matched again, now for the
+     maker's whole remainder; the maker gets a strike so that this cannot repeat for ever.
    - **Nothing identifiable** → the taker is dropped, the maker gets its size back and a strike;
      three consecutive strikes remove the maker.
-   In every case the same pair cannot be matched again, so no order retries a failing match forever.
+   In every case the same pair cannot be matched again unchanged, so nothing retries for ever.
 4. A cancel removes the unmatched remainder at once. Matches already queued or in flight are
    not recalled and may still settle.
 
@@ -322,19 +424,24 @@ chain you run on.
   that nonce and the same calldata, and the outcome is looked up by the locally computed
   transaction hashes, so a batch cannot settle twice whatever the RPC answers.
 - A transaction that stays unmined for two broadcast rounds is replaced with 25% higher fees,
-  whether or not the broadcast call itself reported an error, up to `MAX_FEE_PER_GAS_GWEI`.
-- The binding is released only when one of the batch's transactions is mined, or when the nonce
-  is gone on-chain, none of the batch's transactions has a receipt after extra polls **and**
-  on-chain `filledSize` of every order in the batch is unchanged since before the first
-  broadcast (so the chain itself shows nothing of the batch was applied). If `filledSize` moved,
-  the settler keeps waiting for the receipt.
+  whether or not the broadcast call itself reported an error, up to `MAX_FEE_PER_GAS_GWEI`
+  (100 gwei unless configured). If a node refuses a replacement because the operator cannot pay
+  for it, bumping stops and the highest-fee transaction a node did accept keeps being
+  re-broadcast. Both conditions show in `/health` (`warnings`, `settlement.insufficientFunds`,
+  `settlement.feeCapReached`) and in the metrics until the batch is mined.
+- The binding is released only when one of the batch's transactions is mined, or when — all read
+  as of one pinned block that is `CONFIRMATIONS` deep — the nonce is consumed, none of the
+  batch's transactions has a receipt after extra polls **and** on-chain `filledSize` of every
+  order in the batch is unchanged since before the first broadcast (so the chain itself shows
+  nothing of the batch was applied). If `filledSize` moved, the settler keeps waiting for the receipt.
+- After a restart with no batch in flight, the next operator nonce is taken from the chain.
 - While a batch's outcome is unknown the engine keeps retrying *that* batch, submits nothing
   else, reports `stalled` on `/health`, and refuses new orders with 503.
 - A batch whose transaction reverted as a whole (e.g. the contract's `InsufficientGas`), or would
   revert in gas estimation, did not settle; it is retried up to three times and then its matches
   are failed as "nothing identifiable". The gas limit is `max(estimate × 1.5, matches × floor +
   300,000)`, where floor is the contract's per-match gas floor (`MATCH_GAS_FLOOR_BASE` +
-  `MATCH_GAS_FLOOR_PER_MARKET` × markets, currently 400,000 + 150,000 × markets): the estimate
+  `MATCH_GAS_FLOOR_PER_MARKET` × markets, currently 400,000 + 200,000 × markets): the estimate
   alone would be too low when a match fails cheaply at estimation but runs fully at inclusion.
   The two constants are read from the contract at start-up; the settings are the fallback.
 - A transaction counts as final once it is `CONFIRMATIONS` blocks deep (see "Finality").
@@ -366,7 +473,16 @@ chain you run on.
   flag do not trade until the pause ends.
 - Start-up reads `filledSize` and `isCancelled` once per resting order (in parallel chunks, no
   multicall): slow with a very large book and a rate-limited RPC.
-- Trader fault counters and suspensions are in memory and reset on restart.
+- Trader fault counters, suspensions and per-trader rate-limit windows are in memory and reset
+  on restart.
+- Under a global condition the failed slice of a still-resting taker (and of its maker) is
+  dropped rather than re-posted; such an order ends `cancelled` with less than its size filled.
+  Its nonce is not dead: the remainder can only be traded with a new order.
+- The contract's rule that a reducing fill by an account already below maintenance must not
+  worsen its health is not mirrored pre-trade; it shows up as `InsufficientMargin(trader)` and
+  is handled as a fault of that trader.
+- A cancel for an order the engine has never seen needs `trader` and `nonce` in the request;
+  with only the hash it is a 404 and protects nothing.
 - Some nodes cannot estimate gas for `settleMatches` (seen with Hardhat's node, whose search
   does not cope with the contract's per-match gas floor). The engine then uses the computed
   budget after an `eth_call` check; that fallback does not include an L2's L1 data cost.
@@ -377,6 +493,10 @@ chain you run on.
   `TRUST_PROXY` only behind a proxy. EOA signatures only (no EIP-1271). The WebSocket book feed
   sends full snapshots, not deltas.
 - Keeper: knows accounts from `Fill`/`Liquidation` events since `KEEPER_START_BLOCK` (cursor and
-  accounts are saved in `KEEPER_STATE_PATH`), does not hedge or unwind positions it takes over,
+  accounts are saved in `KEEPER_STATE_PATH`; a long history is read a few ranges per tick while
+  known accounts are already being checked), forgets a position only after it read as zero on
+  three consecutive ticks, backs off (2, 4, … 64 ticks) on a position it could not liquidate,
+  uses `isLiquidatableIn` when another market's feed is down, calls `updateFunding` only when
+  the latest block's timestamp is a full interval past `lastFundingTime`, does not hedge or unwind positions it takes over,
   does not check profitability, exposes no metrics endpoint (logs only), and sends its
   transactions without the engine's nonce/fee-bump machinery.

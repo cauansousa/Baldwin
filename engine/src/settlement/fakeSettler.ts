@@ -31,10 +31,9 @@ export class FakeSettler implements Settler {
     const prior = this.done.get(batch.id);
     if (prior) return prior;
     const txHash = `0x${(++this.txSeq).toString(16).padStart(64, "0")}` as Hex;
-    // Decide every outcome first, then apply: a batch is atomic, like a transaction.
-    const reasons = batch.matches.map((m) => this.failWhen(m) ?? null);
-    const results = batch.matches.map((m, i): MatchResult => {
-      const reason = reasons[i];
+    // Like the contract: matches are executed in order, each seeing the effect of the earlier ones.
+    const results = batch.matches.map((m): MatchResult => {
+      const reason = this.failWhen(m);
       if (reason) return { status: "failed", txHash, reason };
       for (const [hash, order] of [[m.makerHash, m.maker], [m.takerHash, m.taker]] as const) {
         const total = (this.filled.get(hash) ?? 0n) + m.fillSize;

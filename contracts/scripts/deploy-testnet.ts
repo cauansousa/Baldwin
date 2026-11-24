@@ -385,7 +385,16 @@ export async function deployTestnet(config: TestnetConfig, log: Log = console.lo
   }
 
   // --------------------------------------------------------------- output
-  const deployment = { chainId, exchange: exchangeAddress, usdc: config.usdc, oracle: oracleAddress, markets };
+  // The block the Exchange was created in: where off-chain services start reading events.
+  const exchangeReceipt = await exchange.deploymentTransaction()?.wait();
+  const deployment = {
+    chainId,
+    exchange: exchangeAddress,
+    usdc: config.usdc,
+    oracle: oracleAddress,
+    markets,
+    ...(exchangeReceipt ? { deploymentBlock: exchangeReceipt.blockNumber } : {}),
+  };
   fs.writeFileSync(file, JSON.stringify(deployment, null, 2) + "\n");
   fs.rmSync(incompleteFile, { force: true });
 

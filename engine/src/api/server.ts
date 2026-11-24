@@ -122,8 +122,8 @@ export async function buildServer(engine: Engine, opts: ServerOptions = {}): Pro
 
   app.delete<{ Params: { orderHash: string } }>("/orders/:orderHash", async (req) => {
     const orderHash = parseOrderHash(req.params.orderHash);
-    const { signature } = parseCancelBody(req.body);
-    return engine.cancel(orderHash, signature);
+    const { signature, hint } = parseCancelBody(req.body);
+    return engine.cancel(orderHash, signature, hint);
   });
 
   const ws = attachWebSocket(app.server, engine, {
@@ -138,7 +138,6 @@ export async function buildServer(engine: Engine, opts: ServerOptions = {}): Pro
     ws.close();
   });
   app.addHook("onClose", async () => {
-    ws.close();
     limiter.close();
   });
 

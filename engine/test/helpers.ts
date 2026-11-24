@@ -145,6 +145,8 @@ export function harness(opts: Partial<EngineOptions> & { withChain?: boolean } =
     // Tests that are about expiry timing set these themselves.
     expiryBufferSec: 5,
     minTimeToExpirySec: 0,
+    // Tests change the fake chain between orders and expect the next order to see it.
+    preTradeCacheMs: 0,
     ...rest,
   });
   return {

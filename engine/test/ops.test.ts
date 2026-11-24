@@ -46,7 +46,8 @@ describe("LogPoller", () => {
         startBlock: opts.startBlock,
         maxRange: opts.maxRange ?? 1000n,
         minRange: 10n,
-        overlap: opts.overlap,
+        overlap: opts.overlap ?? 0n,
+        headLag: 0n,
         maxBackoffMs: 5,
       });
     return { w, make, poller: make() };
@@ -309,6 +310,7 @@ describe("logging and config", () => {
       DEPLOYMENT_PATH: dep,
       OPERATOR_PRIVATE_KEY: "0x" + "11".repeat(32),
       KEEPER_PRIVATE_KEY: "0x" + "22".repeat(32),
+      KEEPER_START_BLOCK: "100",
       CONFIRMATIONS: "3",
       OPERATOR_MIN_BALANCE_ETH: "0.005",
       LOG_LEVEL: "warn",
@@ -331,9 +333,11 @@ describe("keeper with a partly failing oracle", () => {
     const WAD = 10n ** 18n;
     const positions = new Map<string, bigint>([[`${alice.address}:1`, 2n * WAD], [`${alice.address}:2`, -3n * WAD]]);
     const done: [string, number, bigint][] = [];
+    const asked: number[] = [];
+    let liquidatableIn1 = false;
     const chain = {
       async blockNumber() {
-        return 1n;
+        return 10n;
       },
       async touchedPositions() {
         return [{ trader: alice.address, marketId: 1 }, { trader: alice.address, marketId: 2 }];
@@ -343,6 +347,11 @@ describe("keeper with a partly failing oracle", () => {
       },
       async isLiquidatable(): Promise<boolean> {
         throw new Error("FeedStale(2, 0)"); // market 2's feed is stale: account-wide views revert
+      },
+      async isLiquidatableIn(_t: string, m: number): Promise<boolean> {
+        asked.push(m);
+        if (m === 2) throw new Error("FeedStale(2, 0)");
+        return liquidatableIn1;
       },
       async liquidate(t: string, m: number, size: bigint) {
         done.push([t, m, size]);
@@ -366,7 +375,11 @@ describe("keeper with a partly failing oracle", () => {
         return 1000n;
       },
     };
-    const keeper = new Keeper({ chain, marketIds: [1, 2] });
+    const keeper = new Keeper({ chain, marketIds: [1, 2], headLag: 0n, overlap: 0n });
+    await keeper.tick();
+    expect(asked).toEqual([1, 2]);
+    expect(done).toEqual([]); // not liquidatable by the contract's own valuation: no attempt at all
+    liquidatableIn1 = true;
     await keeper.tick();
     expect(done).toEqual([[alice.address, 1, 2n * WAD]]);
   });
@@ -394,6 +407,9 @@ describe("keeper persistence", () => {
       async isLiquidatable(t: string) {
         return this.liquidatable && t === alice.address;
       },
+      async isLiquidatableIn(t: string) {
+        return this.liquidatable && t === alice.address;
+      },
       async liquidate(t: string) {
         liquidations.push(t);
         positions.set(`${t}:1`, 0n);
@@ -415,20 +431,20 @@ describe("keeper persistence", () => {
         return 1000n;
       },
     };
-    const k1 = new Keeper({ chain, marketIds: [1], state: new FileKeeperState(path), startBlock: 5n });
+    const k1 = new Keeper({ chain, marketIds: [1], state: new FileKeeperState(path), startBlock: 5n, headLag: 0n, overlap: 0n, untrackAfterZeroReads: 1 });
     await k1.tick();
     expect(queries).toEqual([[5n, 50n]]);
     expect(JSON.parse(readFileSync(path, "utf8"))).toMatchObject({ cursor: "50" });
     // killed and restarted; an account became liquidatable in the meantime
     chain.head = 60n;
     chain.liquidatable = true;
-    const k2 = new Keeper({ chain, marketIds: [1], state: new FileKeeperState(path), startBlock: 5n });
+    const k2 = new Keeper({ chain, marketIds: [1], state: new FileKeeperState(path), startBlock: 5n, headLag: 0n, overlap: 0n, untrackAfterZeroReads: 1 });
     expect(k2.trackedAccounts().sort()).toEqual([alice.address, bob.address].sort());
     await k2.tick();
     expect(queries).toEqual([[5n, 50n], [51n, 60n]]);
     expect(liquidations).toEqual([alice.address]);
     await k2.tick(); // alice's position is closed: she is dropped, and that is saved too
-    const k3 = new Keeper({ chain, marketIds: [1], state: new FileKeeperState(path) });
+    const k3 = new Keeper({ chain, marketIds: [1], state: new FileKeeperState(path), headLag: 0n, overlap: 0n });
     expect(k3.trackedAccounts()).toEqual([bob.address]);
   });
 
@@ -447,6 +463,10 @@ describe("keeper persistence", () => {
         return 5n;
       },
       async isLiquidatable(): Promise<boolean> {
+        if (down) throw new Error("SequencerDown()");
+        return false;
+      },
+      async isLiquidatableIn(): Promise<boolean> {
         if (down) throw new Error("SequencerDown()");
         return false;
       },
@@ -474,10 +494,10 @@ describe("keeper persistence", () => {
         return 10_000n;
       },
     };
-    const keeper = new Keeper({ chain, marketIds: [1, 2] });
+    const keeper = new Keeper({ chain, marketIds: [1, 2], headLag: 0n, overlap: 0n });
     await keeper.tick(); // must not throw
     expect(funded).toEqual([]);
-    expect(attempts).toEqual([[alice.address, 1, 5n]]); // tried anyway: this market's own price is readable
+    expect(attempts).toEqual([]); // isLiquidatableIn is down as well: nothing is attempted blindly
     expect(keeper.trackedAccounts()).toEqual([alice.address]);
     down = false;
     await keeper.tick();

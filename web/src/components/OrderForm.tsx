@@ -184,16 +184,22 @@ export function OrderForm({ market, chainMarket, account, exchangeStatus, engine
     void queryClient.invalidateQueries({ queryKey: queryKeys.chain });
   };
 
-  function describeAccepted(result: PostOrderResult | undefined): Submit {
-    if (!result) return { status: "success", message: "Ordem confirmada: o motor já a tinha registrado.", warn: false };
+  function describeAccepted(result: PostOrderResult): Submit {
     const status = STATUS_LABELS[result.status] ?? result.status;
-    const fills = result.fills.length > 0 ? ` · ${result.fills.length} execução(ões) aguardando liquidação` : "";
+    const warn = CLOSED_STATUSES.has(result.status) && result.fills.length === 0 && !((result.filled ?? 0n) + (result.pending ?? 0n) > 0n);
     const reason = result.reason ? ` Motivo: ${describeOrderReason(result.reason)}.` : "";
-    return {
-      status: "success",
-      message: `Ordem enviada${status ? `: ${status}` : ""}${fills}.${reason}`,
-      warn: CLOSED_STATUSES.has(result.status) && result.fills.length === 0,
-    };
+    if (result.duplicate) {
+      // The earlier attempt had gone through; this is the order's current state.
+      const matched = (result.filled ?? 0n) + (result.pending ?? 0n);
+      const executed = matched > 0n ? ` · ${formatSize(matched)} ${base} já casado` : "";
+      return {
+        status: "success",
+        message: `Ordem confirmada: o motor já a tinha recebido na primeira tentativa${status ? ` (${status})` : ""}${executed}.${reason}`,
+        warn,
+      };
+    }
+    const fills = result.fills.length > 0 ? ` · ${result.fills.length} execução(ões) aguardando liquidação` : "";
+    return { status: "success", message: `Ordem enviada${status ? `: ${status}` : ""}${fills}.${reason}`, warn };
   }
 
   /**
@@ -219,9 +225,16 @@ export function OrderForm({ market, chainMarket, account, exchangeStatus, engine
       setSubmit(describeAccepted(outcome.value));
       setSize("");
     } else if (outcome.kind === "not_accepted") {
-      // Definitely not registered: the signed order is dropped and a new one may be signed.
+      // Not live at the engine: the signed order is dropped and a new one may be signed.
       setPending(undefined);
-      setSubmit({ status: "error", message: describeError(outcome.error) });
+      const code = outcome.error instanceof EngineError ? outcome.error.code : undefined;
+      const closedMeanwhile = outcome.resubmission && (code === "NONCE_CANCELLED" || code === "EXPIRED");
+      setSubmit({
+        status: "error",
+        message: closedMeanwhile
+          ? "A ordem não está ativa: foi cancelada, encerrada ou expirou enquanto confirmávamos com o motor. Confira posições e negócios antes de enviar outra."
+          : describeError(outcome.error),
+      });
     } else {
       setSubmit({ status: "unresolved", detail: describeError(outcome.error) });
     }
@@ -282,8 +295,7 @@ export function OrderForm({ market, chainMarket, account, exchangeStatus, engine
 
   /**
    * Gives up on an unresolved order. The nonce is cancelled at the engine
-   * first; the order is only forgotten once the engine confirms the cancel or
-   * says it never had the order.
+   * first; the order is only forgotten once the engine answers 200.
    */
   async function discardPending() {
     if (!pending || !trader || !config.exchange) return;
@@ -292,16 +304,20 @@ export function OrderForm({ market, chainMarket, account, exchangeStatus, engine
       const signature = normalizeSignature(
         await signTypedDataAsync(cancelTypedData(config.chainId, config.exchange, trader, pending.order.nonce)),
       );
-      await engine.cancelOrder(pending.orderHash, signature);
+      // The engine answers 200 even for an order it never saw: it then records the
+      // nonce as dead, so an attempt still in transit cannot land afterwards.
+      const result = await engine.cancelOrder(pending.orderHash, signature, trader, pending.order.nonce);
       setPending(undefined);
-      setSubmit({ status: "success", message: "Ordem descartada: o motor confirmou o cancelamento.", warn: false });
+      setSubmit({
+        status: "success",
+        message: result.known
+          ? "Ordem descartada: o motor confirmou o cancelamento."
+          : "Ordem descartada: o motor não a tinha recebido e bloqueou o nonce dela, então ela não pode mais entrar.",
+        warn: false,
+      });
     } catch (err) {
-      if (err instanceof EngineError && err.status === 404) {
-        setPending(undefined);
-        setSubmit({ status: "success", message: "Ordem descartada: o motor confirmou que ela não chegou a ser registrada.", warn: false });
-      } else {
-        setSubmit({ status: "discard_failed", detail: describeError(err) });
-      }
+      // Anything but a 200 (including 404) leaves the order unresolved.
+      setSubmit({ status: "discard_failed", detail: describeError(err) });
     }
     refreshAfterOrder();
   }

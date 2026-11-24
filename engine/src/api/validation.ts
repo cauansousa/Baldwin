@@ -86,9 +86,13 @@ export function parseSubmitBody(v: unknown): SubmitBody {
   };
 }
 
-export function parseCancelBody(v: unknown): { signature: Hex } {
+/** `{ signature }`, optionally with `trader` and `nonce` (both or neither). */
+export function parseCancelBody(v: unknown): { signature: Hex; hint?: { trader: Address; nonce: bigint } } {
   if (!isObject(v)) throw new ValidationError("body must be a JSON object { signature }");
-  return { signature: parseSignature(v.signature) };
+  const signature = parseSignature(v.signature);
+  if (v.trader === undefined && v.nonce === undefined) return { signature };
+  if (v.trader === undefined || v.nonce === undefined) throw new ValidationError("trader and nonce must be given together");
+  return { signature, hint: { trader: parseAddress(v.trader, "trader"), nonce: parseUint(v.nonce, "nonce", UINT256_MAX) } };
 }
 
 /** Optional integer query parameter within [min, max]. */

@@ -49,7 +49,8 @@ export function App() {
   const engineMarket = market ? health.data?.markets.find((m) => m.marketId === market.marketId) : undefined;
   // The contract is the authority; the engine's view is the fallback while the chain read is unavailable.
   const paused = exchangeStatus.data?.paused ?? health.data?.paused ?? false;
-  const halted = engineMarket !== undefined && engineMarket.indexPrice === null;
+  // While recovering the engine has not read prices yet; that is not a halted market.
+  const halted = engineMarket !== undefined && engineMarket.indexPrice === null && !health.data?.recovering;
 
   const [testnetNoticeOpen, setTestnetNoticeOpen] = useState(() => !isLocalChain && !readSessionFlag(TESTNET_NOTICE_KEY));
   const dismissTestnetNotice = () => {
@@ -107,7 +108,13 @@ export function App() {
           </button>
         </div>
       )}
-      {health.data?.ok === false && (
+      {health.data?.recovering && (
+        <div className="banner banner-warn" role="alert">
+          O motor está reiniciando e se sincronizando com a blockchain: novas ordens são temporariamente recusadas.
+          Cancelamentos, depósitos e saques continuam funcionando.
+        </div>
+      )}
+      {health.data?.stalled && !health.data.recovering && (
         <div className="banner banner-warn" role="alert">
           O motor está com a liquidação on-chain parada. Ordens casadas podem demorar a ser confirmadas.
         </div>
