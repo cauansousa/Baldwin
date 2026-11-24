@@ -1,11 +1,12 @@
 // Regression tests for the findings of the independent review (R1-R7 and follow-ups).
-import { mkdtempSync, readFileSync, appendFileSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { encodeErrorResult, parseAbi } from "viem";
 import { describe, expect, it } from "vitest";
 import { accountFromKey, privateKey } from "../src/config.ts";
-import { FileDeadNonceStore, MemoryDeadNonceStore } from "../src/engine/deadNonces.ts";
+import { MemoryDeadNonceStore } from "../src/engine/deadNonces.ts";
+import { SqliteStore } from "../src/store/sqliteStore.ts";
 import { Engine, EngineError } from "../src/engine/engine.ts";
 import { FakeSettler } from "../src/settlement/fakeSettler.ts";
 import { hashOrder } from "../src/signing.ts";
@@ -29,15 +30,15 @@ const code = async (p: Promise<unknown>) => {
   }
   return "OK";
 };
-const tmpFile = () => join(mkdtempSync(join(tmpdir(), "baldwin-dead-")), "dead.jsonl");
+const tmpFile = () => join(mkdtempSync(join(tmpdir(), "baldwin-dead-")), "engine.sqlite");
 
 describe("1: dead nonces survive a restart", () => {
   it("R1: an order cancelled off-chain cannot be re-posted from public calldata after a restart", async () => {
     const path = tmpFile();
     const chain = new FakeChain(); // on-chain state survives; the off-chain cancel is not on it
     const settler1 = new FakeSettler();
-    const store1 = new FileDeadNonceStore(path, 1000n);
-    const e1 = new Engine({ domain: DOMAIN, markets: [MARKET], settler: settler1, chain, deadNonces: store1, now: () => 1000 });
+    const store1 = new SqliteStore(path);
+    const e1 = new Engine({ domain: DOMAIN, markets: [MARKET], settler: settler1, chain, store: store1, now: () => 1000 });
     const aOrder = makeOrder(alice, true, 100, 10);
     await e1.submit({ order: aOrder, signature: await signOrder(alice, aOrder) });
     const bOrder = makeOrder(bob, false, 100, 1);
@@ -47,13 +48,15 @@ describe("1: dead nonces survive a restart", () => {
     chain.filled.set(aHash, wad(1));
     const publicCalldata = settler1.calls[0]!.matches[0]!;
     expect((await e1.cancel(aHash, await signCancel(alice, alice.address, aOrder.nonce))).status).toBe("cancelled");
-    // durable at the moment the cancel is acknowledged
-    expect(readFileSync(path, "utf8")).toContain(`"n":"${aOrder.nonce}"`);
-    await e1.stop();
-    store1.close();
+    // durable at the moment the cancel is acknowledged: another connection to the file sees it
+    const peek = new SqliteStore(path);
+    expect(peek.has(alice.address, aOrder.nonce)).toBe(true);
+    peek.close();
+    // the process dies without any shutdown
 
-    const e2 = new Engine({ domain: DOMAIN, markets: [MARKET], settler: new FakeSettler(), chain, deadNonces: new FileDeadNonceStore(path, 2000n), now: () => 2000 });
-    expect(await code(e2.submit({ order: publicCalldata.maker, signature: publicCalldata.makerSig }))).toBe("NONCE_CANCELLED");
+    const e2 = new Engine({ domain: DOMAIN, markets: [MARKET], settler: new FakeSettler(), chain, store: new SqliteStore(path), now: () => 2000 });
+    await e2.recover();
+    expect(["NONCE_CANCELLED", "DUPLICATE_ORDER"]).toContain(await code(e2.submit({ order: publicCalldata.maker, signature: publicCalldata.makerSig })));
     expect(e2.getOrderBook(1, 10).bids).toEqual([]);
   });
 
@@ -97,23 +100,19 @@ describe("1: dead nonces survive a restart", () => {
     expect(dead.has(carol.address, offMarket.nonce)).toBe(true);
   });
 
-  it("the file store drops expired entries on load, tolerates a torn last line, and keeps live ones", () => {
-    const path = tmpFile();
-    const s1 = new FileDeadNonceStore(path, 1000n);
+  it("the store forgets dead nonces only once their expiry has passed", () => {
+    const s1 = new SqliteStore(tmpFile());
     s1.add(alice.address, 1n, 1500n);
     s1.add(alice.address, 2n, 5000n);
     s1.add(bob.address, 1n, 5000n);
+    s1.prune(2000n);
+    expect(s1.has(alice.address, 1n)).toBe(false); // expired: the order is dead on-chain anyway
+    expect(s1.has(alice.address, 2n)).toBe(true);
+    expect(s1.has(bob.address, 1n)).toBe(true);
+    expect(s1.has(bob.address, 2n)).toBe(false);
+    s1.prune(5000n);
+    expect(s1.has(bob.address, 1n)).toBe(false);
     s1.close();
-    appendFileSync(path, '{"t":"0xabc","n":"9"'); // crash in the middle of a write
-    const s2 = new FileDeadNonceStore(path, 2000n);
-    expect(s2.has(alice.address, 1n)).toBe(false); // expired: the order is dead on-chain anyway
-    expect(s2.has(alice.address, 2n)).toBe(true);
-    expect(s2.has(bob.address, 1n)).toBe(true);
-    expect(s2.has(bob.address, 2n)).toBe(false);
-    expect(readFileSync(path, "utf8").trim().split("\n")).toHaveLength(2); // compacted
-    s2.prune(5000n);
-    expect(s2.size).toBe(0);
-    s2.close();
   });
 
   it("a cancel that cannot be made durable is not acknowledged and changes nothing", async () => {

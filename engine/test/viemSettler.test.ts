@@ -4,6 +4,7 @@ import { exchangeAbi } from "../src/abi.ts";
 import { hashOrder } from "../src/signing.ts";
 import { BatchRevertedError, type Batch } from "../src/settlement/types.ts";
 import { parseSettlementLogs, ViemSettler, type RpcLog, type RpcReceipt, type SettlerRpc } from "../src/settlement/viemSettler.ts";
+import type { KeyValueStore } from "../src/store/types.ts";
 import type { Address, Hex, Logger, Match } from "../src/types.ts";
 import { alice, bob, carol, DOMAIN, makeOrder, MARKET, signOrder, wad } from "./helpers.ts";
 
@@ -46,6 +47,9 @@ function failLog(index: number, m: Match, reason: Hex): RpcLog {
   };
 }
 
+/** A receipt as tests write it; FakeRpc.mine assigns the block. */
+type TestReceipt = Pick<RpcReceipt, "status" | "logs">;
+
 /** Minimal chain: one account, a mempool, and receipts the test decides on. */
 class FakeRpc implements SettlerRpc {
   minedNonce = 7;
@@ -53,11 +57,15 @@ class FakeRpc implements SettlerRpc {
   pendingNonce: number | null = null;
   sent: Hex[] = [];
   receipts = new Map<Hex, RpcReceipt>();
+  head = 100n;
+  async blockNumber() {
+    return this.head;
+  }
   fees = { maxFeePerGas: 100n, maxPriorityFeePerGas: 10n };
   gasEstimate = 200_000n;
   estimateError: Error | null = null;
   /** Called on every broadcast; may throw, and may mine by returning a receipt. */
-  onSend: (raw: Hex, hash: Hex, count: number) => RpcReceipt | null = () => null;
+  onSend: (raw: Hex, hash: Hex, count: number) => TestReceipt | null = () => null;
 
   async getNonce(_a: Address, tag: "pending" | "latest") {
     return tag === "latest" ? this.minedNonce : (this.pendingNonce ?? this.minedNonce);
@@ -84,17 +92,44 @@ class FakeRpc implements SettlerRpc {
   async filledSize(hash: Hex) {
     return this.filled.get(hash) ?? 0n;
   }
-  mine(hash: Hex, receipt: RpcReceipt) {
-    this.receipts.set(hash, receipt);
+  mine(hash: Hex, receipt: TestReceipt) {
+    this.head++;
+    this.receipts.set(hash, this.inBlock(receipt));
     this.minedNonce++;
+  }
+  inBlock(receipt: TestReceipt, block = this.head): RpcReceipt {
+    return { ...receipt, blockNumber: block, blockHash: `0x${block.toString(16).padStart(64, "0")}` };
   }
   nonces() {
     return this.sent.map((raw) => parseTransaction(raw).nonce);
   }
 }
 
-function setup(opts: { maxRounds?: number; logger?: Logger; bumpAfterRounds?: number; maxFeePerGasCap?: bigint } = {}) {
-  const rpc = new FakeRpc();
+interface SetupOptions {
+  maxRounds?: number;
+  logger?: Logger;
+  bumpAfterRounds?: number;
+  maxFeePerGasCap?: bigint;
+  confirmations?: number;
+  store?: KeyValueStore;
+  rpc?: FakeRpc;
+}
+
+/** In-memory KeyValueStore standing for the engine's durable store. */
+class MemoryKv implements KeyValueStore {
+  data = new Map<string, string>();
+  writes = 0;
+  getMeta(k: string) {
+    return this.data.get(k);
+  }
+  setMeta(k: string, v: string) {
+    this.writes++;
+    this.data.set(k, v);
+  }
+}
+
+function setup(opts: SetupOptions = {}) {
+  const rpc = opts.rpc ?? new FakeRpc();
   const settler = new ViemSettler({
     rpc,
     account: operator,
@@ -107,11 +142,14 @@ function setup(opts: { maxRounds?: number; logger?: Logger; bumpAfterRounds?: nu
     bumpAfterRounds: opts.bumpAfterRounds,
     maxFeePerGasCap: opts.maxFeePerGasCap,
     releasePolls: 3,
+    confirmations: opts.confirmations,
+    confirmationTimeoutMs: 200,
+    store: opts.store,
   });
   return { rpc, settler };
 }
 
-const ok = (matches: Match[]): RpcReceipt => ({ status: "success", logs: matches.map((m) => fillLog(m)) });
+const ok = (matches: Match[]): TestReceipt => ({ status: "success", logs: matches.map((m) => fillLog(m)) });
 
 describe("ViemSettler", () => {
   it("sends settleMatches with the batch, and maps Fill / MatchFailed logs to per-match results", async () => {
@@ -268,14 +306,14 @@ describe("ViemSettler", () => {
   it("S2: nonce gone and receipt not served, but the orders were filled on-chain => the batch is NOT released", async () => {
     const { rpc, settler } = setup({ maxRounds: 1 });
     const matches = [await makeMatch("m1")];
-    let hidden: { hash: Hex; receipt: RpcReceipt } | null = null;
+    let hidden: { hash: Hex; receipt: RpcReceipt } | null = null as { hash: Hex; receipt: RpcReceipt } | null;
     rpc.onSend = (_raw, hash, n) => {
       if (n === 1) {
         // Mined: the nonce advances and filledSize moves, but this backend does not serve the receipt yet.
         rpc.minedNonce++;
         rpc.filled.set(matches[0]!.makerHash, matches[0]!.fillSize);
         rpc.filled.set(matches[0]!.takerHash, matches[0]!.fillSize);
-        hidden = { hash, receipt: ok(matches) };
+        hidden = { hash, receipt: rpc.inBlock(ok(matches)) };
         return null;
       }
       throw new Error("nonce too low");
@@ -297,7 +335,7 @@ describe("ViemSettler", () => {
     const matches = [await makeMatch("m1")];
     rpc.onSend = (_raw, hash) => {
       rpc.minedNonce++;
-      setTimeout(() => rpc.receipts.set(hash, ok(matches)), 16); // just after the normal wait ends
+      setTimeout(() => rpc.receipts.set(hash, rpc.inBlock(ok(matches))), 16); // just after the normal wait ends
       return null;
     };
     expect((await settler.settle({ id: "b1", matches })).map((r) => r.status)).toEqual(["settled"]);
@@ -310,6 +348,135 @@ describe("ViemSettler", () => {
     const first = settler.settle(batch);
     await expect(settler.settle(batch)).rejects.toThrow(/concurrently/);
     await first;
+  });
+});
+
+describe("ViemSettler: confirmations", () => {
+  it("reports the outcome only once the transaction is N blocks deep", async () => {
+    const { rpc, settler } = setup({ confirmations: 3 });
+    const matches = [await makeMatch("m1")];
+    rpc.onSend = () => ok(matches); // mined in block 101
+    let done = false;
+    const p = settler.settle({ id: "b1", matches }).then((r) => ((done = true), r));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(done).toBe(false); // 1 confirmation
+    rpc.head = 102n;
+    await new Promise((r) => setTimeout(r, 20));
+    expect(done).toBe(false); // 2 confirmations
+    rpc.head = 103n;
+    expect((await p).map((r) => r.status)).toEqual(["settled"]);
+    expect(rpc.sent).toHaveLength(1);
+  });
+
+  it("a transaction reorged out before it is confirmed is looked for again and its final receipt is used", async () => {
+    const { rpc, settler } = setup({ confirmations: 2, maxRounds: 3 });
+    const good = await makeMatch("m1");
+    const matches = [good];
+    let txHash!: Hex;
+    rpc.onSend = (_raw, hash, n) => {
+      txHash = hash;
+      // first inclusion: the match settles; that block is then reorged away
+      return n === 1 ? ok(matches) : null;
+    };
+    const p = settler.settle({ id: "b1", matches });
+    await new Promise((r) => setTimeout(r, 10));
+    rpc.receipts.delete(txHash); // reorg: the transaction is back in the mempool
+    rpc.minedNonce--;
+    rpc.head = 102n;
+    await new Promise((r) => setTimeout(r, 30));
+    // re-mined in the new chain, where the match fails
+    rpc.head = 105n;
+    rpc.minedNonce++;
+    rpc.receipts.set(txHash, rpc.inBlock({ status: "success", logs: [failLog(0, good, "0x1234")] }, 104n));
+    const res = await p;
+    expect(res).toEqual([{ status: "failed", txHash, reason: "0x1234" }]);
+    expect(new Set(rpc.nonces())).toEqual(new Set([7]));
+  });
+});
+
+describe("ViemSettler: restart", () => {
+  it("crash between broadcast and receipt: the new process finds the transaction it already sent and signs nothing", async () => {
+    const store = new MemoryKv();
+    const first = setup({ store, maxRounds: 1 });
+    const batch: Batch = { id: "b1", matches: [await makeMatch("m1")] };
+    let sentHash!: Hex;
+    first.rpc.onSend = (_raw, hash) => {
+      sentHash = hash;
+      return null; // in the mempool, not mined yet
+    };
+    await expect(first.settler.settle(batch)).rejects.toThrow(/not mined/); // ... and the process dies here
+    expect(store.data.get("settler.inflight")).toContain(sentHash);
+
+    // it is mined while the engine is down
+    first.rpc.mine(sentHash, ok(batch.matches));
+    const second = setup({ store, rpc: first.rpc });
+    first.rpc.onSend = () => {
+      throw new Error("nonce too low");
+    };
+    const res = await second.settler.settle(batch);
+    expect(res).toEqual([{ status: "settled", txHash: sentHash }]);
+    expect(new Set(first.rpc.sent).size).toBe(1); // only ever one signed transaction
+  });
+
+  it("crash after signing but before the broadcast got out: the identical transaction is sent, under the same nonce", async () => {
+    const store = new MemoryKv();
+    const first = setup({ store, maxRounds: 1 });
+    const batch: Batch = { id: "b1", matches: [await makeMatch("m1")] };
+    first.rpc.onSend = () => {
+      throw new Error("ECONNRESET"); // never reached the node
+    };
+    await expect(first.settler.settle(batch)).rejects.toThrow();
+    const lostRaw = first.rpc.sent[0]!;
+
+    const rpc2 = new FakeRpc(); // a chain that has never seen the transaction
+    rpc2.pendingNonce = 7;
+    const second = setup({ store, rpc: rpc2 });
+    rpc2.onSend = () => ok(batch.matches);
+    expect((await second.settler.settle(batch)).map((r) => r.status)).toEqual(["settled"]);
+    expect(rpc2.sent).toEqual([lostRaw]);
+  });
+
+  it("the record is written before every broadcast", async () => {
+    const store = new MemoryKv();
+    const { rpc, settler } = setup({ store });
+    const batch: Batch = { id: "b1", matches: [await makeMatch("m1")] };
+    rpc.onSend = (_raw, hash) => {
+      expect(store.data.get("settler.inflight")).toContain(hash); // already durable when the node sees it
+      return ok(batch.matches);
+    };
+    await settler.settle(batch);
+    expect(rpc.sent).toHaveLength(1);
+  });
+
+  it("crash after the outcome was known but before the caller recorded it: same results from the same receipt, nothing re-sent", async () => {
+    const store = new MemoryKv();
+    const first = setup({ store });
+    const m1 = await makeMatch("m1");
+    const m2 = await makeMatch("m2");
+    const batch: Batch = { id: "b1", matches: [m1, m2] };
+    first.rpc.onSend = () => ({ status: "success", logs: [fillLog(m1), failLog(1, m2, "0xbeef")] });
+    const before = await first.settler.settle(batch);
+
+    const second = setup({ store, rpc: first.rpc });
+    first.rpc.onSend = () => {
+      throw new Error("must not broadcast");
+    };
+    expect(await second.settler.settle(batch)).toEqual(before);
+    expect(first.rpc.sent).toHaveLength(1);
+    // the next batch then gets the next nonce
+    const next: Batch = { id: "b2", matches: [await makeMatch("m3")] };
+    first.rpc.onSend = () => ok(next.matches);
+    first.rpc.pendingNonce = 7; // stale node
+    await second.settler.settle(next);
+    expect(first.rpc.nonces()).toEqual([7, 8]);
+  });
+
+  it("refuses to continue if the recorded batch is not the one it is asked to settle", async () => {
+    const store = new MemoryKv();
+    const first = setup({ store, maxRounds: 1 });
+    await first.settler.settle({ id: "b1", matches: [await makeMatch("m1")] }).catch(() => {});
+    const second = setup({ store, rpc: first.rpc });
+    await expect(second.settler.settle({ id: "b1", matches: [await makeMatch("other")] })).rejects.toThrow(/does not match/);
   });
 });
 

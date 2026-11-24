@@ -71,9 +71,11 @@ export class FakeChain implements ChainReader {
   private check() {
     if (this.fail) throw new Error("rpc down");
   }
+  /** trader -> minValidNonce set by cancelAllOrders. */
+  minValid = new Map<string, bigint>();
   async isCancelled(trader: Address, n: bigint) {
     this.check();
-    return this.cancelled.has(`${trader.toLowerCase()}:${n}`);
+    return this.cancelled.has(`${trader.toLowerCase()}:${n}`) || n < (this.minValid.get(trader.toLowerCase()) ?? 0n);
   }
   async filledSize(hash: Hex) {
     this.check();
