@@ -8,6 +8,8 @@ const labelStr = (l: Labels) => {
   return `{${keys.map((k) => `${k}="${String(l[k]).replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n")}"`).join(",")}}`;
 };
 
+export type GaugeValue = number | null | { labels: Labels; value: number }[];
+
 interface Counter {
   help: string;
   values: Map<string, number>;
@@ -23,7 +25,7 @@ interface Histogram {
 
 export class Metrics {
   private readonly counters = new Map<string, Counter>();
-  private readonly gauges = new Map<string, { help: string; read: () => number | null }>();
+  private readonly gauges = new Map<string, { help: string; read: () => GaugeValue }>();
   private readonly histograms = new Map<string, Histogram>();
 
   constructor(private readonly prefix = "baldwin_") {}
@@ -47,8 +49,11 @@ export class Metrics {
     return total;
   }
 
-  /** A gauge read at scrape time; return null to omit it. */
-  gauge(name: string, help: string, read: () => number | null): void {
+  /**
+   * A gauge read at scrape time. Return a number, null to omit it, or a list of
+   * labelled samples.
+   */
+  gauge(name: string, help: string, read: () => GaugeValue): void {
     this.gauges.set(name, { help, read });
   }
 
@@ -75,15 +80,17 @@ export class Metrics {
       for (const [labels, v] of c.values) out.push(`${n}${labels} ${v}`);
     }
     for (const [name, g] of this.gauges) {
-      let v: number | null = null;
+      let v: GaugeValue = null;
       try {
         v = g.read();
       } catch {
         v = null;
       }
-      if (v === null || !Number.isFinite(v)) continue;
+      const samples = (Array.isArray(v) ? v : v === null ? [] : [{ labels: {}, value: v }]).filter((x) => Number.isFinite(x.value));
+      if (samples.length === 0) continue;
       const n = this.prefix + name;
-      out.push(`# HELP ${n} ${g.help}`, `# TYPE ${n} gauge`, `${n} ${v}`);
+      out.push(`# HELP ${n} ${g.help}`, `# TYPE ${n} gauge`);
+      for (const x of samples) out.push(`${n}${labelStr(x.labels)} ${x.value}`);
     }
     for (const [name, h] of this.histograms) {
       const n = this.prefix + name;

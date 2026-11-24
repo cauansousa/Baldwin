@@ -119,6 +119,33 @@ export class FakeChain implements ChainReader {
     this.check();
     return { ...this.market, marketId };
   }
+  twap = wad(100);
+  fundingRate = 0n;
+  lastFunding = 900n;
+  insurance = 0n;
+  badDebt = 0n;
+  /** Names of the stats views that revert. */
+  failing = new Set<string>();
+  private stat<T>(name: string, v: T): T {
+    this.check();
+    if (this.failing.has(name)) throw new Error(`${name} reverted`);
+    return v;
+  }
+  async markTwap() {
+    return this.stat("markTwap", this.twap);
+  }
+  async currentFundingRate() {
+    return this.stat("currentFundingRate", this.fundingRate);
+  }
+  async lastFundingTime() {
+    return this.stat("lastFundingTime", this.lastFunding);
+  }
+  async insuranceFund() {
+    return this.stat("insuranceFund", this.insurance);
+  }
+  async totalBadDebt() {
+    return this.stat("totalBadDebt", this.badDebt);
+  }
 }
 
 export interface Harness {

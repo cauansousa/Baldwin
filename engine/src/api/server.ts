@@ -90,8 +90,12 @@ export async function buildServer(engine: Engine, opts: ServerOptions = {}): Pro
     const chain = engine.chainStatus();
     if (chain?.paused) warnings.push("exchange is paused");
     for (const m of chain?.markets ?? []) if (m.indexPrice === null && !settlement.recovering) warnings.push(`no index price for market ${m.marketId}: market halted`);
+    const { insuranceFund, totalBadDebt } = engine.exchangeStats();
+    if (totalBadDebt !== null && totalBadDebt > 0n) {
+      warnings.push(`the exchange has recorded bad debt of ${totalBadDebt} USDC units; depositInsurance repays it`);
+    }
     const ok = !settlement.stalled && !settlement.recovering && !settlement.storeBroken;
-    return { ok, recovering: settlement.recovering, ...info, warnings, settlement, chain };
+    return { ok, recovering: settlement.recovering, ...info, insuranceFund, totalBadDebt, warnings, settlement, chain };
   });
 
   // Prometheus text exposition format.

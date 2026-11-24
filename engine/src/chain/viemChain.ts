@@ -42,6 +42,21 @@ export class ViemChainReader implements ChainReader {
     const [longs, shorts] = await this.client.readContract({ address: this.exchange, abi: exchangeAbi, functionName: "openInterest", args: [marketId] });
     return { longs, shorts };
   }
+  markTwap(marketId: number): Promise<bigint> {
+    return this.client.readContract({ address: this.exchange, abi: exchangeAbi, functionName: "markTwap", args: [marketId] });
+  }
+  currentFundingRate(marketId: number): Promise<bigint> {
+    return this.client.readContract({ address: this.exchange, abi: exchangeAbi, functionName: "currentFundingRate", args: [marketId] });
+  }
+  lastFundingTime(marketId: number): Promise<bigint> {
+    return this.client.readContract({ address: this.exchange, abi: exchangeAbi, functionName: "lastFundingTime", args: [marketId] });
+  }
+  insuranceFund(): Promise<bigint> {
+    return this.client.readContract({ address: this.exchange, abi: exchangeAbi, functionName: "insuranceFund" });
+  }
+  totalBadDebt(): Promise<bigint> {
+    return this.client.readContract({ address: this.exchange, abi: exchangeAbi, functionName: "totalBadDebt" });
+  }
   async marketCount(): Promise<number> {
     return this.client.readContract({ address: this.exchange, abi: exchangeAbi, functionName: "marketCount" });
   }

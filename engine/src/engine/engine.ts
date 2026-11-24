@@ -197,6 +197,10 @@ export interface EngineOptions {
   maxChainStateAgeMs?: number;
   /** Market parameters are re-read at most this often. Default 30000. */
   marketRefreshMs?: number;
+  /** Funding, open-interest, insurance and bad-debt figures are re-read at most this often. Default 10000. */
+  statsRefreshMs?: number;
+  /** The contract's funding interval, for `nextFundingTime`. Default 3600. */
+  fundingIntervalSec?: number;
   /** Max matches per settleMatches transaction. Default 20. */
   maxBatchSize?: number;
   /** Delay before re-trying a batch whose outcome is unknown or that reverted. Default 2000. */
@@ -240,7 +244,28 @@ interface MarketState {
   index: bigint | null;
   /** Band from the last successful read; kept while the index is unavailable. */
   band: Band | undefined;
+  /** Funding and open-interest figures; each null when its view could not be read. */
+  stats: MarketStats;
 }
+
+/** Per-market figures read from the contract for clients (not used for matching). */
+export interface MarketStats {
+  /** Time-weighted average fill price of the current funding period (WAD). */
+  markTwap: bigint | null;
+  /** WAD per hour; positive = longs pay shorts. */
+  currentFundingRate: bigint | null;
+  /** Unix seconds. */
+  lastFundingTime: bigint | null;
+  /** lastFundingTime + the funding interval. */
+  nextFundingTime: bigint | null;
+  openInterestLong: bigint | null;
+  openInterestShort: bigint | null;
+}
+
+const NO_STATS: MarketStats = { markTwap: null, currentFundingRate: null, lastFundingTime: null, nextFundingTime: null, openInterestLong: null, openInterestShort: null };
+
+/** What GET /markets returns per market. */
+export type MarketView = MarketConfig & MarketStats & { indexPrice: bigint | null; lastPrice: bigint | null; bestBid: bigint | null; bestAsk: bigint | null };
 
 const CANCEL_TEXT: Record<CancelReason, string> = {
   ioc: "IOC remainder cancelled",
@@ -317,6 +342,11 @@ export class Engine extends EventEmitter<EngineEvents> {
   private bandBps: bigint | null = null;
   private chainStateAt = 0;
   private marketsAt = 0;
+  private statsAt = 0;
+  private readonly statsRefreshMs: number;
+  private readonly fundingInterval: bigint;
+  private insuranceFund: bigint | null = null;
+  private totalBadDebt: bigint | null = null;
   private refreshing: Promise<void> | null = null;
   private refreshTimer: NodeJS.Timeout | null = null;
   private readonly trades = new Map<number, Trade[]>();
@@ -392,6 +422,10 @@ export class Engine extends EventEmitter<EngineEvents> {
     this.faultWindowSec = opts.faultWindowSec ?? 600;
     this.maxChainStateAgeMs = opts.maxChainStateAgeMs ?? 30_000;
     this.marketRefreshMs = opts.marketRefreshMs ?? 30_000;
+    this.statsRefreshMs = opts.statsRefreshMs ?? 10_000;
+    this.fundingInterval = BigInt(opts.fundingIntervalSec ?? 3600);
+    this.metrics.gauge("insurance_fund_usdc", "Insurance fund of the exchange, USDC", () => (this.insuranceFund === null ? null : Number(this.insuranceFund) / 1e6));
+    this.metrics.gauge("total_bad_debt_usdc", "Bad debt recorded by the exchange, USDC", () => (this.totalBadDebt === null ? null : Number(this.totalBadDebt) / 1e6));
     this.maxBatchSize = opts.maxBatchSize ?? 20;
     this.retryDelayMs = opts.retryDelayMs ?? 2000;
     this.maxBatchReverts = opts.maxBatchReverts ?? 3;
@@ -401,7 +435,7 @@ export class Engine extends EventEmitter<EngineEvents> {
       this.markets.set(m.marketId, m);
       this.books.set(m.marketId, new OrderBook(m.minOrderSize));
       this.trades.set(m.marketId, []);
-      this.marketState.set(m.marketId, { index: null, band: undefined });
+      this.marketState.set(m.marketId, { index: null, band: undefined, stats: { ...NO_STATS } });
     }
     this.marketsAt = Date.now();
     if (this.store) this.loadFromStore(this.store);
@@ -703,6 +737,10 @@ export class Engine extends EventEmitter<EngineEvents> {
         }
       }
       this.chainStateAt = Date.now();
+      if (Date.now() - this.statsAt >= this.statsRefreshMs) {
+        await this.refreshStats(chain);
+        this.statsAt = Date.now();
+      }
     } catch (e) {
       for (const st of this.marketState.values()) st.index = null;
       this.log.warn("chain state refresh failed; markets halted", { error: errMessage(e) });
@@ -719,6 +757,36 @@ export class Engine extends EventEmitter<EngineEvents> {
     } catch (e) {
       this.log.error("error while enforcing price bands", { error: errMessage(e) });
     }
+  }
+
+  /**
+   * Figures for clients. Every view is read on its own: one that reverts (stale oracle,
+   * sequencer down) leaves its field null and does not disturb the others or matching.
+   */
+  private async refreshStats(chain: ChainReader): Promise<void> {
+    const read = <T>(p: Promise<T>): Promise<T | null> => p.catch(() => null);
+    [this.insuranceFund, this.totalBadDebt] = await Promise.all([read(chain.insuranceFund()), read(chain.totalBadDebt())]);
+    for (const [marketId, st] of this.marketState) {
+      const [markTwap, currentFundingRate, lastFundingTime, oi] = await Promise.all([
+        read(chain.markTwap(marketId)),
+        read(chain.currentFundingRate(marketId)),
+        read(chain.lastFundingTime(marketId)),
+        read(chain.openInterest(marketId)),
+      ]);
+      st.stats = {
+        markTwap,
+        currentFundingRate,
+        lastFundingTime,
+        nextFundingTime: lastFundingTime === null ? null : lastFundingTime + this.fundingInterval,
+        openInterestLong: oi?.longs ?? null,
+        openInterestShort: oi?.shorts ?? null,
+      };
+    }
+  }
+
+  /** Exchange-wide figures (USDC units); null when unknown. */
+  exchangeStats(): { insuranceFund: bigint | null; totalBadDebt: bigint | null } {
+    return { insuranceFund: this.insuranceFund, totalBadDebt: this.totalBadDebt };
   }
 
   private async ensureChainState(): Promise<void> {
@@ -742,11 +810,14 @@ export class Engine extends EventEmitter<EngineEvents> {
 
   // -------------------------------------------------------------------- queries
 
-  getMarkets(): (MarketConfig & { lastPrice: bigint | null; bestBid: bigint | null; bestAsk: bigint | null })[] {
+  getMarkets(): MarketView[] {
     return [...this.markets.values()].map((m) => {
       const book = this.books.get(m.marketId)!;
+      const st = this.marketState.get(m.marketId)!;
       return {
         ...m,
+        indexPrice: st.index,
+        ...st.stats,
         lastPrice: this.lastPrice.get(m.marketId) ?? null,
         bestBid: book.bestBid()?.price ?? null,
         bestAsk: book.bestAsk()?.price ?? null,

@@ -1,0 +1,75 @@
+# Baldwin engine + keeper for a public testnet (Arbitrum Sepolia).
+#
+#   cp .env.testnet.example .env.testnet      # fill in keys, RPC_URL, CORS_ORIGIN
+#   docker compose -f docker-compose.testnet.yml up -d --build
+#
+# Run from engine/. NOTE: written without a Docker daemon at hand; see the README ("Docker").
+#
+# Both services read .env.testnet; each gets the other's private key blanked out so
+# that a process only ever holds its own key.
+
+x-common: &common
+  image: baldwin-engine:latest
+  build:
+    context: ..
+    dockerfile: engine/Dockerfile
+  env_file: .env.testnet
+  restart: unless-stopped
+  init: true
+  # longer than SHUTDOWN_TIMEOUT_MS (30 s): the engine waits for the batch in flight
+  stop_grace_period: 45s
+  logging:
+    driver: json-file
+    options: { max-size: "50m", max-file: "5" }
+
+services:
+  engine:
+    <<: *common
+    environment:
+      KEEPER_PRIVATE_KEY: ""
+      DEPLOYMENT_PATH: /deployments/arbitrumSepolia.json
+      STORE_PATH: /data/engine.sqlite
+      HOST: 0.0.0.0
+      PORT: "8080"
+    volumes:
+      - engine-data:/data
+      - ../contracts/deployments:/deployments:ro
+    ports:
+      # bind to localhost; put a TLS reverse proxy in front (it must pass WebSocket upgrades on /ws)
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      # healthy = the HTTP server answers; /health itself says whether the engine is ok
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 150s # RECOVERY_TIMEOUT_MS + margin
+
+  keeper:
+    <<: *common
+    command: ["src/keeper/main.ts"]
+    environment:
+      OPERATOR_PRIVATE_KEY: ""
+      DEPLOYMENT_PATH: /deployments/arbitrumSepolia.json
+      KEEPER_STATE_PATH: /data/keeper-state.json
+      ENGINE_URL: http://engine:8080
+      KEEPER_PORT: "9100"
+      KEEPER_HOST: 0.0.0.0
+    volumes:
+      - keeper-data:/data
+      - ../contracts/deployments:/deployments:ro
+    ports:
+      - "127.0.0.1:9100:9100"
+    depends_on:
+      engine:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:9100/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 4
+      start_period: 30s
+
+volumes:
+  engine-data:
+  keeper-data:

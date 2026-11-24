@@ -97,6 +97,7 @@ async function main(): Promise<void> {
     intakeTimeoutMs: cfg.intakeTimeoutMs,
     traderOrdersPerMinute: cfg.traderOrdersPerMinute,
     preTradeCacheMs: cfg.preTradeCacheMs,
+    fundingIntervalSec: cfg.fundingIntervalSec,
     logger: log,
   });
   const watcher = cancelWatcher({

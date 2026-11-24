@@ -131,6 +131,8 @@ function optionalBlock(env: Env, name: string): bigint | undefined {
 }
 
 export interface EngineConfig extends CommonConfig {
+  /** The contract's funding interval (for nextFundingTime). */
+  fundingIntervalSec: number;
   operatorKey: Hex;
   port: number;
   host: string;
@@ -178,6 +180,7 @@ export function loadEngineConfig(env: Env = process.env): EngineConfig {
   const base = common(env);
   return {
     ...base,
+    fundingIntervalSec: int(env, "FUNDING_INTERVAL_SEC", 3600, 1),
     operatorKey: privateKey(env, "OPERATOR_PRIVATE_KEY"),
     port: int(env, "PORT", 8080, 1),
     host: env.HOST || "127.0.0.1",
@@ -224,6 +227,22 @@ export interface KeeperConfig extends CommonConfig {
   minFreeCollateral: bigint;
   /** JSON file with the keeper's event cursor and tracked accounts. */
   statePath: string;
+  /** Close positions taken over in liquidations through the engine. */
+  unwind: boolean;
+  /** The engine's REST API, for the unwinder. */
+  engineUrl: string;
+  unwindOffsetBps: bigint;
+  unwindRepriceBps: bigint;
+  unwindExpirySec: number;
+  /** Port of the keeper's own /health and /metrics; 0 = off. */
+  port: number;
+  host: string;
+}
+
+function engineUrl(env: Env): string {
+  const url = env.ENGINE_URL || "http://127.0.0.1:8080";
+  if (!/^https?:\/\//.test(url)) throw new Error("ENGINE_URL must be an http(s) URL");
+  return url;
 }
 
 /** Chain ids of local development nodes (hardhat / anvil / ganache). */
@@ -247,5 +266,12 @@ export function loadKeeperConfig(env: Env = process.env): KeeperConfig {
     startBlock: BigInt(int(env, "KEEPER_START_BLOCK", deploymentBlock ?? 0)),
     minFreeCollateral: bigintEnv(env, "KEEPER_MIN_FREE_COLLATERAL", 1n),
     statePath: resolve(ENGINE_DIR, env.KEEPER_STATE_PATH || "data/keeper-state.json"),
+    unwind: bool(env, "KEEPER_UNWIND", true),
+    engineUrl: engineUrl(env),
+    unwindOffsetBps: BigInt(int(env, "KEEPER_UNWIND_OFFSET_BPS", 10, 0)),
+    unwindRepriceBps: BigInt(int(env, "KEEPER_UNWIND_REPRICE_BPS", 20, 1)),
+    unwindExpirySec: int(env, "KEEPER_UNWIND_EXPIRY_SEC", 300, 150),
+    port: int(env, "KEEPER_PORT", 0, 0),
+    host: env.KEEPER_HOST || "127.0.0.1",
   };
 }

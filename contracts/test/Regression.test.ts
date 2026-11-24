@@ -199,6 +199,38 @@ describe("Review regressions", () => {
       expect(await exchange.accountValue(alice.address)).to.equal(before);
     });
 
+    it("an in-band minimum-size fill just before every accrual cannot steer funding (TWAP)", async () => {
+      const { exchange, oracle, ctx, alice, bob, carol, dave } = await loadFixture(deployFixture);
+      for (const x of [alice, bob, carol, dave]) await exchange.connect(x).deposit(usdc(20_000));
+      await ctx.settleOk([await ctx.trade(alice, bob, ONE, BTC_PRICE)]); // alice long 1 BTC (the victim)
+      let last = Number(await exchange.lastFundingTime(BTC));
+      // let the opening fill's period pass
+      await time.setNextBlockTimestamp(last + HOUR - 1);
+      await oracle.setPrice(BTC, BTC_PRICE);
+      await time.setNextBlockTimestamp(last + HOUR);
+      await exchange.updateFunding(BTC);
+      last += HOUR;
+
+      const before = await exchange.accountValue(alice.address);
+      // For 24 hours the attacker prints the top of the band one second before each accrual.
+      for (let i = 0; i < 24; i++) {
+        await time.setNextBlockTimestamp(last + HOUR - 2);
+        await oracle.setPrice(BTC, BTC_PRICE);
+        const m = await ctx.trade(carol, dave, wad("0.001"), wad(52_500));
+        await time.setNextBlockTimestamp(last + HOUR - 1);
+        await ctx.settleOk([m]);
+        expect(await exchange.markPrice(BTC)).to.equal(wad(52_500));
+        await time.setNextBlockTimestamp(last + HOUR);
+        await exchange.updateFunding(BTC);
+        last += HOUR;
+      }
+      const lost = before - (await exchange.accountValue(alice.address));
+      // 24 x (5% x 1/3600 of 50,000) = 16.67 USDC. With the last fill as the mark the same
+      // fills cost her the capped rate all day: 24 x 50 = 1,200 USDC.
+      expect(lost).to.be.gt(usdc(16));
+      expect(lost).to.be.lt(usdc(17));
+    });
+
     it("small fills are only for completing an order or closing a position", async () => {
       const { exchange, ctx, alice, bob, carol } = await loadFixture(deployFixture);
       for (const x of [alice, bob, carol]) await exchange.connect(x).deposit(usdc(50_000));

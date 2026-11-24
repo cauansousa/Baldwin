@@ -28,13 +28,14 @@ const STEPS = 300;
 
 describe("Solvency invariant (randomized)", function () {
   this.timeout(600_000);
-  const totals = { liquidations: 0, edgeReductions: 0, badDebt: 0n, insurance: 0n };
+  const totals = { badDebtRepayments: 0, liquidations: 0, edgeReductions: 0, badDebt: 0n, insurance: 0n };
 
   after(() => {
     // Across the seeds the runs must have covered liquidations with a penalty and bad debt.
     expect(totals.liquidations, "liquidations").to.be.gt(5);
     expect(totals.edgeReductions, "reducing fills at the band edge").to.be.gt(20);
     expect(totals.badDebt > 0n, "bad debt occurred").to.equal(true);
+    expect(totals.badDebtRepayments, "bad debt repayments").to.be.gt(0);
     expect(totals.insurance > 0n, "penalties reached the insurance fund").to.equal(true);
   });
 
@@ -47,9 +48,10 @@ describe("Solvency invariant (randomized)", function () {
       const accounts = [...traders, liquidator, feeRecipient];
       const exchangeAddress = await exchange.getAddress();
       const prices: Record<number, bigint> = { [BTC]: wad(50_000), [ETH]: wad(2_000) };
-      const stats = { fills: 0, failedFills: 0, edgeReductions: 0, liquidations: 0, withdrawals: 0, refusedWithdrawals: 0, fundings: 0 };
+      const stats = { insuranceDeposits: 0, fills: 0, failedFills: 0, edgeReductions: 0, liquidations: 0, withdrawals: 0, refusedWithdrawals: 0, fundings: 0 };
 
       const failureReasons: Record<string, number> = {};
+      let maxBadDebt = 0n; // bad debt can be repaid again, so remember the peak
 
       const refreshPrices = async () => {
         for (const m of MARKETS) await oracle.setPrice(m, prices[m]);
@@ -180,7 +182,7 @@ describe("Solvency invariant (randomized)", function () {
         } else if (roll < 0.88) {
           label = "liquidations";
           await liquidateAll();
-        } else if (roll < 0.95) {
+        } else if (roll < 0.93) {
           // ---- withdraw: sometimes exactly the maximum, sometimes too much
           label = "withdraw";
           const t = r.pick(traders);
@@ -193,12 +195,26 @@ describe("Solvency invariant (randomized)", function () {
             await exchange.connect(t).withdraw(r.next() < 0.5 ? free : r.big(free) + 1n);
             stats.withdrawals++;
           }
+        } else if (roll < 0.965) {
+          // ---- somebody tops up the insurance fund (repays recorded bad debt first)
+          label = "insurance deposit";
+          const debt = await exchange.totalBadDebt();
+          const amount = r.next() < 0.5 && debt > 0n ? r.big(debt) + 1n : usdc(r.int(1, 200));
+          const fundBefore = await exchange.insuranceFund();
+          await exchange.connect(r.pick([liquidator, ...traders])).depositInsurance(amount);
+          const repaid = amount < debt ? amount : debt;
+          expect(await exchange.totalBadDebt()).to.equal(debt - repaid);
+          expect(await exchange.insuranceFund()).to.equal(fundBefore + amount - repaid);
+          stats.insuranceDeposits++;
+          if (repaid > 0n) totals.badDebtRepayments++;
         } else {
           label = "deposit";
           await exchange.connect(r.pick(traders)).deposit(usdc(r.int(100, 20_000)));
         }
 
         await checkInvariant(`step ${step} (${label})`);
+        const debtNow = await exchange.totalBadDebt();
+        if (debtNow > maxBadDebt) maxBadDebt = debtNow;
       }
 
       totals.liquidations += stats.liquidations;
@@ -207,7 +223,8 @@ describe("Solvency invariant (randomized)", function () {
       for (const reason of Object.keys(failureReasons)) {
         expect(["InsufficientMargin", "NegativeAccountValue", "FillTooSmall", "OpenInterestCapExceeded"], `unexpected failure ${reason}`).to.include(reason);
       }
-      totals.badDebt += await exchange.totalBadDebt();
+      totals.badDebt += maxBadDebt;
+      expect(stats.insuranceDeposits, "insurance deposits").to.be.gt(0);
       totals.insurance += await exchange.insuranceFund();
       if (process.env.INVARIANT_DEBUG) console.log(seed, stats, failureReasons, "badDebt", await exchange.totalBadDebt(), "insurance", await exchange.insuranceFund());
       // The run must actually have exercised the system.
@@ -249,6 +266,14 @@ describe("Solvency invariant (randomized)", function () {
         const balance = await exchange.balanceOf(a.address);
         expect(balance, "no negative balance without positions").to.be.gte(0);
         balances += balance;
+      }
+      // In some runs the remaining bad debt is repaid through the insurance fund, after
+      // which everybody must be payable in full; in the others it is left standing.
+      if (seed % 2 === 1 && (await exchange.totalBadDebt()) > 0n) {
+        const debt = await exchange.totalBadDebt();
+        await exchange.connect(liquidator).depositInsurance(debt + 123n);
+        expect(await exchange.totalBadDebt()).to.equal(0);
+        totals.badDebtRepayments++;
       }
       const surplus = await checkInvariant("wind down");
       const held = await token.balanceOf(exchangeAddress);

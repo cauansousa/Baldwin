@@ -1,0 +1,7 @@
+# Used when building with -f engine/Dockerfile from the repository root (BuildKit).
+# Everything is excluded except what the image copies.
+**
+!shared/src/**
+!engine/package.json
+!engine/package-lock.json
+!engine/src/**

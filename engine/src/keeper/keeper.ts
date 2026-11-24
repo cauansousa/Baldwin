@@ -31,6 +31,18 @@ export interface KeeperChain {
   blockTimestamp(): Promise<bigint>;
 }
 
+export interface KeeperStatus {
+  trackedAccounts: number;
+  eventCursor: bigint | null;
+  eventsCaughtUp: boolean;
+  liquidations: number;
+  liquidationFailures: number;
+  lastLiquidation: { trader: Address; marketId: number; size: bigint; at: number } | null;
+  positionsInBackoff: number;
+  /** Unix seconds of the last tick. */
+  lastTickAt: number;
+}
+
 export interface KeeperOptions {
   chain: KeeperChain;
   marketIds: number[];
@@ -44,6 +56,12 @@ export interface KeeperOptions {
   overlap?: bigint;
   /** A position is forgotten after this many consecutive ticks reading it as zero. Default 3. */
   untrackAfterZeroReads?: number;
+  /**
+   * Called before a position in `marketId` is taken over, so that an order resting on
+   * the keeper's existing position there can be withdrawn first (see Unwinder). A
+   * failure here does not stop the liquidation.
+   */
+  beforeLiquidate?: (marketId: number) => Promise<void>;
   /** Called on every failed chain query (metrics). */
   onRpcError?: (e: unknown) => void;
   /** Max block span per log query. Default 2000. */
@@ -94,8 +112,14 @@ export class Keeper {
   private readonly log: Logger;
   private readonly self: string | undefined;
   private readonly onRpcError: ((e: unknown) => void) | undefined;
+  private readonly beforeLiquidate: ((marketId: number) => Promise<void>) | undefined;
+  private liquidations = 0;
+  private liquidationFailures = 0;
+  private lastLiquidation: { trader: Address; marketId: number; size: bigint; at: number } | null = null;
+  private lastTickAt = 0;
 
   constructor(opts: KeeperOptions) {
+    this.beforeLiquidate = opts.beforeLiquidate;
     this.chain = opts.chain;
     this.self = opts.self?.toLowerCase();
     this.onRpcError = opts.onRpcError;
@@ -144,7 +168,22 @@ export class Keeper {
     return [...this.tracked.values()].map((t) => t.trader);
   }
 
+  /** For /health, metrics and the heartbeat log line. */
+  status(): KeeperStatus {
+    return {
+      trackedAccounts: this.tracked.size,
+      eventCursor: this.cursor ?? null,
+      eventsCaughtUp: this.poller.isCaughtUp,
+      liquidations: this.liquidations,
+      liquidationFailures: this.liquidationFailures,
+      lastLiquidation: this.lastLiquidation,
+      positionsInBackoff: [...this.backoff.values()].filter((b) => b.until > this.ticks).length,
+      lastTickAt: this.lastTickAt,
+    };
+  }
+
   async tick(): Promise<void> {
+    this.lastTickAt = this.now();
     await this.step("event sync", () => this.syncEvents());
     await this.step("liquidations", () => this.checkLiquidations());
     await this.step("funding", () => this.updateFunding());
@@ -247,10 +286,28 @@ export class Keeper {
 
   /** Liquidate the whole position, or as much as the keeper can margin. True if anything was liquidated. */
   private async liquidate(trader: Address, marketId: number, size: bigint): Promise<boolean> {
+    const done = await this.tryLiquidate(trader, marketId, size);
+    if (done === 0n) this.liquidationFailures++;
+    else {
+      this.liquidations++;
+      this.lastLiquidation = { trader, marketId, size: done, at: this.now() };
+    }
+    return done !== 0n;
+  }
+
+  /** Returns the size liquidated (0 if none). */
+  private async tryLiquidate(trader: Address, marketId: number, size: bigint): Promise<bigint> {
     this.log.info("liquidating", { trader, marketId, size });
+    // Taking a position over changes the keeper's own position in this market: an order
+    // resting on the old position must go first, or it could fail on-chain later.
+    try {
+      await this.beforeLiquidate?.(marketId);
+    } catch (e) {
+      this.log.warn("could not withdraw the unwind order before liquidating; liquidating anyway", { marketId, error: errMessage(e) });
+    }
     try {
       await this.chain.liquidate(trader, marketId, size);
-      return true;
+      return size;
     } catch (e) {
       this.log.warn("full liquidation failed", { trader, marketId, error: errMessage(e) });
     }
@@ -258,14 +315,14 @@ export class Keeper {
       const affordable = await this.affordableSize(marketId);
       if (affordable === 0n || affordable >= size) {
         this.log.warn("cannot liquidate: the keeper has no free collateral to take the position over", { trader, marketId });
-        return false;
+        return 0n;
       }
       this.log.info("liquidating partially", { trader, marketId, size: affordable });
       await this.chain.liquidate(trader, marketId, affordable);
-      return true;
+      return affordable;
     } catch (e) {
       this.log.warn("partial liquidation failed", { trader, marketId, error: errMessage(e) });
-      return false;
+      return 0n;
     }
   }
 

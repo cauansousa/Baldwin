@@ -23,4 +23,14 @@ export interface ChainReader {
   openInterest(marketId: number): Promise<{ longs: bigint; shorts: bigint }>;
   /** Current market parameters. */
   getMarket(marketId: number): Promise<MarketConfig>;
+  /** Time-weighted average fill price of the current funding period (WAD). */
+  markTwap(marketId: number): Promise<bigint>;
+  /** Funding rate the current period would apply now, WAD per hour; positive = longs pay. */
+  currentFundingRate(marketId: number): Promise<bigint>;
+  /** Unix seconds. */
+  lastFundingTime(marketId: number): Promise<bigint>;
+  /** USDC units. */
+  insuranceFund(): Promise<bigint>;
+  /** USDC units. */
+  totalBadDebt(): Promise<bigint>;
 }
