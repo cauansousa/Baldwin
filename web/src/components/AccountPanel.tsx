@@ -3,9 +3,10 @@ import { useWriteContract } from "wagmi";
 import { readContract } from "wagmi/actions";
 import { USDC_DECIMALS } from "@shared";
 import { config, isLocalChain } from "../config";
-import type { ChainAccount } from "../hooks/useChain";
+import type { ChainAccount, ChainMarket } from "../hooks/useChain";
 import { useTxFlow, type TxStep } from "../hooks/useTx";
 import { describeError } from "../lib/errors";
+import { pendingFundingUsdc } from "../lib/funding";
 import { marginUsageBps } from "../lib/risk";
 import { formatBps, formatUsdc, parseUsdc, toInputString } from "../lib/units";
 import { erc20Abi, exchangeAbi, wagmiConfig } from "../wagmi";
@@ -15,6 +16,7 @@ const MINT_AMOUNT = 10_000n * 10n ** BigInt(USDC_DECIMALS);
 
 interface Props {
   account: ChainAccount | undefined;
+  chainMarkets: Map<number, ChainMarket> | undefined;
   loadError: unknown;
   /** Connected address on the right network; undefined disables transactions. */
   trader: `0x${string}` | undefined;
@@ -23,7 +25,7 @@ interface Props {
 
 type Mode = "deposit" | "withdraw";
 
-export function AccountPanel({ account, loadError, trader, connected }: Props) {
+export function AccountPanel({ account, chainMarkets, loadError, trader, connected }: Props) {
   const { writeContractAsync } = useWriteContract();
   const tx = useTxFlow();
   const [mode, setMode] = useState<Mode>("deposit");
@@ -44,6 +46,18 @@ export function AccountPanel({ account, loadError, trader, connected }: Props) {
       ? marginUsageBps(account.initialMargin, account.accountValue)
       : undefined;
   const usagePct = usage === null ? 100 : usage === undefined ? 0 : Math.min(100, Number(usage / 100n));
+
+  // Funding accrued on-chain but not yet settled into the balance (positive = owed by the trader).
+  // Undefined while any position's market index is unknown, rather than showing a partial sum.
+  let pendingFunding: bigint | undefined = account ? 0n : undefined;
+  for (const pos of account?.positions ?? []) {
+    const cumulative = chainMarkets?.get(pos.marketId)?.cumulativeFunding;
+    if (cumulative === undefined || pendingFunding === undefined) {
+      pendingFunding = undefined;
+      break;
+    }
+    pendingFunding += pendingFundingUsdc(pos.size, pos.lastCumulativeFunding, cumulative);
+  }
 
   async function onSubmit() {
     if (!canSend || !parsed.ok || !trader || !exchange || !usdc) return;
@@ -123,6 +137,20 @@ export function AccountPanel({ account, loadError, trader, connected }: Props) {
               <dd className="num">{usd(account?.balance)}</dd>
             </div>
             <div>
+              <dt title="Funding já apurado no contrato e ainda não lançado no saldo; já está descontado do valor da conta.">
+                Funding pendente
+              </dt>
+              <dd className="num">
+                {pendingFunding === undefined
+                  ? "—"
+                  : pendingFunding === 0n
+                    ? "0,00"
+                    : pendingFunding > 0n
+                      ? `a pagar ${formatUsdc(pendingFunding)}`
+                      : `a receber ${formatUsdc(-pendingFunding)}`}
+              </dd>
+            </div>
+            <div>
               <dt>Valor da conta</dt>
               <dd className="num strong">{usd(account?.accountValue)}</dd>
             </div>
@@ -146,12 +174,12 @@ export function AccountPanel({ account, loadError, trader, connected }: Props) {
             <span style={{ width: `${usagePct}%` }} />
           </div>
 
-          <div className="tabs" role="tablist">
+          <div className="tabs" role="group" aria-label="Operação">
             {(["deposit", "withdraw"] as const).map((m) => (
               <button
                 key={m}
-                role="tab"
-                aria-selected={mode === m}
+                type="button"
+                aria-pressed={mode === m}
                 className={mode === m ? "active" : ""}
                 disabled={tx.busy}
                 onClick={() => {
@@ -165,13 +193,14 @@ export function AccountPanel({ account, loadError, trader, connected }: Props) {
             ))}
           </div>
 
-          <label className="field">
+          <div className="field">
             <span className="field-label">
-              Valor
+              <label htmlFor="account-amount">Valor</label>
               <button
                 type="button"
                 className="link"
                 disabled={max === undefined || tx.busy}
+                aria-label={`Usar o máximo: ${usd(max)} USDC`}
                 onClick={() => max !== undefined && setAmount(toInputString(max, USDC_DECIMALS))}
               >
                 Máx.: {usd(max)}
@@ -179,6 +208,7 @@ export function AccountPanel({ account, loadError, trader, connected }: Props) {
             </span>
             <span className="input-wrap">
               <input
+                id="account-amount"
                 inputMode="decimal"
                 autoComplete="off"
                 placeholder="0,00"
@@ -186,11 +216,16 @@ export function AccountPanel({ account, loadError, trader, connected }: Props) {
                 disabled={tx.busy}
                 onChange={(e) => setAmount(e.target.value)}
                 aria-invalid={amount !== "" && !!amountError}
+                aria-describedby={amount !== "" && amountError ? "account-amount-error" : undefined}
               />
               <span className="suffix">USDC</span>
             </span>
-            {amount !== "" && amountError && <span className="field-error">{amountError}</span>}
-          </label>
+            {amount !== "" && amountError && (
+              <span className="field-error" id="account-amount-error">
+                {amountError}
+              </span>
+            )}
+          </div>
 
           <button className="btn btn-primary btn-block" disabled={!canSend} onClick={() => void onSubmit()}>
             {!ready ? "Indisponível nesta rede" : mode === "deposit" ? "Depositar USDC" : "Sacar USDC"}

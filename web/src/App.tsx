@@ -2,6 +2,8 @@ import { useCallback, useState } from "react";
 import { useAccount } from "wagmi";
 import { AccountPanel } from "./components/AccountPanel";
 import { Header } from "./components/Header";
+import { MarketBar } from "./components/MarketBar";
+import { ProtocolPanel } from "./components/ProtocolPanel";
 import { OpenOrdersTable } from "./components/OpenOrdersTable";
 import { OrderBookPanel } from "./components/OrderBookPanel";
 import { OrderForm, type OrderPrefill } from "./components/OrderForm";
@@ -52,6 +54,16 @@ export function App() {
   // While recovering the engine has not read prices yet; that is not a halted market.
   const halted = engineMarket !== undefined && engineMarket.indexPrice === null && !health.data?.recovering;
 
+  // Contract reads first; the engine's last view of the same figures fills in while a read is missing.
+  const protocolStatus =
+    exchangeStatus.data || health.data
+      ? {
+          ...exchangeStatus.data,
+          insuranceFund: exchangeStatus.data?.insuranceFund ?? health.data?.insuranceFund,
+          totalBadDebt: exchangeStatus.data?.totalBadDebt ?? health.data?.totalBadDebt,
+        }
+      : undefined;
+
   const [testnetNoticeOpen, setTestnetNoticeOpen] = useState(() => !isLocalChain && !readSessionFlag(TESTNET_NOTICE_KEY));
   const dismissTestnetNotice = () => {
     writeSessionFlag(TESTNET_NOTICE_KEY);
@@ -77,13 +89,13 @@ export function App() {
           </button>
         </div>
       )}
-      <Header
+      <Header live={feed.live} wrongNetwork={wrongNetwork} />
+      <MarketBar
         markets={markets}
         market={market}
         onSelectMarket={setSelectedId}
         chainMarket={chainMarket}
-        live={feed.live}
-        wrongNetwork={wrongNetwork}
+        loading={marketsQuery.isLoading || chainMarkets.isLoading}
       />
 
       {!config.exchange && (
@@ -142,6 +154,8 @@ export function App() {
               markets={markets}
               chainMarkets={chainMarkets.data}
               account={account.data}
+              loading={account.isLoading}
+              loadError={account.error}
               connected={isConnected}
               onClose={onClosePosition}
             />
@@ -158,7 +172,14 @@ export function App() {
             trader={trader}
             prefill={prefill}
           />
-          <AccountPanel account={account.data} loadError={account.error} trader={trader} connected={isConnected} />
+          <AccountPanel
+            account={account.data}
+            chainMarkets={chainMarkets.data}
+            loadError={account.error}
+            trader={trader}
+            connected={isConnected}
+          />
+          <ProtocolPanel status={protocolStatus} loading={exchangeStatus.isLoading} error={exchangeStatus.error} paused={paused} />
         </div>
       </main>
 

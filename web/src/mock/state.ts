@@ -3,6 +3,7 @@
 
 import { WAD } from "@shared";
 import type { BookLevel, OpenOrder, OrderBook, Trade } from "../api/types";
+import { pendingFundingUsdc } from "../lib/funding";
 import { mulBps, notionalUsdc, unrealizedPnlUsdc } from "../lib/risk";
 
 export const MOCK_ACCOUNT = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8" as const;
@@ -25,6 +26,10 @@ export interface MockMarket {
   liquidationPenaltyBps: number;
   minOrderSize: bigint;
   trades: Trade[];
+  /** Funding: hourly rate in 1e-6 (100 = 0.01%), cumulative index in cents per unit of base. */
+  fundingRatePpm: number;
+  cumulativeFundingCents: number;
+  openInterest: number; // base units per side
 }
 
 function market(
@@ -49,6 +54,9 @@ function market(
     liquidationPenaltyBps: 250,
     minOrderSize: wad(minOrderSize),
     trades: [],
+    fundingRatePpm: marketId === 1 ? -62 : 85 + marketId * 20,
+    cumulativeFundingCents: Math.round(price * 0.9),
+    openInterest: baseSize * 310,
   };
 }
 
@@ -64,9 +72,10 @@ export const account = {
   walletUsdc: usdc(25_000),
   allowance: 0n,
   balance: usdc(12_500),
-  positions: new Map<number, { size: bigint; entryNotional: bigint }>([
-    [0, { size: wad(0.35), entryNotional: usdc(0.35 * 96_200) }],
-    [1, { size: -wad(4.2), entryNotional: usdc(4.2 * 3_480) }],
+  positions: new Map<number, { size: bigint; entryNotional: bigint; lastCumulativeFunding: bigint }>([
+    // Snapshots slightly behind the current cumulative index, so some funding is pending.
+    [0, { size: wad(0.35), entryNotional: usdc(0.35 * 96_200), lastCumulativeFunding: wad(97_432.5 * 0.009 - 21.4, 2) }],
+    [1, { size: -wad(4.2), entryNotional: usdc(4.2 * 3_480), lastCumulativeFunding: wad(3_415.2 * 0.009 - 1.15, 2) }],
   ]),
 };
 
@@ -148,11 +157,24 @@ export const getMarket = (marketId: number) => markets.find((m) => m.marketId ==
 export const indexPrice = (m: MockMarket) => BigInt(m.priceCents) * CENT;
 export const markPrice = (m: MockMarket) => BigInt(m.priceCents + m.markOffsetCents) * CENT;
 
+export const cumulativeFunding = (m: MockMarket) => BigInt(m.cumulativeFundingCents) * CENT;
+export const fundingRate = (m: MockMarket) => (BigInt(m.fundingRatePpm) * WAD) / 1_000_000n;
+/** Start of the current funding period: the top of the hour. */
+export const lastFundingTime = () => BigInt(Math.floor(Date.now() / 3_600_000) * 3600);
+
+/** Protocol-level figures; ?mockBadDebt=1 in the URL simulates recorded bad debt. */
+export const protocol = {
+  insuranceFund: usdc(48_250.75),
+  totalBadDebt: typeof location !== "undefined" && new URLSearchParams(location.search).has("mockBadDebt") ? usdc(1_820.4) : 0n,
+};
+
 export function accountValue(): bigint {
   let value = account.balance;
   for (const [marketId, pos] of account.positions) {
     const m = getMarket(marketId);
-    if (m) value += unrealizedPnlUsdc(pos.size, pos.entryNotional, indexPrice(m));
+    if (!m) continue;
+    value += unrealizedPnlUsdc(pos.size, pos.entryNotional, indexPrice(m));
+    value -= pendingFundingUsdc(pos.size, pos.lastCumulativeFunding, cumulativeFunding(m));
   }
   return value;
 }

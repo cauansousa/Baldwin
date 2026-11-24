@@ -83,6 +83,9 @@ export interface EngineHealth {
   stalled: boolean;
   /** Undefined when the engine runs without a chain reader. */
   paused?: boolean;
+  /** The engine's last read of the contract's insurance fund / bad debt, USDC units. */
+  insuranceFund?: bigint;
+  totalBadDebt?: bigint;
   markets: {
     marketId: number;
     /** Null when the engine has no fresh index price: the market is halted. */

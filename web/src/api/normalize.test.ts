@@ -81,13 +81,16 @@ describe("engine payload normalization", () => {
       recovering: false,
       stalled: true,
       paused: true,
+      insuranceFund: undefined,
+      totalBadDebt: undefined,
       markets: [
         { marketId: 0, indexPrice: 100n, band: { lower: 95n, upper: 105n } },
         { marketId: 1, indexPrice: null, band: null },
       ],
     });
     // Engine without a chain reader, or an unexpected body: nothing is assumed.
-    const blank = { ok: true, recovering: false, stalled: false, paused: undefined, markets: [] };
+    const blank = { ok: true, recovering: false, stalled: false, paused: undefined, insuranceFund: undefined, totalBadDebt: undefined, markets: [] };
+    expect(normalizeHealth({ ok: true, insuranceFund: "5000000", totalBadDebt: "0" })).toMatchObject({ insuranceFund: 5_000_000n, totalBadDebt: 0n });
     expect(normalizeHealth({ ok: true, chain: null })).toEqual(blank);
     expect(normalizeHealth("nope")).toEqual(blank);
     // Recovering makes ok false, but that is not a settlement stall.

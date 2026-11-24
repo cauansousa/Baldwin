@@ -34,7 +34,12 @@ function requireMarket(marketId: number) {
   return m;
 }
 
+// keccak256("oracle()")[:4] — the public getter the app reads outside the shared ABI.
+const ORACLE_SELECTOR = "0x7dc0d1d0";
+const MOCK_ORACLE = "0x00000000000000000000000000000000ba1d0003";
+
 function callExchange(data: Hex): Hex {
+  if (data.toLowerCase() === ORACLE_SELECTOR) return `0x${MOCK_ORACLE.slice(2).padStart(64, "0")}`;
   const { functionName, args } = decodeFunctionData({ abi: exchangeAbi, data });
   switch (functionName) {
     case "getMarket": {
@@ -59,12 +64,37 @@ function callExchange(data: Hex): Hex {
       return encodeFunctionResult({ abi: exchangeAbi, functionName, result: state.indexPrice(requireMarket(args[0])) });
     case "markPrice":
       return encodeFunctionResult({ abi: exchangeAbi, functionName, result: state.markPrice(requireMarket(args[0])) });
+    case "markTwap":
+      // Sits between the index and the last fill, as an average would.
+      return encodeFunctionResult({
+        abi: exchangeAbi,
+        functionName,
+        result: (state.indexPrice(requireMarket(args[0])) + state.markPrice(requireMarket(args[0]))) / 2n,
+      });
+    case "currentFundingRate":
+      return encodeFunctionResult({ abi: exchangeAbi, functionName, result: state.fundingRate(requireMarket(args[0])) });
+    case "lastFundingTime":
+      return encodeFunctionResult({ abi: exchangeAbi, functionName, result: state.lastFundingTime() });
+    case "cumulativeFunding":
+      return encodeFunctionResult({ abi: exchangeAbi, functionName, result: state.cumulativeFunding(requireMarket(args[0])) });
+    case "openInterest": {
+      const oi = BigInt(Math.round(requireMarket(args[0]).openInterest * 1000)) * 10n ** 15n;
+      return encodeFunctionResult({ abi: exchangeAbi, functionName, result: [oi, oi] });
+    }
+    case "insuranceFund":
+      return encodeFunctionResult({ abi: exchangeAbi, functionName, result: state.protocol.insuranceFund });
+    case "totalBadDebt":
+      return encodeFunctionResult({ abi: exchangeAbi, functionName, result: state.protocol.totalBadDebt });
     case "getPosition": {
       const pos = state.account.positions.get(args[1]);
       return encodeFunctionResult({
         abi: exchangeAbi,
         functionName,
-        result: { size: pos?.size ?? 0n, entryNotional: pos?.entryNotional ?? 0n, lastCumulativeFunding: 0n },
+        result: {
+          size: pos?.size ?? 0n,
+          entryNotional: pos?.entryNotional ?? 0n,
+          lastCumulativeFunding: pos?.lastCumulativeFunding ?? 0n,
+        },
       });
     }
     case "balanceOf":

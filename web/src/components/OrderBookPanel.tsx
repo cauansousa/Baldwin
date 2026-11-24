@@ -37,7 +37,7 @@ export function OrderBookPanel({ book, loading, error }: Props) {
 
   const renderRow = (row: Row, side: "ask" | "bid") => (
     <div className={`book-row ${side}`} key={`${side}-${row.price}`}>
-      <span className="depth" style={{ width: `${barWidth(row.total, maxTotal)}%` }} />
+      <span className="depth" aria-hidden="true" style={{ width: `${barWidth(row.total, maxTotal)}%` }} />
       <span className={`num ${side === "ask" ? "neg" : "pos"}`}>{formatPrice(row.price, fraction)}</span>
       <span className="num">{formatSize(row.size)}</span>
       <span className="num muted">{formatSize(row.total)}</span>
@@ -47,7 +47,7 @@ export function OrderBookPanel({ book, loading, error }: Props) {
   return (
     <section className="panel book">
       <h2 className="panel-title">Livro de ofertas</h2>
-      <div className="book-head">
+      <div className="book-head" aria-hidden="true">
         <span>Preço (USD)</span>
         <span>Tamanho</span>
         <span>Acumulado</span>
@@ -56,7 +56,8 @@ export function OrderBookPanel({ book, loading, error }: Props) {
         <div className="empty">{error ? describeError(error) : loading ? "Carregando…" : "Sem dados"}</div>
       ) : (
         <>
-          <div className="book-side asks">
+          <div className="book-side asks" role="group" aria-label="Ofertas de venda">
+            <div className="book-caption neg">▼ Vendas</div>
             {asks.length === 0 ? <div className="empty">Sem ofertas de venda</div> : [...asks].reverse().map((r) => renderRow(r, "ask"))}
           </div>
           <div className="book-spread">
@@ -64,7 +65,8 @@ export function OrderBookPanel({ book, loading, error }: Props) {
             <span className="num">{spread !== undefined ? formatPrice(spread, fraction) : "—"}</span>
             <span className="num muted">{spreadPct !== undefined ? `${formatUnits(spreadPct, 4, { maxFraction: 3 })}%` : ""}</span>
           </div>
-          <div className="book-side bids">
+          <div className="book-side bids" role="group" aria-label="Ofertas de compra">
+            <div className="book-caption pos">▲ Compras</div>
             {bids.length === 0 ? <div className="empty">Sem ofertas de compra</div> : bids.map((r) => renderRow(r, "bid"))}
           </div>
         </>

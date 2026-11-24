@@ -18,7 +18,7 @@ export function TradesPanel({ trades, loading, error }: Props) {
     <section className="panel trades">
       <h2 className="panel-title">Negócios recentes</h2>
       <div className="trades-head">
-        <span>Preço (USD)</span>
+        <span title="▲ comprador agrediu · ▼ vendedor agrediu">Preço (USD)</span>
         <span>Tamanho</span>
         <span>Hora</span>
       </div>
@@ -28,7 +28,11 @@ export function TradesPanel({ trades, loading, error }: Props) {
         <div className="trades-list">
           {rows.map((t) => (
             <div className="trade-row" key={t.id}>
-              <span className={`num ${t.takerIsBuy ? "pos" : "neg"}`}>{formatPrice(t.price, fraction)}</span>
+              <span className={`num ${t.takerIsBuy ? "pos" : "neg"}`}>
+                <span aria-hidden="true">{t.takerIsBuy ? "▲ " : "▼ "}</span>
+                <span className="sr-only">{t.takerIsBuy ? "compra " : "venda "}</span>
+                {formatPrice(t.price, fraction)}
+              </span>
               <span className="num">{formatSize(t.size)}</span>
               <span className="num muted">{t.timestampMs ? timeFormat.format(t.timestampMs) : "—"}</span>
             </div>

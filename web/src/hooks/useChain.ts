@@ -1,4 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
+import { parseAbi } from "viem";
 import { getBlock, readContract } from "wagmi/actions";
 import type { MarketInfo } from "../api/types";
 import { config } from "../config";
@@ -24,13 +25,23 @@ export interface MarketParams {
 export interface ChainMarket {
   params?: MarketParams;
   indexPrice?: bigint; // WAD; undefined when the oracle read fails (e.g. stale)
-  markPrice?: bigint; // WAD; undefined before the first fill
+  markPrice?: bigint; // WAD, last fill; undefined before the first fill
+  /** Time-weighted average fill price of the current funding period (the index if it did not trade), WAD. */
+  markTwap?: bigint;
+  /** Rate the current period would apply if accrued now: WAD per hour, positive = longs pay shorts. */
+  fundingRate?: bigint;
+  /** Unix seconds of the last funding accrual. */
+  lastFundingTime?: bigint;
+  /** Cumulative funding index, USD-WAD per unit of base. */
+  cumulativeFunding?: bigint;
+  openInterest?: { longs: bigint; shorts: bigint }; // base, WAD
 }
 
 export interface ChainPosition {
   marketId: number;
   size: bigint;
   entryNotional: bigint;
+  lastCumulativeFunding: bigint;
 }
 
 export interface ChainAccount {
@@ -66,15 +77,25 @@ const chainId = config.chainId;
 
 async function fetchMarket(exchange: `0x${string}`, marketId: number): Promise<ChainMarket> {
   const base = { abi: exchangeAbi, address: exchange, chainId, args: [marketId] } as const;
-  const [params, indexPrice, markPrice] = await readAll([
+  const [params, indexPrice, markPrice, markTwap, fundingRate, lastFundingTime, cumulativeFunding, openInterest] = await readAll([
     readContract(wagmiConfig, { ...base, functionName: "getMarket" }),
     readContract(wagmiConfig, { ...base, functionName: "indexPrice" }),
     readContract(wagmiConfig, { ...base, functionName: "markPrice" }),
+    readContract(wagmiConfig, { ...base, functionName: "markTwap" }),
+    readContract(wagmiConfig, { ...base, functionName: "currentFundingRate" }),
+    readContract(wagmiConfig, { ...base, functionName: "lastFundingTime" }),
+    readContract(wagmiConfig, { ...base, functionName: "cumulativeFunding" }),
+    readContract(wagmiConfig, { ...base, functionName: "openInterest" }),
   ] as const);
   return {
     params,
     indexPrice: indexPrice && indexPrice > 0n ? indexPrice : undefined,
     markPrice: markPrice && markPrice > 0n ? markPrice : undefined,
+    markTwap: markTwap && markTwap > 0n ? markTwap : undefined,
+    fundingRate,
+    lastFundingTime: lastFundingTime && lastFundingTime > 0n ? lastFundingTime : undefined,
+    cumulativeFunding,
+    openInterest: openInterest ? { longs: openInterest[0], shorts: openInterest[1] } : undefined,
   };
 }
 
@@ -96,7 +117,15 @@ export function useChainMarkets(markets: MarketInfo[]) {
 export interface ExchangeStatus {
   paused?: boolean;
   maxPriceDeviationBps?: bigint;
+  /** USDC units held to cover losses beyond a liquidated account's value. */
+  insuranceFund?: bigint;
+  /** USDC units of losses nobody covered yet. */
+  totalBadDebt?: bigint;
+  oracle?: `0x${string}`;
 }
+
+// `oracle` is a public variable of Exchange.sol that the shared ABI does not list.
+const oracleGetterAbi = parseAbi(["function oracle() view returns (address)"]);
 
 /** Exchange-wide flags: pause state and the fill-price band around the index. */
 export function useExchangeStatus() {
@@ -107,11 +136,14 @@ export function useExchangeStatus() {
     refetchInterval: Math.max(10_000, POLL_MS),
     queryFn: async (): Promise<ExchangeStatus> => {
       const ex = { abi: exchangeAbi, address: exchange!, chainId } as const;
-      const [paused, maxPriceDeviationBps] = await readAll([
+      const [paused, maxPriceDeviationBps, insuranceFund, totalBadDebt, oracle] = await readAll([
         readContract(wagmiConfig, { ...ex, functionName: "paused" }),
         readContract(wagmiConfig, { ...ex, functionName: "maxPriceDeviationBps" }),
+        readContract(wagmiConfig, { ...ex, functionName: "insuranceFund" }),
+        readContract(wagmiConfig, { ...ex, functionName: "totalBadDebt" }),
+        readContract(wagmiConfig, { abi: oracleGetterAbi, address: exchange!, chainId, functionName: "oracle" }),
       ] as const);
-      return { paused, maxPriceDeviationBps };
+      return { paused, maxPriceDeviationBps, insuranceFund, totalBadDebt, oracle: oracle ?? config.oracle };
     },
   });
 }
@@ -147,7 +179,9 @@ export function useChainAccount(trader: `0x${string}` | undefined, markets: Mark
         freeCollateral,
         minValidNonce,
         positions: (positions ?? []).flatMap((p, i) =>
-          p && p.size !== 0n ? [{ marketId: ids[i]!, size: p.size, entryNotional: p.entryNotional }] : [],
+          p && p.size !== 0n
+            ? [{ marketId: ids[i]!, size: p.size, entryNotional: p.entryNotional, lastCumulativeFunding: p.lastCumulativeFunding }]
+            : [],
         ),
       };
     },

@@ -1,25 +1,18 @@
 import { useEffect, useRef, useState } from "react";
 import { useAccount, useConnect, useConnectors, useDisconnect, useSwitchChain } from "wagmi";
-import type { MarketInfo } from "../api/types";
 import { config, MOCK } from "../config";
-import type { ChainMarket } from "../hooks/useChain";
 import { describeError } from "../lib/errors";
-import { formatPrice } from "../lib/units";
 import { selectWallets } from "../lib/wallets";
 import { chain } from "../wagmi";
 
 interface Props {
-  markets: MarketInfo[];
-  market: MarketInfo | undefined;
-  onSelectMarket: (marketId: number) => void;
-  chainMarket: ChainMarket | undefined;
   live: boolean;
   wrongNetwork: boolean;
 }
 
 const shortAddress = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
 
-export function Header({ markets, market, onSelectMarket, chainMarket, live, wrongNetwork }: Props) {
+export function Header({ live, wrongNetwork }: Props) {
   const { address, isConnected } = useAccount();
   const { connect, isPending: connecting, error: connectError } = useConnect();
   const wallets = selectWallets(useConnectors());
@@ -63,32 +56,8 @@ export function Header({ markets, market, onSelectMarket, chainMarket, live, wro
           {MOCK && <span className="tag tag-mock">simulado</span>}
         </div>
 
-        <label className="market-select">
-          <span className="sr-only">Mercado</span>
-          <select
-            value={market?.marketId ?? ""}
-            onChange={(e) => onSelectMarket(Number(e.target.value))}
-            disabled={markets.length === 0}
-          >
-            {markets.length === 0 && <option value="">Sem mercados</option>}
-            {markets.map((m) => (
-              <option key={m.marketId} value={m.marketId}>
-                {m.symbol}
-              </option>
-            ))}
-          </select>
-        </label>
-
-        <div className="stat">
-          <span className="stat-label">Preço índice</span>
-          <span className="stat-value num">{chainMarket?.indexPrice ? formatPrice(chainMarket.indexPrice) : "—"}</span>
-        </div>
-        <div className="stat">
-          <span className="stat-label">Preço de marca</span>
-          <span className="stat-value num">{chainMarket?.markPrice ? formatPrice(chainMarket.markPrice) : "—"}</span>
-        </div>
-        <div className={`feed-status ${live ? "is-live" : ""}`} title="Conexão em tempo real com o motor de ordens">
-          <span className="dot" />
+        <div className={`feed-status ${live ? "is-live" : ""}`} title="Conexão em tempo real com o motor de ordens" role="status">
+          <span className="dot" aria-hidden="true" />
           {live ? "Ao vivo" : "Reconectando…"}
         </div>
 

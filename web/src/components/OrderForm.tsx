@@ -352,10 +352,10 @@ export function OrderForm({ market, chainMarket, account, exchangeStatus, engine
       <form onSubmit={onSubmit} noValidate>
         <div className="side-toggle" role="group" aria-label="Lado">
           <button type="button" className={isBuy ? "active buy" : ""} aria-pressed={isBuy} onClick={() => setIsBuy(true)}>
-            Comprar
+            ▲ Comprar
           </button>
           <button type="button" className={!isBuy ? "active sell" : ""} aria-pressed={!isBuy} onClick={() => setIsBuy(false)}>
-            Vender
+            ▼ Vender
           </button>
         </div>
 
@@ -369,10 +369,15 @@ export function OrderForm({ market, chainMarket, account, exchangeStatus, engine
               value={price}
               onChange={(e) => setPrice(e.target.value)}
               aria-invalid={price !== "" && !!parsed.priceError}
+              aria-describedby={price !== "" && parsed.priceError ? "order-price-error" : undefined}
             />
             <span className="suffix">USD</span>
           </span>
-          {price !== "" && parsed.priceError && <span className="field-error">{parsed.priceError}</span>}
+          {price !== "" && parsed.priceError && (
+            <span className="field-error" id="order-price-error">
+              {parsed.priceError}
+            </span>
+          )}
         </label>
 
         <label className="field">
@@ -385,10 +390,15 @@ export function OrderForm({ market, chainMarket, account, exchangeStatus, engine
               value={size}
               onChange={(e) => setSize(e.target.value)}
               aria-invalid={size !== "" && !!parsed.sizeError}
+              aria-describedby={size !== "" && parsed.sizeError ? "order-size-error" : undefined}
             />
             <span className="suffix">{base}</span>
           </span>
-          {size !== "" && parsed.sizeError && <span className="field-error">{parsed.sizeError}</span>}
+          {size !== "" && parsed.sizeError && (
+            <span className="field-error" id="order-size-error">
+              {parsed.sizeError}
+            </span>
+          )}
         </label>
 
         <div className="checks">

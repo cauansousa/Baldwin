@@ -1,6 +1,8 @@
 import { WAD } from "@shared";
 import type { MarketInfo } from "../api/types";
 import type { ChainAccount, ChainMarket } from "../hooks/useChain";
+import { describeError } from "../lib/errors";
+import { estimateNextFundingUsdc } from "../lib/funding";
 import { entryPriceWad, estimateLiquidationPrice, unrealizedPnlUsdc } from "../lib/risk";
 import { formatPrice, formatSize, formatUsdc, priceFractionDigits, roundToFraction, toInputString, WAD_DECIMALS } from "../lib/units";
 import type { OrderPrefill } from "./OrderForm";
@@ -9,11 +11,13 @@ interface Props {
   markets: MarketInfo[];
   chainMarkets: Map<number, ChainMarket> | undefined;
   account: ChainAccount | undefined;
+  loading: boolean;
+  loadError: unknown;
   connected: boolean;
   onClose: (prefill: Omit<OrderPrefill, "key">) => void;
 }
 
-export function PositionsTable({ markets, chainMarkets, account, connected, onClose }: Props) {
+export function PositionsTable({ markets, chainMarkets, account, loading, loadError, connected, onClose }: Props) {
   const positions = account?.positions ?? [];
   return (
     <section className="panel">
@@ -21,22 +25,42 @@ export function PositionsTable({ markets, chainMarkets, account, connected, onCl
         Posições <span className="count">{positions.length}</span>
       </h2>
       {positions.length === 0 ? (
-        <div className="empty">{connected ? "Nenhuma posição aberta." : "Conecte a carteira para ver suas posições."}</div>
+        <div className="empty">
+          {!connected
+            ? "Conecte a carteira para ver suas posições."
+            : account
+              ? "Nenhuma posição aberta."
+              : loadError
+                ? describeError(loadError)
+                : loading
+                  ? "Carregando…"
+                  : "Sem dados"}
+        </div>
       ) : (
-        <div className="table-scroll">
+        <div className="table-scroll" role="region" aria-label="Posições" tabIndex={0}>
           <table className="table">
+            <caption className="sr-only">Posições abertas</caption>
             <thead>
               <tr>
-                <th>Mercado</th>
-                <th>Lado</th>
-                <th className="r">Tamanho</th>
-                <th className="r">Preço de entrada</th>
-                <th className="r">Preço índice</th>
-                <th className="r">PnL não realizado</th>
-                <th className="r" title="Estimativa: supõe que só este mercado se move e ignora funding futuro.">
+                <th scope="col">Mercado</th>
+                <th scope="col">Lado</th>
+                <th scope="col" className="r">Tamanho</th>
+                <th scope="col" className="r">Preço de entrada</th>
+                <th scope="col" className="r">Preço índice</th>
+                <th scope="col" className="r">PnL não realizado</th>
+                <th
+                  scope="col"
+                  className="r"
+                  title="Estimativa do próximo pagamento de funding, se a taxa, o preço e a posição não mudarem."
+                >
+                  Próx. funding*
+                </th>
+                <th scope="col" className="r" title="Estimativa: supõe que só este mercado se move e ignora funding futuro.">
                   Liq. estimada*
                 </th>
-                <th />
+                <th scope="col">
+                  <span className="sr-only">Ações</span>
+                </th>
               </tr>
             </thead>
             <tbody>
@@ -62,20 +86,35 @@ export function PositionsTable({ markets, chainMarkets, account, connected, onCl
                       })
                     : undefined;
                 const fraction = priceFractionDigits(index ?? entry ?? WAD);
+                // Positive = this position pays at the next accrual.
+                const nextFunding =
+                  index !== undefined && cm?.fundingRate !== undefined
+                    ? estimateNextFundingUsdc(pos.size, index, cm.fundingRate)
+                    : undefined;
                 return (
                   <tr key={pos.marketId}>
-                    <td>{symbol}</td>
-                    <td className={isLong ? "pos" : "neg"}>{isLong ? "Comprado" : "Vendido"}</td>
+                    <th scope="row">{symbol}</th>
+                    <td className={isLong ? "pos" : "neg"}>{isLong ? "▲ Comprado" : "▼ Vendido"}</td>
                     <td className="r num">{formatSize(absSize)}</td>
                     <td className="r num">{entry !== null ? formatPrice(entry, fraction) : "—"}</td>
                     <td className="r num">{index !== undefined ? formatPrice(index, fraction) : "—"}</td>
                     <td className={`r num ${pnl === undefined || pnl === 0n ? "" : pnl > 0n ? "pos" : "neg"}`}>
                       {pnl !== undefined ? formatUsdc(pnl, { showPlus: true }) : "—"}
                     </td>
+                    <td className="r num">
+                      {nextFunding === undefined
+                        ? "—"
+                        : nextFunding === 0n
+                          ? "0,00"
+                          : nextFunding > 0n
+                            ? `≈ paga ${formatUsdc(nextFunding)}`
+                            : `≈ recebe ${formatUsdc(-nextFunding)}`}
+                    </td>
                     <td className="r num">{liq === undefined ? "—" : liq === null ? "sem risco" : `≈ ${formatPrice(liq, fraction)}`}</td>
                     <td className="r">
                       <button
                         className="btn btn-small"
+                        aria-label={`Fechar posição em ${symbol}`}
                         onClick={() =>
                           onClose({
                             marketId: pos.marketId,
@@ -98,8 +137,9 @@ export function PositionsTable({ markets, chainMarkets, account, connected, onCl
       )}
       {positions.length > 0 && (
         <p className="footnote">
-          * Preço de liquidação é uma estimativa: considera a margem cruzada atual, supõe que apenas este mercado se
-          move e ignora funding futuro. O contrato é quem decide.
+          * Estimativas. Liquidação: considera a margem cruzada atual, supõe que apenas este mercado se move e ignora
+          funding futuro. Próximo funding: supõe taxa, preço índice e posição inalterados até a apuração. O contrato é
+          quem decide.
         </p>
       )}
     </section>

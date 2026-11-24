@@ -41,6 +41,8 @@ export function normalizeHealth(value: unknown): EngineHealth {
     recovering,
     stalled: typeof settlement.stalled === "boolean" ? settlement.stalled : v.ok === false && !recovering,
     paused: typeof chain?.paused === "boolean" ? chain.paused : undefined,
+    insuranceFund: optionalBigint(v.insuranceFund),
+    totalBadDebt: optionalBigint(v.totalBadDebt),
     markets,
   };
 }

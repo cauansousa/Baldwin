@@ -27,7 +27,7 @@ function requireMarket(marketId: number) {
 /** Fake engine: same interface as the HTTP client, backed by mock/state.ts. */
 export const mockEngine: EngineApi = {
   async getHealth() {
-    return { ok: true, recovering: false, stalled: false, paused: false, markets: [] };
+    return { ok: true, recovering: false, stalled: false, paused: false, markets: [] }; // figures come from the mock chain
   },
   async getMarkets() {
     return markets.map(({ marketId, symbol }) => ({ marketId, symbol }));

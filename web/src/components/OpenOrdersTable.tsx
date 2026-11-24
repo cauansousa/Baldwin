@@ -199,21 +199,24 @@ export function OpenOrdersTable({ markets, viewer, trader }: Props) {
                 : "Nenhuma ordem aberta."}
         </div>
       ) : (
-        <div className="table-scroll">
+        <div className="table-scroll" role="region" aria-label="Ordens abertas" tabIndex={0}>
           <table className="table">
+            <caption className="sr-only">Ordens abertas</caption>
             <thead>
               <tr>
-                <th>Mercado</th>
-                <th>Lado</th>
-                <th className="r">Preço limite</th>
-                <th className="r">Tamanho</th>
-                <th className="r" title="Confirmado on-chain; “pend.” = casado, aguardando confirmação on-chain">
+                <th scope="col">Mercado</th>
+                <th scope="col">Lado</th>
+                <th scope="col" className="r">Preço limite</th>
+                <th scope="col" className="r">Tamanho</th>
+                <th scope="col" className="r" title="Confirmado on-chain; “pend.” = casado, aguardando confirmação on-chain">
                   Executado
                 </th>
-                <th title="Parcial: parte executada, resto no livro. Em liquidação: toda casada, aguardando confirmação on-chain.">Status</th>
-                <th>Condição</th>
-                <th>Expira</th>
-                <th />
+                <th scope="col" title="Parcial: parte executada, resto no livro. Em liquidação: toda casada, aguardando confirmação on-chain.">Status</th>
+                <th scope="col">Condição</th>
+                <th scope="col">Expira</th>
+                <th scope="col">
+                  <span className="sr-only">Ações</span>
+                </th>
               </tr>
             </thead>
             <tbody>
@@ -221,27 +224,41 @@ export function OpenOrdersTable({ markets, viewer, trader }: Props) {
                 const symbol = markets.find((m) => m.marketId === o.order.marketId)?.symbol ?? `#${o.order.marketId}`;
                 return (
                   <tr key={o.orderHash}>
-                    <td>{symbol}</td>
-                    <td className={o.order.isBuy ? "pos" : "neg"}>{o.order.isBuy ? "Compra" : "Venda"}</td>
+                    <th scope="row">{symbol}</th>
+                    <td className={o.order.isBuy ? "pos" : "neg"}>{o.order.isBuy ? "▲ Compra" : "▼ Venda"}</td>
                     <td className="r num">{formatPrice(o.order.limitPrice)}</td>
                     <td className="r num">{formatSize(o.order.size)}</td>
                     <td className="r num">
                       {formatSize(o.filledSize)}
                       {o.pendingSize > 0n && <span className="muted"> +{formatSize(o.pendingSize)} pend.</span>}
                     </td>
-                    <td>{isDeadOnChain(o) ? "Cancelada on-chain · motor atualizando" : (STATUS_LABELS[o.status] ?? o.status)}</td>
+                    <td>
+                      {isDeadOnChain(o) ? (
+                        <span title="O contrato já não aceita esta ordem; o motor leva alguns blocos para tirá-la da lista.">
+                          Canc. on-chain
+                          <span className="sr-only"> (o motor ainda está atualizando)</span>
+                        </span>
+                      ) : (
+                        (STATUS_LABELS[o.status] ?? o.status)
+                      )}
+                    </td>
                     <td>
                       {[o.order.reduceOnly && "Só redução", o.postOnly && "Post-only", o.ioc && "IOC"]
                         .filter(Boolean)
                         .join(" · ") || "—"}
                     </td>
                     <td className="num">
-                      {o.order.expiry === 0n ? "Sem validade" : expiryFormat.format(Number(o.order.expiry) * 1000)}
+                      {o.order.expiry === 0n ? "—" : expiryFormat.format(Number(o.order.expiry) * 1000).replace(",", "")}
                     </td>
                     <td className="r">
                       <span className="row-actions">
                         {isCancellable(o) && !isDeadOnChain(o) && (
-                          <button className="btn btn-small" disabled={!trader || cancelling !== undefined} onClick={() => void cancel(o)}>
+                          <button
+                            className="btn btn-small"
+                            aria-label={`Cancelar ordem de ${o.order.isBuy ? "compra" : "venda"} em ${symbol} a ${formatPrice(o.order.limitPrice)}`}
+                            disabled={!trader || cancelling !== undefined}
+                            onClick={() => void cancel(o)}
+                          >
                             {cancelling === o.orderHash ? "Cancelando…" : "Cancelar"}
                           </button>
                         )}
@@ -250,6 +267,7 @@ export function OpenOrdersTable({ markets, viewer, trader }: Props) {
                           className="btn btn-small btn-ghost"
                           disabled={!canTransact}
                           title="Cancela este nonce no contrato (custa gás)."
+                          aria-label={`Cancelar on-chain a ordem de ${o.order.isBuy ? "compra" : "venda"} em ${symbol} a ${formatPrice(o.order.limitPrice)}`}
                           onClick={() => void cancelOnChain(o)}
                         >
                           On-chain

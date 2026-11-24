@@ -35,6 +35,8 @@ export const config = {
   chainId,
   exchange: MOCK ? MOCK_EXCHANGE : (address(env.VITE_EXCHANGE_ADDRESS) ?? address(deployment?.exchange)),
   usdc: MOCK ? MOCK_USDC : (address(env.VITE_USDC_ADDRESS) ?? address(deployment?.usdc)),
+  /** Only a fallback for display: the oracle address is normally read from the exchange. */
+  oracle: MOCK ? undefined : address(deployment?.oracle),
 } as const;
 
 export { LOCAL_CHAIN_ID };
