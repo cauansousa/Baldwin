@@ -33,6 +33,8 @@ export interface SettlerRpc {
   getNonce(address: Address, tag: "pending" | "latest"): Promise<number>;
   /** Must reject with BatchRevertedError if the call would revert. */
   estimateGas(tx: { from: Address; to: Address; data: Hex }): Promise<bigint>;
+  /** eth_call with an explicit gas limit. Must reject with BatchRevertedError if it reverts. */
+  call(tx: { from: Address; to: Address; data: Hex; gas: bigint }): Promise<void>;
   estimateFees(): Promise<{ maxFeePerGas: bigint; maxPriorityFeePerGas: bigint }>;
   sendRawTransaction(raw: Hex): Promise<void>;
   /** null while the transaction is not mined. */
@@ -56,11 +58,11 @@ export interface ViemSettlerOptions {
   pollIntervalMs?: number;
   /** Broadcast/wait rounds per `settle` call before giving up (state is kept). Default 4. */
   maxRounds?: number;
-  /** Upper bound for the gas limit. Default 25,000,000. */
+  /** Upper bound for the gas limit. Default 16,000,000 (below the 2^24 per-transaction cap of EIP-7825). */
   gasLimitCap?: bigint;
   /**
    * Gas the contract insists on having left before each match
-   * (300,000 + 100,000 x marketCount); added on top of the estimate. Default 500,000.
+   * (400,000 + 150,000 x marketCount); added on top of the estimate. Default 700,000.
    */
   gasFloorPerMatch?: bigint;
   /** Unmined broadcast rounds after which the transaction is replaced with higher fees. Default 2. */
@@ -206,8 +208,8 @@ export class ViemSettler implements Settler {
     this.receiptTimeoutMs = opts.receiptTimeoutMs ?? 30_000;
     this.pollIntervalMs = opts.pollIntervalMs ?? 500;
     this.maxRounds = opts.maxRounds ?? 4;
-    this.gasLimitCap = opts.gasLimitCap ?? 25_000_000n;
-    this.gasFloorPerMatch = opts.gasFloorPerMatch ?? 500_000n;
+    this.gasLimitCap = opts.gasLimitCap ?? 16_000_000n;
+    this.gasFloorPerMatch = opts.gasFloorPerMatch ?? 700_000n;
     this.bumpAfterRounds = Math.max(1, opts.bumpAfterRounds ?? 2);
     this.maxFeePerGasCap = opts.maxFeePerGasCap;
     this.releasePolls = opts.releasePolls ?? 5;
@@ -232,7 +234,13 @@ export class ViemSettler implements Settler {
       const raw = this.store?.getMeta(STORE_KEY);
       if (raw) {
         this.inflight = deserialize(raw);
-        this.log.info("resuming the settlement batch that was in flight", { batch: this.inflight.batchId, nonce: this.inflight.nonce });
+        if (this.inflight.minedHash === undefined) {
+          this.log.info("found a settlement batch that was in flight; resolving it from the chain", {
+            batch: this.inflight.batchId,
+            nonce: this.inflight.nonce,
+            transactions: this.inflight.attempts.map((a) => a.hash),
+          });
+        }
       }
     }
     if (this.last?.batchId === batch.id) return this.last.results;
@@ -321,11 +329,7 @@ export class ViemSettler implements Settler {
   /** Bind the batch to calldata, a gas limit and a nonce. Nothing is signed yet. */
   private async prepare(batch: Batch): Promise<InFlight> {
     const data = encodeBatch(batch);
-    const estimate = await this.rpc.estimateGas({ from: this.account.address, to: this.exchange, data });
-    // Head-room on top of the estimate: the contract reverts the whole batch with
-    // InsufficientGas when less than its per-match floor is left before a match.
-    let gas = (estimate * 3n) / 2n + this.gasFloorPerMatch;
-    if (gas > this.gasLimitCap) gas = estimate > this.gasLimitCap ? estimate : this.gasLimitCap;
+    const gas = await this.gasLimit(data, batch.matches.length);
     const baseline = new Map<Hex, bigint>();
     for (const m of batch.matches) {
       for (const hash of [m.makerHash, m.takerHash]) {
@@ -335,6 +339,30 @@ export class ViemSettler implements Settler {
     const pending = await this.rpc.getNonce(this.account.address, "pending");
     const nonce = Math.max(pending, this.nextNonce);
     return (this.inflight = { batchId: batch.id, nonce, data, gas, attempts: [], unminedRounds: 0, baseline });
+  }
+
+  /**
+   * Gas limit for the batch. Normally the node's estimate (which on an L2 includes the
+   * L1 data cost) times 1.5, plus the contract's per-match floor: the contract reverts
+   * the whole batch with InsufficientGas when less than the floor is left before a match.
+   * Some nodes cannot estimate this call (their search does not cope with that floor);
+   * then a computed limit is used, after checking with eth_call that the batch goes
+   * through with it.
+   */
+  private async gasLimit(data: Hex, matches: number): Promise<bigint> {
+    const tx = { from: this.account.address, to: this.exchange, data };
+    const clamp = (g: bigint) => (g > this.gasLimitCap ? this.gasLimitCap : g);
+    try {
+      const estimate = await this.rpc.estimateGas(tx);
+      const gas = (estimate * 3n) / 2n + this.gasFloorPerMatch;
+      return gas > this.gasLimitCap ? (estimate > this.gasLimitCap ? estimate : this.gasLimitCap) : gas;
+    } catch (e) {
+      if (e instanceof BatchRevertedError) throw e;
+      const gas = clamp(200_000n + BigInt(matches) * (this.gasFloorPerMatch + 500_000n));
+      this.log.warn("gas estimation failed; using a computed gas limit", { gas, error: errMessage(e) });
+      await this.rpc.call({ ...tx, gas }); // BatchRevertedError if it would revert; other errors: nothing was sent
+      return gas;
+    }
   }
 
   /** Sign the first attempt, or a replacement with higher fees (if the cap leaves room for one). */
@@ -515,6 +543,16 @@ export function viemSettlerRpc(client: PublicClient, exchange: Address): Settler
     async estimateGas({ from, to, data }) {
       try {
         return await client.estimateGas({ account: from, to, data });
+      } catch (e) {
+        if (e instanceof BaseError && e.walk((x) => x instanceof ExecutionRevertedError)) {
+          throw new BatchRevertedError(`settleMatches would revert: ${e.shortMessage}`);
+        }
+        throw e;
+      }
+    },
+    async call({ from, to, data, gas }) {
+      try {
+        await client.call({ account: from, to, data, gas });
       } catch (e) {
         if (e instanceof BaseError && e.walk((x) => x instanceof ExecutionRevertedError)) {
           throw new BatchRevertedError(`settleMatches would revert: ${e.shortMessage}`);

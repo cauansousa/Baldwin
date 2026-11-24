@@ -43,11 +43,18 @@ function boot(path: string, world: { chain: FakeChain; settler: FakeSettler; now
   };
   return { engine, store, place };
 }
-const world = () => ({ chain: new FakeChain(), settler: new FakeSettler(), now: 1000 });
-/** Keep the fake chain's filledSize in step with what the fake settler "mined". */
-const mirror = (w: ReturnType<typeof world>) => {
-  for (const [h, v] of w.settler.filled) w.chain.filled.set(h, v);
+/** The fake chain's filledSize follows what the fake settler "mined". */
+const world = () => {
+  const w = { chain: new FakeChain(), settler: new FakeSettler(), now: 1000 };
+  const settle = w.settler.settle.bind(w.settler);
+  w.settler.settle = async (batch) => {
+    const res = await settle(batch);
+    for (const [h, v] of w.settler.filled) w.chain.filled.set(h, v);
+    return res;
+  };
+  return w;
 };
+const mirror = (_w: unknown) => {};
 
 describe("restart", () => {
   it("restores the book with the same time priority, fill state, flags and trades", async () => {

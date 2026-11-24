@@ -56,6 +56,11 @@ const GLOBAL_ERROR_TEXT: Partial<Record<ErrorName, string>> = {
   StalePrice: "oracle price is stale",
   OnlyReducingAllowed: "exchange paused or market inactive",
   OpenInterestCapExceeded: "open-interest cap reached",
+  SequencerDown: "L2 sequencer is down",
+  SequencerGracePeriodNotOver: "L2 sequencer just came back (grace period)",
+  FeedStale: "oracle feed is stale",
+  InvalidAnswer: "oracle feed returned an invalid answer",
+  FeedNotSet: "oracle feed is not configured",
   // Happens only when an earlier fill of the completing order failed; nobody's fault.
   FillTooSmall: "fill below the minimum size",
 };
@@ -124,11 +129,17 @@ export async function classifyFailure(match: Match, market: MarketConfig, chain:
   const oi = await chain.openInterest(match.marketId);
   if (oi.longs + match.fillSize > market.maxOpenInterest) return { ...UNATTRIBUTED, global: "open-interest cap reached" };
 
-  const [maker, taker] = await Promise.all([
-    marginHeuristic(match.maker, match.fillSize, match.price, market.makerFeeBps, market, indexPrice, chain),
-    marginHeuristic(match.taker, match.fillSize, match.price, market.takerFeeBps, market, indexPrice, chain),
-  ]);
-  return { maker, taker };
+  try {
+    const [maker, taker] = await Promise.all([
+      marginHeuristic(match.maker, match.fillSize, match.price, market.makerFeeBps, market, indexPrice, chain),
+      marginHeuristic(match.taker, match.fillSize, match.price, market.takerFeeBps, market, indexPrice, chain),
+    ]);
+    return { maker, taker };
+  } catch {
+    // Account views revert when the oracle fails for any market the account is in
+    // (stale feed, sequencer down). The fill needed those prices too: a global condition.
+    return { ...UNATTRIBUTED, global: "account views unavailable (oracle)" };
+  }
 }
 
 async function definitiveCause(order: Order, hash: Hex, fillSize: bigint, blockTime: bigint, chain: ChainReader): Promise<string | null> {

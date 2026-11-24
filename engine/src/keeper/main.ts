@@ -36,8 +36,12 @@ async function main(): Promise<void> {
   const keeperChain = new ViemKeeperChain(client, wallet, account, deployment.exchange);
   // Liquidating means taking the position over, which the keeper has to margin itself.
   if (cfg.minFreeCollateral > 0n) {
-    const free = await keeperChain.ownFreeCollateral();
-    if (free < cfg.minFreeCollateral) {
+    // The view reverts while the oracle is unavailable; that must not stop the keeper.
+    const free = await keeperChain.ownFreeCollateral().catch((e) => {
+      log.warn("could not read the keeper's free collateral", { error: errMessage(e) });
+      return null;
+    });
+    if (free !== null && free < cfg.minFreeCollateral) {
       log.warn("keeper has too little free collateral in the Exchange: it will not be able to take over positions", {
         keeper: account.address,
         freeCollateral: free,

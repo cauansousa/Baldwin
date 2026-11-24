@@ -77,6 +77,12 @@ class FakeRpc implements SettlerRpc {
   async estimateFees() {
     return this.fees;
   }
+  calls: bigint[] = [];
+  callError: Error | null = null;
+  async call(tx: { gas: bigint }) {
+    this.calls.push(tx.gas);
+    if (this.callError) throw this.callError;
+  }
   async sendRawTransaction(raw: Hex) {
     this.sent.push(raw);
     const { keccak256 } = await import("viem");
@@ -162,7 +168,7 @@ describe("ViemSettler", () => {
 
     expect(rpc.sent).toHaveLength(1);
     const tx = parseTransaction(rpc.sent[0]!);
-    expect(tx).toMatchObject({ nonce: 7, chainId: DOMAIN.chainId, maxFeePerGas: 100n, maxPriorityFeePerGas: 10n, gas: 300_000n + 500_000n });
+    expect(tx).toMatchObject({ nonce: 7, chainId: DOMAIN.chainId, maxFeePerGas: 100n, maxPriorityFeePerGas: 10n, gas: 300_000n + 700_000n });
     expect(tx.to!.toLowerCase()).toBe(EXCHANGE.toLowerCase());
     const call = decodeFunctionData({ abi: exchangeAbi, data: tx.data! });
     expect(call.functionName).toBe("settleMatches");
@@ -254,6 +260,23 @@ describe("ViemSettler", () => {
     rpc.estimateError = new BatchRevertedError("settleMatches would revert: NotOperator");
     await expect(settler.settle({ id: "b1", matches: [await makeMatch("m1")] })).rejects.toBeInstanceOf(BatchRevertedError);
     expect(rpc.sent).toEqual([]);
+  });
+
+  it("when the node cannot estimate gas (not a revert), a computed limit is used after an eth_call check", async () => {
+    const { rpc, settler } = setup();
+    const matches = [await makeMatch("m1"), await makeMatch("m2")];
+    rpc.estimateError = new Error("transaction gas limit (30311717) is greater than the cap (16777216)");
+    rpc.onSend = () => ok(matches);
+    expect((await settler.settle({ id: "b1", matches })).map((r) => r.status)).toEqual(["settled", "settled"]);
+    const gas = 200_000n + 2n * (700_000n + 500_000n);
+    expect(rpc.calls).toEqual([gas]);
+    expect(parseTransaction(rpc.sent[0]!).gas).toBe(gas);
+    // ... and if that check says the batch reverts, nothing is sent
+    const other = setup();
+    other.rpc.estimateError = new Error("cannot estimate");
+    other.rpc.callError = new BatchRevertedError("settleMatches would revert: NotOperator");
+    await expect(other.settler.settle({ id: "b1", matches })).rejects.toBeInstanceOf(BatchRevertedError);
+    expect(other.rpc.sent).toEqual([]);
   });
 
   it("if a foreign transaction consumed the nonce, the batch is released as definitively unsettled", async () => {

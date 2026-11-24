@@ -917,8 +917,9 @@ export class Engine extends EventEmitter<EngineEvents> {
     const rec = hash && this.orders.get(hash);
     // Without a known expiry keep the entry for as long as any acceptable order could live.
     const until = expiry ?? rec?.order.expiry ?? BigInt(this.clock()) + this.maxTimeToExpiry + 1n;
+    const known = this.dead.has(trader, nonce);
     this.dead.add(trader, nonce, until);
-    this.metrics.inc("orders_cancelled_total");
+    if (!known) this.metrics.inc("orders_cancelled_total");
     if (!rec || rec.userCancelled) return;
     this.cancelRecord(rec, reason);
     this.flush();

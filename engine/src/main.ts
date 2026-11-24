@@ -59,7 +59,7 @@ async function main(): Promise<void> {
     pollIntervalMs: cfg.receiptPollMs,
     gasLimitCap: cfg.gasLimitCap,
     // The contract's per-match gas floor (MATCH_GAS_BASE + MATCH_GAS_PER_MARKET x markets).
-    gasFloorPerMatch: 300_000n + 100_000n * BigInt(marketCount),
+    gasFloorPerMatch: 400_000n + 150_000n * BigInt(marketCount),
     maxFeePerGasCap: cfg.maxFeePerGasCap,
   });
   const engine = new Engine({

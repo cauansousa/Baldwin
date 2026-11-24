@@ -2,6 +2,7 @@
 import { encodeErrorResult, parseAbi } from "viem";
 import { describe, expect, it } from "vitest";
 import { EngineError } from "../src/engine/engine.ts";
+import { SqliteStore } from "../src/store/sqliteStore.ts";
 import type { Match } from "../src/types.ts";
 import { alice, bob, carol, harness, makeOrder, signCancel, signOrder } from "./helpers.ts";
 
@@ -16,7 +17,9 @@ describe("fuzz", () => {
     const problems: string[] = [];
     for (let seed = 1; seed <= 60; seed++) {
       const r = rng(seed);
-      const h = harness({ maxBatchSize: 3, expiryBufferSec: 0, faultThreshold: 1_000_000 });
+      // Every third world runs on the durable store, which must end up identical to memory.
+      const store = seed % 3 === 0 ? new SqliteStore(":memory:") : undefined;
+      const h = harness({ maxBatchSize: 3, expiryBufferSec: 0, faultThreshold: 1_000_000, ...(store ? { store } : {}) });
       const accts = [alice, bob, carol];
       const hashes: { hash: `0x${string}`; acct: typeof alice; nonce: bigint }[] = [];
       h.settler.failWhen = (m) => {
@@ -77,6 +80,24 @@ describe("fuzz", () => {
       }
       for (const m of h.settler.settled) if (m.maker.trader === m.taker.trader) problems.push(`seed ${seed}: self-trade settled`);
       if (eng.queue.length || eng.current) problems.push(`seed ${seed}: queue not drained`);
+      if (store) {
+        const snap = store.load();
+        if (snap.matches.length) problems.push(`seed ${seed}: ${snap.matches.length} matches left in the store`);
+        if (snap.orders.length !== eng.orders.size) problems.push(`seed ${seed}: store has ${snap.orders.length} orders, memory ${eng.orders.size}`);
+        for (const o of snap.orders) {
+          const rec = eng.orders.get(o.hash);
+          const same = rec && rec.remaining === o.remaining && rec.pending === o.pending && rec.filled === o.filled && rec.seq === o.seq &&
+            rec.userCancelled === o.userCancelled && rec.strikes === o.strikes && rec.closed?.status === o.closed?.status;
+          if (!same) problems.push(`seed ${seed} ${o.hash.slice(0, 10)}: store differs from memory`);
+        }
+        // A process started from this store sees the same book.
+        const again = harness({ store, expiryBufferSec: 0 });
+        again.clock.now = h.clock.now;
+        const before = JSON.stringify(h.engine.getOrderBook(1, 1000), (_k, v) => (typeof v === "bigint" ? v.toString() : v));
+        const after = JSON.stringify(again.engine.getOrderBook(1, 1000), (_k, v) => (typeof v === "bigint" ? v.toString() : v));
+        if (before !== after) problems.push(`seed ${seed}: restored book differs`);
+        store.close();
+      }
     }
     expect(problems).toEqual([]);
   }, 60_000);

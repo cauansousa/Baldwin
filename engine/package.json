@@ -7,9 +7,9 @@
     "node": ">=22"
   },
   "scripts": {
-    "dev": "tsx watch src/main.ts",
-    "start": "tsx src/main.ts",
-    "keeper": "tsx src/keeper/main.ts",
+    "dev": "tsx watch --disable-warning=ExperimentalWarning src/main.ts",
+    "start": "tsx --disable-warning=ExperimentalWarning src/main.ts",
+    "keeper": "tsx --disable-warning=ExperimentalWarning src/keeper/main.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
