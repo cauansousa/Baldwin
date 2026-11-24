@@ -6,7 +6,7 @@ import { loadFixture, time } from "@nomicfoundation/hardhat-network-helpers";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { deployTestnet, loadConfig } from "../scripts/deploy-testnet";
+import { deployTestnet, isWellKnownTestAccount, loadConfig } from "../scripts/deploy-testnet";
 import { usdc, wad } from "./helpers";
 
 describe("scripts/deploy-testnet.ts", () => {
@@ -74,6 +74,11 @@ describe("scripts/deploy-testnet.ts", () => {
       expect(() => loadConfig({ ...env, MAX_FUNDING_RATE_BPS: "101" })).to.throw("MAX_FUNDING_RATE_BPS must be at most 100");
       expect(() => loadConfig({ ...env, MAX_PRICE_DEVIATION_BPS: "995" })).to.throw("below MAINTENANCE_MARGIN_BPS");
       expect(() => loadConfig({ ...env, MAINTENANCE_MARGIN_BPS: "2500" })).to.throw("margins must satisfy");
+      // fee is charged on up to (1 + band) of the notional: 500 + 99 * 1.05 > 600
+      expect(() => loadConfig({ ...env, MAINTENANCE_MARGIN_BPS: "600", MAKER_FEE_BPS: "99", LIQUIDATION_PENALTY_BPS: "100" })).to.throw("highest fee x (1 + band)");
+      expect(() => loadConfig({ ...env, MAX_FUNDING_RATE_BPS: "70" })).to.throw("8 x MAX_FUNDING_RATE_BPS");
+      expect(() => loadConfig({ ...env, BTC_MIN_ORDER_SIZE: "0" })).to.throw("BTC-USD: the minimum order size must be positive");
+      expect(() => loadConfig({ ...env, ETH_MAX_OPEN_INTEREST: "0" })).to.throw("ETH-USD: the open interest cap must be positive");
     });
 
     it("applies the documented defaults", async () => {
@@ -117,6 +122,29 @@ describe("scripts/deploy-testnet.ts", () => {
       await expectRefusal({ ...env, ETH_USD_FEED: user.address }, "ETH-USD feed " + user.address + " has no contract code");
       await expectRefusal({ ...env, SEQUENCER_UPTIME_FEED: user.address }, "has no contract code");
       await expectRefusal({ ...env, ALLOW_EOA_OWNER: "false" }, "expected a multisig");
+      // the deployer as owner is a single key too
+      const deployer = (await ethers.getSigners())[0].address;
+      await expectRefusal({ ...env, OWNER_ADDRESS: deployer, ALLOW_EOA_OWNER: "false" }, `OWNER_ADDRESS ${deployer} has no contract code`);
+    });
+
+    it("when the operator or fee recipient is one of the contracts involved", async () => {
+      const { env, deployer } = await loadFixture(externals);
+      const nonce = await ethers.provider.getTransactionCount(deployer.address);
+      const oracleToBe = ethers.getCreateAddress({ from: deployer.address, nonce });
+      const exchangeToBe = ethers.getCreateAddress({ from: deployer.address, nonce: nonce + 1 });
+      await expectRefusal({ ...env, FEE_RECIPIENT: env.USDC_ADDRESS }, "is the USDC token");
+      await expectRefusal({ ...env, OPERATOR_ADDRESS: env.USDC_ADDRESS }, "is the USDC token");
+      await expectRefusal({ ...env, FEE_RECIPIENT: exchangeToBe }, "is the Exchange about to be deployed");
+      await expectRefusal({ ...env, OPERATOR_ADDRESS: exchangeToBe }, "is the Exchange about to be deployed");
+      await expectRefusal({ ...env, FEE_RECIPIENT: oracleToBe }, "is the ChainlinkOracle about to be deployed");
+      await expectRefusal({ ...env, OPERATOR_ADDRESS: env.BTC_USD_FEED }, "is the BTC-USD feed");
+      await expectRefusal({ ...env, FEE_RECIPIENT: env.SEQUENCER_UPTIME_FEED }, "is the sequencer uptime feed");
+      expect(() => loadConfig({ ...env, FEE_RECIPIENT: ethers.ZeroAddress })).to.throw("FEE_RECIPIENT is not a valid non-zero address");
+      expect(() => loadConfig({ ...env, OPERATOR_ADDRESS: ethers.ZeroAddress })).to.throw("OPERATOR_ADDRESS is not a valid non-zero address");
+      // the prediction is right: the real deployment lands on those addresses
+      const result = await run(env);
+      expect(result.deployment.oracle).to.equal(oracleToBe);
+      expect(result.deployment.exchange).to.equal(exchangeToBe);
     });
 
     it("when the token is not a 6-decimal ERC-20", async () => {
@@ -166,6 +194,8 @@ describe("scripts/deploy-testnet.ts", () => {
       // cannot switch chain id in-process; assert the guard exists by its list
       const source = fs.readFileSync(path.join(__dirname, "..", "scripts", "deploy-testnet.ts"), "utf8");
       expect(source).to.match(/MAINNET_CHAIN_IDS = \[1, .*42161/);
+    // by chain id, not by network name
+    expect(source).to.contain("if (MAINNET_CHAIN_IDS.includes(chainId)) throw");
     });
   });
 
@@ -238,10 +268,50 @@ describe("scripts/deploy-testnet.ts", () => {
     expect(await exchange.balanceOf(user.address)).to.equal(usdc(1_000));
   });
 
+  it("recognizes the well-known test accounts", async () => {
+    const signers = await ethers.getSigners();
+    // hardhat's default accounts are exactly those
+    expect(isWellKnownTestAccount(signers[0].address)).to.equal(true);
+    expect(isWellKnownTestAccount(signers[0].address.toLowerCase())).to.equal(true);
+    expect(isWellKnownTestAccount(signers[19].address)).to.equal(true);
+    expect(isWellKnownTestAccount(ethers.Wallet.createRandom().address)).to.equal(false);
+    // The refusal itself needs a chain id other than 31337 and is exercised by the dry
+    // run (README); here: the guard is in place and is keyed on the chain id.
+    const source = fs.readFileSync(path.join(__dirname, "..", "scripts", "deploy-testnet.ts"), "utf8");
+    expect(source).to.contain("chainId !== LOCAL_CHAIN_ID && !config.allowTestKey && isWellKnownTestAccount(deployer.address)");
+  });
+
+  it("leaves a record when the setup fails after contracts were deployed", async () => {
+    const { env, file } = await loadFixture(externals);
+    fs.rmSync(file, { force: true });
+    const config = loadConfig(env);
+    // passes the script's own checks but is rejected by the contract when the second market is added
+    config.markets[1].minOrderSize = 0n;
+    let failed = false;
+    try {
+      await deployTestnet(config, quiet);
+    } catch {
+      failed = true;
+    }
+    expect(failed).to.equal(true);
+    expect(fs.existsSync(file)).to.equal(false); // no file that looks like a finished deployment
+    const partial = JSON.parse(fs.readFileSync(`${file}.incomplete`, "utf8"));
+    expect(partial.note).to.contain("INCOMPLETE");
+    expect(ethers.isAddress(partial.oracle)).to.equal(true);
+    expect(ethers.isAddress(partial.exchange)).to.equal(true);
+    expect(partial.completedSteps).to.deep.equal(["deploy ChainlinkOracle", "deploy Exchange", "add market 0 BTC-USD"]);
+    expect(await ethers.provider.getCode(partial.exchange)).to.not.equal("0x");
+
+    // a later successful run removes the stale record
+    await run(env);
+    expect(fs.existsSync(file)).to.equal(true);
+    expect(fs.existsSync(`${file}.incomplete`)).to.equal(false);
+  });
+
   it("works without a sequencer feed and with the deployer as owner", async () => {
     const { env, deployer } = await loadFixture(externals);
     const lines: string[] = [];
-    const result = await deployTestnet(loadConfig({ ...env, SEQUENCER_UPTIME_FEED: "", OWNER_ADDRESS: deployer.address, ALLOW_EOA_OWNER: "false" }), (l) => lines.push(l));
+    const result = await deployTestnet(loadConfig({ ...env, SEQUENCER_UPTIME_FEED: "", OWNER_ADDRESS: deployer.address, ALLOW_EOA_OWNER: "true" }), (l) => lines.push(l));
     expect(result.ownershipPending).to.equal(false);
     expect(await result.oracle.sequencerUptimeFeed()).to.equal(ethers.ZeroAddress);
     expect(await result.exchange.pendingOwner()).to.equal(ethers.ZeroAddress);

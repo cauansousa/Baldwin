@@ -77,16 +77,17 @@ contract Exchange is IExchange, Ownable2Step, ReentrancyGuard, EIP712 {
     ///      which is an upper bound for the match itself, with the ChainlinkOracle
     ///      adapter, mock aggregators and the sequencer uptime check enabled. The two most
     ///      expensive cases found, with both accounts holding a position in every market,
-    ///      cold storage, a funding accrual and pending funding to settle:
-    ///        - both sides flip:   367k gas with 2 markets, 647k with 8 (~47k per market);
-    ///        - both sides reduce: 408k gas with 2 markets, 810k with 8 (~67k per market;
+    ///      cold storage, pending funding to settle and a funding accrual due in every
+    ///      market:
+    ///        - both sides flip:   380k gas with 2 markets, 787k with 8 (~68k per market);
+    ///        - both sides reduce: 421k gas with 2 markets, 951k with 8 (~88k per market;
     ///          a reducing side is valued twice).
-    ///      The floor is 700k for 2 markets (1.7x the measurement) and 1.6M for 8 (2.0x).
-    ///      The headroom is for real Chainlink feeds, which sit behind a proxy and cost
-    ///      more per read than the mock aggregators, and for the 1/64 of gas withheld
-    ///      from the inner call. Re-measure on a fork before mainnet.
+    ///      The floor is 800k for 2 markets (1.9x the measurement), 2.0M for 8 (2.1x) and
+    ///      3.6M at MAX_MARKETS. The headroom is for real Chainlink feeds, which sit
+    ///      behind a proxy and cost more per read than the mock aggregators, and for the
+    ///      1/64 of gas withheld from the inner call. Re-measure on a fork before mainnet.
     uint256 public constant MATCH_GAS_BASE = 400_000;
-    uint256 public constant MATCH_GAS_PER_MARKET = 150_000;
+    uint256 public constant MATCH_GAS_PER_MARKET = 200_000;
 
     bytes32 public constant ORDER_TYPEHASH = keccak256(
         "Order(address trader,uint32 marketId,bool isBuy,bool reduceOnly,uint256 size,uint256 limitPrice,uint256 nonce,uint64 expiry)"

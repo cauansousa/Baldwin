@@ -36,6 +36,7 @@ async function main() {
     `SEQUENCER_UPTIME_FEED=${await sequencer.getAddress()}`,
     `OWNER_ADDRESS=${process.env.DRY_RUN_OWNER ?? (owner ?? deployer).address}`,
     `ALLOW_EOA_OWNER=true`,
+    `ALLOW_TEST_KEY=true`,
     `OPERATOR_ADDRESS=${(operator ?? deployer).address}`,
     `FEE_RECIPIENT=${(feeRecipient ?? deployer).address}`,
   ];

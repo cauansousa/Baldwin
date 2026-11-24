@@ -112,6 +112,27 @@ describe("Review regressions", () => {
       expect(await exchange.totalBadDebt()).to.equal(0);
     });
 
+    it("variant: closing the whole position in-band before liquidation is allowed and leaves nothing behind", async () => {
+      // Not an attack: the spec lets an account reduce risk at any time. A full close
+      // collects no penalty (there is nothing left to liquidate) and can create no bad
+      // debt, because the account must end with non-negative value.
+      const f = await stripFixture();
+      const { exchange, oracle, ctx, alice, dave, liquidator } = f;
+      await exchange.connect(dave).deposit(usdc(20_000));
+      await oracle.setPrice(BTC, wad(54_700));
+      expect(await exchange.isLiquidatable(alice.address)).to.equal(true);
+      // above the band: no
+      expect(await ctx.settleError(await ctx.trade(alice, dave, ONE, wad(57_436)))).to.equal("PriceOutOfBand");
+      // at the top of the band: she pays 2,735 over the index plus the fee and is flat
+      await ctx.settleOk([await ctx.trade(alice, dave, ONE, wad(57_435))]);
+      expect((await exchange.getPosition(alice.address, BTC)).size).to.equal(0);
+      // 5,375 - 2,735 - 11.487 (maker fee)
+      expect(await exchange.balanceOf(alice.address)).to.equal(usdc("2628.513"));
+      expect(await exchange.isLiquidatable(alice.address)).to.equal(false);
+      await expect(exchange.connect(liquidator).liquidate(alice.address, BTC, MAX)).to.be.revertedWithCustomError(exchange, "NoPosition");
+      expect(await exchange.totalBadDebt()).to.equal(0);
+    });
+
     it("variant: no reducing fill at a stale price", async () => {
       const f = await stripFixture();
       const { ctx, alice, dave } = f;
@@ -253,7 +274,7 @@ describe("Review regressions", () => {
       await exchange.connect(alice).deposit(usdc(50_000));
       await exchange.connect(bob).deposit(usdc(50_000));
       const floor = (await exchange.MATCH_GAS_BASE()) + (await exchange.MATCH_GAS_PER_MARKET()) * 2n;
-      expect(floor).to.equal(700_000n);
+      expect(floor).to.equal(800_000n);
 
       const m = await ctx.trade(alice, bob, ONE, BTC_PRICE);
       await expect(exchange.connect(ctx.operator).settleMatches([m], { gasLimit: 400_000 })).to.be.revertedWithCustomError(exchange, "InsufficientGas");
@@ -328,9 +349,13 @@ describe("Review regressions", () => {
           for (let i = 0; i < n; i++) {
             await ctx.settleOk([await ctx.trade(alice, bob, ONE, (wad(MARKET_PRICE(i)) * 104n) / 100n, { marketId: i })]);
           }
+          // pending funding in every market ...
           await time.increase(HOUR + 5);
           await refresh();
-          for (let i = 1; i < n; i++) await exchange.updateFunding(i);
+          for (let i = 0; i < n; i++) await exchange.updateFunding(i);
+          // ... and every market due for another accrual when the match is settled
+          await time.increase(HOUR + 5);
+          await refresh();
           const floor = (await exchange.MATCH_GAS_BASE()) + (await exchange.MATCH_GAS_PER_MARKET()) * BigInt(n);
 
           const cases = {

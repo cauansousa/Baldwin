@@ -31,6 +31,7 @@ export interface TestnetConfig {
   sequencerGracePeriod: bigint;
   owner: string;
   allowEoaOwner: boolean;
+  allowTestKey: boolean;
   operator: string;
   feeRecipient: string;
   maxPriceAge: bigint;
@@ -52,6 +53,20 @@ const AGGREGATOR_ABI = [
 const ERC20_ABI = ["function decimals() view returns (uint8)", "function symbol() view returns (string)"];
 
 const ARBITRUM_SEPOLIA_CHAIN_ID = 421614;
+const LOCAL_CHAIN_ID = 31337;
+
+/**
+ * True for the 20 accounts of the Hardhat/Anvil default mnemonic. Their private keys are
+ * public: anything they own on a public network can be taken by anyone.
+ */
+export function isWellKnownTestAccount(address: string): boolean {
+  const { ethers } = hre;
+  const mnemonic = ethers.Mnemonic.fromPhrase("test test test test test test test test test test test junk");
+  for (let i = 0; i < 20; i++) {
+    if (ethers.HDNodeWallet.fromMnemonic(mnemonic, `m/44'/60'/0'/0/${i}`).address === ethers.getAddress(address)) return true;
+  }
+  return false;
+}
 /** Chains with real money: this script is for testnets only. */
 const MAINNET_CHAIN_IDS = [1, 10, 56, 137, 8453, 42161, 43114];
 
@@ -107,6 +122,7 @@ export function loadConfig(env: Env): TestnetConfig {
     sequencerGracePeriod: integer("SEQUENCER_GRACE_PERIOD", 3600n),
     owner: address("OWNER_ADDRESS"),
     allowEoaOwner: raw("ALLOW_EOA_OWNER") === "true",
+    allowTestKey: raw("ALLOW_TEST_KEY") === "true",
     operator: address("OPERATOR_ADDRESS"),
     feeRecipient: address("FEE_RECIPIENT"),
     maxPriceAge: integer("MAX_PRICE_AGE", btcStaleness > ethStaleness ? btcStaleness : ethStaleness),
@@ -154,8 +170,15 @@ export function loadConfig(env: Env): TestnetConfig {
   }
   if (maxFee > 100n) problems.push("fees must be at most 100 bps");
   if (c.liquidationPenaltyBps > c.maintenanceMarginBps) problems.push("LIQUIDATION_PENALTY_BPS must not exceed MAINTENANCE_MARGIN_BPS");
-  if (c.maxPriceDeviationBps + maxFee >= c.maintenanceMarginBps) {
-    problems.push("MAX_PRICE_DEVIATION_BPS + highest fee must be below MAINTENANCE_MARGIN_BPS");
+  if (c.maxPriceDeviationBps * 10_000n + maxFee * (10_000n + c.maxPriceDeviationBps) >= c.maintenanceMarginBps * 10_000n) {
+    problems.push("MAX_PRICE_DEVIATION_BPS + highest fee x (1 + band) must be below MAINTENANCE_MARGIN_BPS");
+  }
+  if (c.maxFundingRateBps * 8n + c.maxPriceDeviationBps >= c.maintenanceMarginBps) {
+    problems.push("8 x MAX_FUNDING_RATE_BPS + MAX_PRICE_DEVIATION_BPS must be below MAINTENANCE_MARGIN_BPS");
+  }
+  for (const m of c.markets) {
+    if (m.minOrderSize === 0n) problems.push(`${m.symbol}: the minimum order size must be positive`);
+    if (m.maxOpenInterest === 0n) problems.push(`${m.symbol}: the open interest cap must be positive`);
   }
 
   if (problems.length) throw new Error(`Configuration problems:\n  - ${problems.join("\n  - ")}`);
@@ -171,7 +194,14 @@ export async function deployTestnet(config: TestnetConfig, log: Log = console.lo
   const [deployer] = await ethers.getSigners();
   if (!deployer) throw new Error("No deployer account: set DEPLOYER_PRIVATE_KEY");
   const chainId = Number((await provider.getNetwork()).chainId);
+  // By chain id, whatever the network is called in the config.
   if (MAINNET_CHAIN_IDS.includes(chainId)) throw new Error(`Chain ${chainId} is a mainnet; this script is for testnets only`);
+  if (chainId !== LOCAL_CHAIN_ID && !config.allowTestKey && isWellKnownTestAccount(deployer.address)) {
+    throw new Error(
+      `The deployer ${deployer.address} is a well-known Hardhat/Anvil test account whose private key is public. ` +
+        "Use a real key (or set ALLOW_TEST_KEY=true for a local rehearsal).",
+    );
+  }
   if (network.name === "arbitrumSepolia" && chainId !== ARBITRUM_SEPOLIA_CHAIN_ID) {
     throw new Error(`The RPC endpoint reports chain ${chainId}, expected ${ARBITRUM_SEPOLIA_CHAIN_ID}`);
   }
@@ -254,8 +284,27 @@ export async function deployTestnet(config: TestnetConfig, log: Log = console.lo
     log("sequencer uptime feed: disabled");
   }
 
-  if (config.owner !== deployer.address && !(await hasCode(config.owner)) && !config.allowEoaOwner) {
+  // Also when the owner is the deployer itself: a single key as owner must be a decision.
+  if (!(await hasCode(config.owner)) && !config.allowEoaOwner) {
     problems.push(`OWNER_ADDRESS ${config.owner} has no contract code (expected a multisig); set ALLOW_EOA_OWNER=true to accept a plain account`);
+  }
+
+  // The operator and the fee recipient must be accounts somebody controls, not one of the
+  // contracts involved (fees credited to such an address would be stuck).
+  const deployerNonce = await provider.getTransactionCount(deployer.address);
+  const reserved: Record<string, string> = {
+    [config.usdc]: "the USDC token",
+    [config.sequencerUptimeFeed]: "the sequencer uptime feed",
+    [ethers.getCreateAddress({ from: deployer.address, nonce: deployerNonce })]: "the ChainlinkOracle about to be deployed",
+    [ethers.getCreateAddress({ from: deployer.address, nonce: deployerNonce + 1 })]: "the Exchange about to be deployed",
+  };
+  for (const m of config.markets) reserved[m.feed] = `the ${m.symbol} feed`;
+  reserved[ethers.ZeroAddress] = "the zero address";
+  for (const [name, value] of [
+    ["OPERATOR_ADDRESS", config.operator],
+    ["FEE_RECIPIENT", config.feeRecipient],
+  ]) {
+    if (reserved[value]) problems.push(`${name} ${value} is ${reserved[value]}`);
   }
 
   if (problems.length) throw new Error(`Preflight failed, nothing was deployed:\n  - ${problems.join("\n  - ")}`);
@@ -266,6 +315,25 @@ export async function deployTestnet(config: TestnetConfig, log: Log = console.lo
   await oracle.waitForDeployment();
   const oracleAddress = await oracle.getAddress();
   log(`ChainlinkOracle deployed at ${oracleAddress}`);
+
+  // From here on contracts exist. Keep a record on disk after every step, so that a
+  // failure half-way leaves a trace of what was deployed and how far the setup got.
+  const file = config.deploymentFile ?? path.join(__dirname, "..", "deployments", `${network.name}.json`);
+  const incompleteFile = `${file}.incomplete`;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const progress: Record<string, unknown> = {
+    note: "INCOMPLETE deployment: the script did not finish. Do not use these contracts.",
+    chainId,
+    deployer: deployer.address,
+    oracle: oracleAddress,
+    completedSteps: ["deploy ChainlinkOracle"],
+  };
+  const record = (step?: string, extra: Record<string, unknown> = {}) => {
+    Object.assign(progress, extra);
+    if (step) (progress.completedSteps as string[]).push(step);
+    fs.writeFileSync(incompleteFile, JSON.stringify(progress, null, 2) + "\n");
+  };
+  record();
 
   const exchangeArgs = [
     config.usdc,
@@ -280,6 +348,7 @@ export async function deployTestnet(config: TestnetConfig, log: Log = console.lo
   await exchange.waitForDeployment();
   const exchangeAddress = await exchange.getAddress();
   log(`Exchange deployed at ${exchangeAddress}`);
+  record("deploy Exchange", { exchange: exchangeAddress });
 
   const markets: { marketId: number; symbol: string }[] = [];
   for (const [marketId, m] of config.markets.entries()) {
@@ -301,11 +370,13 @@ export async function deployTestnet(config: TestnetConfig, log: Log = console.lo
     const index = await exchange.indexPrice(marketId);
     log(`market ${marketId} ${m.symbol} added, index price ${ethers.formatUnits(index, 18)}`);
     markets.push({ marketId, symbol: m.symbol });
+    record(`add market ${marketId} ${m.symbol}`);
   }
   if (Number(await exchange.marketCount()) !== config.markets.length) throw new Error("unexpected market count");
 
   await (await exchange.setOperator(config.operator, true)).wait();
   log(`operator ${config.operator}`);
+  record("set operator");
 
   const ownershipPending = config.owner !== deployer.address;
   if (ownershipPending) {
@@ -315,9 +386,8 @@ export async function deployTestnet(config: TestnetConfig, log: Log = console.lo
 
   // --------------------------------------------------------------- output
   const deployment = { chainId, exchange: exchangeAddress, usdc: config.usdc, oracle: oracleAddress, markets };
-  const file = config.deploymentFile ?? path.join(__dirname, "..", "deployments", `${network.name}.json`);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(deployment, null, 2) + "\n");
+  fs.rmSync(incompleteFile, { force: true });
 
   log("");
   log("=== summary ===");

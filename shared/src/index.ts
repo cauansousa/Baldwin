@@ -90,6 +90,9 @@ export const EXCHANGE_ABI = [
   "function lastFundingTime(uint32 marketId) view returns (uint256)",
   "function maxPriceDeviationBps() view returns (uint256)",
   "function totalBadDebt() view returns (uint256)",
+  "function isLiquidatableIn(address trader, uint32 marketId) view returns (bool)",
+  "function MATCH_GAS_BASE() view returns (uint256)",
+  "function MATCH_GAS_PER_MARKET() view returns (uint256)",
   "error InsufficientMargin(address trader)",
   "error NegativeAccountValue(address trader)",
   "error ReduceOnlyViolated(address trader)",
@@ -103,6 +106,7 @@ export const EXCHANGE_ABI = [
   "error OrderIsCancelled()",
   "error OrderExpired()",
   "error NonceNotIncreased()",
+  "error NonceTooHigh()",
   // Raised by ChainlinkOracle and bubbled through the Exchange.
   "error SequencerDown()",
   "error SequencerGracePeriodNotOver()",

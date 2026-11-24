@@ -36,7 +36,9 @@ is for mocks only.
 Constructor: `Exchange(usdc, oracle, owner, feeRecipient, maxPriceAge, maxFundingRateBps,
 maxPriceDeviationBps)`; the funding cap may be at most 100 bps per hour.
 Admin functions (not part of `IExchange`): `addMarket`, `updateMarket`, `setOperator`,
-`setFeeRecipient`, `setPaused`, and the two-step `transferOwnership` / `acceptOwnership`.
+`setFeeRecipient`, `setPaused`, `setOracle`, and the two-step `transferOwnership` /
+`acceptOwnership` (`renounceOwnership` is disabled). At most 16 markets.
+`deploy.ts` refuses to run on any chain but 31337.
 
 ## Testnet deployment (Arbitrum Sepolia)
 
@@ -55,8 +57,11 @@ USDC token and existing Chainlink feeds. It deploys no mocks and mints nothing.
    Before the first transaction the script refuses to continue if
    - a required variable is missing or malformed, or the parameters break a contract rule;
    - the RPC is not chain 421614 (or is a known mainnet);
-   - USDC, a feed or the sequencer feed has no code; the owner has no code
-     (unless `ALLOW_EOA_OWNER=true`);
+   - the deployer is one of the well-known Hardhat/Anvil test accounts (unless
+     `ALLOW_TEST_KEY=true`, for rehearsals);
+   - USDC, a feed or the sequencer feed has no code; the owner has no code, which
+     includes the deployer itself (unless `ALLOW_EOA_OWNER=true`);
+   - the operator or the fee recipient is one of the contracts involved;
    - USDC does not have 6 decimals;
    - a feed's answer is not positive, is older than its staleness limit, is outside a
      plausible range, or the two feeds look swapped; the sequencer is down or inside the
@@ -64,7 +69,11 @@ USDC token and existing Chainlink feeds. It deploys no mocks and mints nothing.
 
    Then it deploys, sets the feeds, adds BTC-USD (0) and ETH-USD (1), reads the index
    price of both through the exchange, sets the operator, starts the ownership transfer
-   of both contracts and writes `deployments/arbitrumSepolia.json`.
+   of both contracts and writes `deployments/arbitrumSepolia.json`. From the first
+   deployed contract on, progress is kept in `deployments/arbitrumSepolia.json.incomplete`
+   (addresses and completed steps); it is removed on success. If the script fails
+   half-way, that file says what exists; fix the cause and run again (a new pair of
+   contracts is deployed, the abandoned ones are harmless).
 4. **The multisig must call `acceptOwnership()` on the Exchange and on the
    ChainlinkOracle.** Until then the deployer key is still the owner of both.
 5. Verify the sources with the two commands the script prints, e.g.
@@ -80,12 +89,12 @@ chain-id check, preflight, deployment, output file) can be rehearsed against a l
 that reports chain id 421614:
 
 ```sh
-HARDHAT_CHAIN_ID=421614 npx hardhat node --port 8555            # terminal 1
+HARDHAT_CHAIN_ID=421614 npx hardhat node --port 8555            # terminal 1 (any free port)
 # terminal 2 (the key is hardhat's public test account #0)
 export ARBITRUM_SEPOLIA_RPC_URL=http://127.0.0.1:8555
 export DEPLOYER_PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 npx hardhat run scripts/dry-run-mocks.ts --network arbitrumSepolia > /tmp/dry.env
-set -a; . /tmp/dry.env; set +a
+set -a; . /tmp/dry.env; set +a      # includes ALLOW_TEST_KEY=true and ALLOW_EOA_OWNER=true
 DEPLOYMENT_FILE=/tmp/dry-deployment.json npm run deploy:testnet
 ```
 
@@ -117,17 +126,25 @@ including each refusal.
   `|price − index| × 10000 ≤ index × maxPriceDeviationBps` (inclusive), else
   `PriceOutOfBand(price, index)`. This stops accounts from moving equity between them
   through off-market fills and keeps the mark price next to the index. Market parameters
-  must satisfy `maxPriceDeviationBps + max(makerFeeBps, takerFeeBps) < maintenanceMarginBps`.
+  must satisfy `band + maxFee × (1 + band) < maintenance` (the fee is charged on the fill
+  notional, which can be up to `1 + band` of the index notional) and
+  `8 × maxFundingRateBps + band < maintenance`.
 - **Fill size.** Both orders must be at least `minOrderSize`; so must the fill, unless it
   completes one of the two orders or closes one side's position entirely.
 - **Margin.** After a fill each side must satisfy initial margin, unless it strictly
   reduced its position without flipping. A reducing side must not end with negative value
-  (`NegativeAccountValue`) and must either satisfy initial margin or not have lowered its
-  `accountValue − maintenance requirement` (all markets) across the fill
-  (`InsufficientMargin`). Withdrawals are allowed up to
-  `freeCollateral = accountValue − initial margin`, so unrealized profit is withdrawable
-  and the cash balance can be negative; `withdraw` first accrues due funding in the
-  account's markets.
+  (`NegativeAccountValue`). If it then does not satisfy initial margin, it must not have
+  lowered `accountValue − maintenance requirement`, and, if it was below maintenance
+  before the fill, it must not have lowered `accountValue / maintenance requirement`
+  either (`InsufficientMargin`). The last rule stops a liquidatable account from paying
+  its remaining equity to a counterparty through band-edge reductions while keeping most
+  of its position; it can still reduce at fair prices or close completely. Withdrawals
+  are allowed up to `freeCollateral = accountValue − initial margin`, so unrealized
+  profit is withdrawable and the cash balance can be negative.
+- **Funding accrual.** `withdraw`, fills and liquidations first accrue due funding in
+  every market the accounts involved hold a position in, so margin checks see it. The
+  views (`accountValue`, `freeCollateral`, `isLiquidatable`) cannot accrue and may be
+  ahead of what a transaction will find until `updateFunding` has run.
 - **Funding.** `updateFunding` (anyone; also called by fills and liquidations of that
   market) acts at most once per hour: `rate = clamp((mark − index)/index, ±cap)`,
   `cumulativeFunding += index × rate × elapsed / 1h`, with `elapsed` capped at 8 hours.
@@ -138,6 +155,14 @@ including each refusal.
   the account's remaining value) is split 50/50 between liquidator and insurance fund.
   When the account has no positions left and a negative balance, the insurance fund
   covers it; the remainder is added to `totalBadDebt` and reported in the event.
+  The liquidated market needs a fresh price. The trader's positions in *other* markets
+  whose price is unavailable (stale, or the oracle reverts) are valued at entry: no
+  unrealized PnL, maintenance on the entry notional. Without this, one dead feed or a dust
+  position in a market without a price would make an account unliquidatable everywhere.
+  The trade-off: **a trader whose buffer is unrealized profit in a market without a price
+  can be liquidated although truly healthy** (and one with an unrealized loss there is
+  judged too kindly). `isLiquidatableIn(trader, marketId)` answers with the same
+  valuation; `isLiquidatable` stays strict and reverts.
 - **Rounding.** Always against the trader: buyers pay the notional rounded up, sellers
   receive it rounded down, fees/penalties/margin requirements round up, funding payers
   pay the ceiling and receivers get the floor. Dust stays in the contract unassigned.
@@ -163,14 +188,18 @@ including each refusal.
   which side is the maker (i.e. which of two crossing limit prices is used). It can censor
   and it can move the mark price with small fills, but it cannot exceed any signed limit,
   size, expiry or reduce-only flag, and it cannot move funds on its own.
-- **Owner**: fully trusted for parameters. It can add/update markets (margins, fees up to
+- **Owner**: fully trusted, for parameters and, through `setOracle`, for prices: **the
+  owner can replace the oracle and thereby set any price, liquidate anyone and withdraw
+  the collateral as "profit". `setOracle` exists so that a permanently broken oracle can
+  be replaced; before mainnet the owner must be a multisig behind a timelock.** It can add/update markets (margins, fees up to
   1%, penalty up to the maintenance margin, caps), set operators and the fee recipient,
   and pause. Raising the maintenance margin makes accounts liquidatable, so the owner can
   effectively take traders' margin; it must be a multisig behind a timelock. Ownership
   moves in two steps (`Ownable2Step`): the new owner has to accept.
 - **Oracle**: fully trusted. A wrong price lets positions be opened, liquidated and profits
-  withdrawn at that price. The oracle address is immutable in the exchange; the Chainlink
-  adapter's owner chooses the feeds and their staleness limits (two-step ownership too).
+  withdrawn at that price. The exchange's owner can replace the oracle; the Chainlink
+  adapter's owner chooses the feeds, their staleness limits and the sequencer uptime
+  feed (settable, `address(0)` disables it; two-step ownership too).
   The adapter reverts while the L2 sequencer is down and for a grace period after it is
   back, which freezes fills, liquidations and withdrawals of accounts with positions.
 - **Collateral token**: assumed to be a standard 6-decimal ERC-20 without transfer fees,
@@ -208,8 +237,10 @@ including each refusal.
 - **Oracle**: no deviation check/circuit breaker and no fallback feed. The sequencer
   check and the feed reads were only tested against mock aggregators, never against the
   real feeds. A market whose oracle call reverts (including sequencer downtime) freezes
-  withdrawals and liquidations of every account that has a position in it. The oracle
-  cannot be replaced without redeploying the exchange.
+  fills and withdrawals of every account that has a position in it, and liquidations of
+  positions in that market. Recovery is manual (`setOracle`, `setFeed`,
+  `setSequencerUptimeFeed`); there is **no emergency settlement mode** that would let
+  users exit a market whose price never comes back.
 - **Gap risk**: unrealized profit is withdrawable immediately, while the losing side pays
   only when it closes or is liquidated. A price gap larger than the maintenance margin
   before liquidation becomes bad debt (also when both sides belong to one person).
@@ -221,14 +252,17 @@ including each refusal.
   closed with an order of at least the minimum size that is filled for exactly the
   position. A reducing fill worth less than a few millionths of a USDC can be rejected
   for an account under initial margin, because fee rounding outweighs the margin released.
-- The batch gas floor (700k gas for 2 markets) was measured with the Chainlink adapter
+- The batch gas floor (800k gas for 2 markets, 2.0M for 8) was measured with the Chainlink adapter
   over mock aggregators; real feeds sit behind a proxy and cost more per read. Re-measure
   on a fork or on the testnet. It grows with the number of markets.
 - EOA signatures only (no ERC-1271 smart accounts, no compact signatures). Orders have no
   time-in-force or post-only semantics on-chain; nonces are only cancellation handles.
-  `renounceOwnership` is not disabled.
+  `cancelAllOrders` accepts values up to one day ahead in the (ms timestamp << 64) nonce
+  scheme, so a mistaken call can block new orders for at most a day.
 - Every margin check loops over all markets (one storage read each, plus an oracle call
-  per open position), so gas grows with the number of markets.
+  per open position), so gas grows with the number of markets (capped at 16).
+- A liquidatable account can still close its whole position in-band before it is
+  liquidated and thereby pay no penalty; only partial reductions on bad terms are refused.
 - No timelock and no parameter change delays; pause has no guardian role. Until the
   multisig accepts ownership after a deployment, a single deployer key is the owner.
 - The testnet deployment script has only run against a local node with stand-in

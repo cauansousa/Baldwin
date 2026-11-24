@@ -39,7 +39,8 @@ The source of truth for the on-chain interface is
   balance whenever a position is touched.
 - Liquidation: anyone may take over a position of an account below maintenance margin at
   the index price. The liquidator becomes the counterparty, so it needs its own collateral
-  and must satisfy initial margin afterwards. Penalty (bps of notional) is split between liquidator and insurance
+  and must satisfy initial margin afterwards. A position of the liquidated trader in another
+  market whose price is unavailable is valued at entry, so one stale feed cannot shield an account. Penalty (bps of notional) is split between liquidator and insurance
   fund. Losses beyond the account's value are covered by the insurance fund; any
   remainder is recorded as bad debt (event) — socialized loss/ADL is out of MVP scope.
 - Oracle: `IOracle.getPrice(marketId) → (priceWad, updatedAt)`; stale prices revert.
