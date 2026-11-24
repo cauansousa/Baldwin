@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineChain, isAddress, isHex, type Chain } from "viem";
+import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
 import type { Deployment } from "../../shared/src/index.ts";
 import type { Hex } from "./types.ts";
 
@@ -32,6 +33,22 @@ export function privateKey(env: Env, name: string): Hex {
   const key = raw.startsWith("0x") ? raw : `0x${raw}`;
   if (!isHex(key) || key.length !== 66) throw new Error(`${name} must be a 32-byte hex private key`);
   return key;
+}
+
+/** Account for a key; a key the curve rejects is reported by variable name only, never by value. */
+export function accountFromKey(key: Hex, name: string): PrivateKeyAccount {
+  try {
+    return privateKeyToAccount(key);
+  } catch {
+    throw new Error(`${name} is not a valid secp256k1 private key`);
+  }
+}
+
+function bigintEnv(env: Env, name: string, def: bigint): bigint {
+  const raw = env[name];
+  if (raw === undefined || raw === "") return def;
+  if (!/^[0-9]+$/.test(raw)) throw new Error(`${name} must be a non-negative integer`);
+  return BigInt(raw);
 }
 
 export function loadDeployment(env: Env = process.env): Deployment {
@@ -72,6 +89,16 @@ export interface EngineConfig extends CommonConfig {
   maxBatchSize: number;
   preTradeChecks: boolean;
   expiryBufferSec: number;
+  minTimeToExpirySec: number;
+  maxTimeToExpirySec: number;
+  deadNoncesPath: string;
+  chainRefreshMs: number;
+  faultThreshold: number;
+  faultWindowSec: number;
+  /** wei; undefined = no cap. */
+  maxFeePerGasCap: bigint | undefined;
+  wsMaxConnections: number;
+  wsMaxConnectionsPerIp: number;
 }
 
 export function loadEngineConfig(env: Env = process.env): EngineConfig {
@@ -86,7 +113,16 @@ export function loadEngineConfig(env: Env = process.env): EngineConfig {
     trustProxy: bool(env, "TRUST_PROXY", false),
     maxBatchSize: int(env, "MAX_BATCH_SIZE", 20, 1),
     preTradeChecks: bool(env, "PRETRADE_CHECKS", true),
-    expiryBufferSec: int(env, "EXPIRY_BUFFER_SEC", 5),
+    expiryBufferSec: int(env, "EXPIRY_BUFFER_SEC", 30),
+    minTimeToExpirySec: int(env, "MIN_TIME_TO_EXPIRY_SEC", 60),
+    maxTimeToExpirySec: int(env, "MAX_TIME_TO_EXPIRY_SEC", 7 * 24 * 3600, 1),
+    deadNoncesPath: resolve(ENGINE_DIR, env.DEAD_NONCES_PATH || "data/dead-nonces.jsonl"),
+    chainRefreshMs: int(env, "CHAIN_REFRESH_MS", 2000, 100),
+    faultThreshold: int(env, "FAULT_THRESHOLD", 3, 1),
+    faultWindowSec: int(env, "FAULT_WINDOW_SEC", 600, 1),
+    maxFeePerGasCap: env.MAX_FEE_PER_GAS_GWEI ? BigInt(int(env, "MAX_FEE_PER_GAS_GWEI", 0, 1)) * 10n ** 9n : undefined,
+    wsMaxConnections: int(env, "WS_MAX_CONNECTIONS", 1000, 1),
+    wsMaxConnectionsPerIp: int(env, "WS_MAX_CONNECTIONS_PER_IP", 10, 1),
   };
 }
 
@@ -95,6 +131,8 @@ export interface KeeperConfig extends CommonConfig {
   pollIntervalMs: number;
   fundingIntervalSec: number;
   startBlock: bigint;
+  /** Warn at start-up when the keeper's free collateral (USDC units) is below this; 0 disables. */
+  minFreeCollateral: bigint;
 }
 
 export function loadKeeperConfig(env: Env = process.env): KeeperConfig {
@@ -105,5 +143,6 @@ export function loadKeeperConfig(env: Env = process.env): KeeperConfig {
     pollIntervalMs: int(env, "KEEPER_POLL_INTERVAL_MS", 5000, 100),
     fundingIntervalSec: int(env, "FUNDING_INTERVAL_SEC", 3600, 1),
     startBlock: BigInt(int(env, "KEEPER_START_BLOCK", 0)),
+    minFreeCollateral: bigintEnv(env, "KEEPER_MIN_FREE_COLLATERAL", 1n),
   };
 }

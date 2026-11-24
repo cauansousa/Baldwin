@@ -13,6 +13,9 @@ export interface ServerOptions {
   rateLimitPerMinute?: number;
   /** Trust X-Forwarded-For (only behind a reverse proxy). Default false. */
   trustProxy?: boolean;
+  /** WebSocket connections allowed in total (default 1000) and per IP (default 10). */
+  wsMaxConnections?: number;
+  wsMaxConnectionsPerIp?: number;
   /** Extra fields for GET /health. */
   info?: Record<string, unknown>;
   logger?: boolean;
@@ -56,7 +59,7 @@ export async function buildServer(engine: Engine, opts: ServerOptions = {}): Pro
 
   app.get("/health", async () => {
     const settlement = engine.settlementStatus();
-    return { ok: !settlement.stalled, ...opts.info, settlement };
+    return { ok: !settlement.stalled, ...opts.info, settlement, chain: engine.chainStatus() };
   });
 
   app.get("/markets", async () => engine.getMarkets());
@@ -86,7 +89,12 @@ export async function buildServer(engine: Engine, opts: ServerOptions = {}): Pro
     return engine.cancel(orderHash, signature);
   });
 
-  const ws = attachWebSocket(app.server, engine, { limiter, trustProxy: opts.trustProxy ?? false });
+  const ws = attachWebSocket(app.server, engine, {
+    limiter,
+    trustProxy: opts.trustProxy ?? false,
+    maxConnections: opts.wsMaxConnections ?? 1000,
+    maxConnectionsPerIp: opts.wsMaxConnectionsPerIp ?? 10,
+  });
   app.addHook("onClose", async () => {
     ws.close();
     limiter.close();

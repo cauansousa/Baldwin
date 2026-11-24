@@ -1,4 +1,4 @@
-import type { Address, Hex } from "../types.ts";
+import type { Address, Hex, MarketConfig } from "../types.ts";
 
 /**
  * Read-only view of the Exchange contract. Used for the optional pre-trade check
@@ -16,4 +16,11 @@ export interface ChainReader {
   indexPrice(marketId: number): Promise<bigint>;
   /** Timestamp of the latest block, unix seconds. */
   blockTimestamp(): Promise<bigint>;
+  paused(): Promise<boolean>;
+  /** Half-width of the fill-price band around the index, in bps (immutable on-chain). */
+  maxPriceDeviationBps(): Promise<bigint>;
+  /** Base WAD per side. */
+  openInterest(marketId: number): Promise<{ longs: bigint; shorts: bigint }>;
+  /** Current market parameters. */
+  getMarket(marketId: number): Promise<MarketConfig>;
 }

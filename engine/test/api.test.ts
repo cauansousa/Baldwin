@@ -257,4 +257,83 @@ describe("WebSocket API", () => {
     const err = await new Promise<Error>((r) => other.once("error", r));
     expect(err.message).toMatch(/404/);
   });
+
+  it("caps WebSocket connections per IP and in total", async () => {
+    const { app } = await server({ wsMaxConnectionsPerIp: 3, wsMaxConnections: 1000 });
+    await app.listen({ port: 0, host: "127.0.0.1" });
+    const { port } = app.server.address() as AddressInfo;
+    const open = (): Promise<WebSocket | Error> =>
+      new Promise((resolve) => {
+        const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+        ws.once("open", () => resolve(ws));
+        ws.once("error", (e) => resolve(e));
+      });
+    const first = await Promise.all([open(), open(), open(), open(), open()]); // a burst cannot overshoot either
+    const ok = first.filter((x): x is WebSocket => x instanceof WebSocket);
+    const refused = first.filter((x): x is Error => x instanceof Error);
+    expect(ok).toHaveLength(3);
+    expect(refused).toHaveLength(2);
+    expect(refused[0]!.message).toMatch(/429/);
+    // a slot is freed when a connection closes
+    ok[0]!.close();
+    await new Promise((r) => ok[0]!.once("close", r));
+    await new Promise((r) => setTimeout(r, 20));
+    const again = await open();
+    expect(again).toBeInstanceOf(WebSocket);
+    for (const ws of [...ok, again as WebSocket]) ws.terminate();
+  });
+
+  it("caps WebSocket connections in total", async () => {
+    const { app } = await server({ wsMaxConnectionsPerIp: 100, wsMaxConnections: 2 });
+    await app.listen({ port: 0, host: "127.0.0.1" });
+    const { port } = app.server.address() as AddressInfo;
+    const socks: WebSocket[] = [];
+    for (let i = 0; i < 2; i++) {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      await new Promise((r, j) => (ws.once("open", r), ws.once("error", j)));
+      socks.push(ws);
+    }
+    const third = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    const err = await new Promise<Error>((r) => third.once("error", r));
+    expect(err.message).toMatch(/503/);
+    for (const ws of socks) ws.terminate();
+  });
+});
+
+describe("malformed input", () => {
+  it("never produces a 5xx", async () => {
+    const { app } = await server({ rateLimitPerMinute: 100000 });
+    const o = makeOrder(alice, true, 100, 1);
+    const sig = await signOrder(alice, o);
+    const j = (x: unknown) => JSON.stringify(x, jsonReplacer);
+    const json = { "content-type": "application/json" };
+    const cases: [string, string, string | undefined, Record<string, string>?][] = [
+      ["POST", "/orders", "{", json],
+      ["POST", "/orders", "null", json],
+      ["POST", "/orders", "[]", json],
+      ["POST", "/orders", '{"__proto__":{"a":1}}', json],
+      ["POST", "/orders", '{"order":{"constructor":{"prototype":{}}},"signature":"0x"}', json],
+      ["POST", "/orders", j({ order: { ...o, size: "9".repeat(78) }, signature: sig }), json],
+      ["POST", "/orders", j({ order: { ...o, size: 1e30 }, signature: sig }), json],
+      ["POST", "/orders", j({ order: { ...o, marketId: 1.5 }, signature: sig }), json],
+      ["POST", "/orders", j({ order: { ...o, limitPrice: (2n ** 256n - 1n).toString(), size: (2n ** 256n - 1n).toString() }, signature: sig }), json],
+      ["POST", "/orders", j({ order: { ...o, expiry: "0" }, signature: sig }), json],
+      ["POST", "/orders", j({ order: o, signature: sig }), { "content-type": "text/plain" }],
+      ["POST", "/orders", "x".repeat(20000), json],
+      ["DELETE", "/orders/0x" + "ab".repeat(32), undefined],
+      ["DELETE", "/orders/0x" + "ab".repeat(32), "", json],
+      ["DELETE", "/orders/zz", "{}", json],
+      ["GET", "/orders?trader=0x1&trader=0x2", undefined],
+      ["GET", "/orderbook/1?depth=1&depth=2", undefined],
+      ["GET", "/orderbook/99999999999", undefined],
+      ["GET", "/trades/1?limit=0", undefined],
+      ["GET", "/orderbook/%00", undefined],
+    ];
+    for (const [method, url, payload, headers] of cases) {
+      const r = await app.inject({ method: method as "GET", url, payload, headers });
+      expect(r.statusCode, `${method} ${url}`).toBeGreaterThanOrEqual(400);
+      expect(r.statusCode, `${method} ${url}`).toBeLessThan(500);
+      expect(r.json().error, `${method} ${url}`).toBeDefined();
+    }
+  });
 });

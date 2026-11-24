@@ -1,11 +1,11 @@
 import { EventEmitter } from "node:events";
-import { BPS } from "../../../shared/src/index.ts";
-import { OrderBook, type BookFill, type BookOrder, type Level } from "../book/orderbook.ts";
+import { OrderBook, type Band, type BookFill, type BookOrder, type CancelReason, type Level, type RestoreOptions } from "../book/orderbook.ts";
 import type { ChainReader } from "../chain/types.ts";
 import { hashOrder, verifyCancelSignature, verifyOrderSignature, type Domain } from "../signing.ts";
 import { BatchRevertedError, type Batch, type MatchResult, type Settler } from "../settlement/types.ts";
 import { errMessage, silentLogger, type Address, type Hex, type Logger, type MarketConfig, type Match, type Order } from "../types.ts";
-import { attributeFromRevert, classifyFailure, isReducing, notionalUsdc, UNATTRIBUTED, type Verdict } from "./reconcile.ts";
+import { MemoryDeadNonceStore, type DeadNonceStore } from "./deadNonces.ts";
+import { attributeFromRevert, classifyFailure, priceBand, requiredCollateral, UNATTRIBUTED, type MarginMarket, type OpenExposure, type Verdict } from "./reconcile.ts";
 
 export type OrderStatus =
   /** Resting, nothing matched yet. */
@@ -76,6 +76,11 @@ export type EngineErrorCode =
   | "INVALID_ORDER"
   | "BELOW_MIN_SIZE"
   | "EXPIRED"
+  | "INVALID_EXPIRY"
+  | "PRICE_OUTSIDE_BAND"
+  | "TRADER_SUSPENDED"
+  | "EXCHANGE_PAUSED"
+  | "MARKET_HALTED"
   | "DUPLICATE_ORDER"
   | "NONCE_CANCELLED"
   | "NONCE_REUSED"
@@ -93,6 +98,11 @@ const HTTP_STATUS: Record<EngineErrorCode, number> = {
   INVALID_ORDER: 400,
   BELOW_MIN_SIZE: 400,
   EXPIRED: 400,
+  INVALID_EXPIRY: 400,
+  PRICE_OUTSIDE_BAND: 422,
+  TRADER_SUSPENDED: 429,
+  EXCHANGE_PAUSED: 503,
+  MARKET_HALTED: 503,
   DUPLICATE_ORDER: 409,
   NONCE_CANCELLED: 409,
   NONCE_REUSED: 409,
@@ -132,8 +142,22 @@ export interface EngineOptions {
   logger?: Logger;
   /** Unix seconds. */
   now?: () => number;
-  /** Orders are treated as expired this many seconds before their expiry. Default 5. */
+  /** Resting orders are dropped this many seconds before their expiry. Default 30. */
   expiryBufferSec?: number;
+  /** Minimum time to expiry at intake (never less than the buffer). Default 60. */
+  minTimeToExpirySec?: number;
+  /** Maximum time to expiry at intake; also bounds the dead-nonce set. Default 7 days. */
+  maxTimeToExpirySec?: number;
+  /** Durable set of dead (trader, nonce) pairs. Default: in memory only. */
+  deadNonces?: DeadNonceStore;
+  /** At-fault on-chain failures within `faultWindowSec` after which a trader's new orders are refused. Default 3. */
+  faultThreshold?: number;
+  /** Default 600. */
+  faultWindowSec?: number;
+  /** Chain state (index, pause) older than this is refreshed before an order is taken. Default 30000. */
+  maxChainStateAgeMs?: number;
+  /** Market parameters are re-read at most this often. Default 30000. */
+  marketRefreshMs?: number;
   /** Max matches per settleMatches transaction. Default 20. */
   maxBatchSize?: number;
   /** Delay before re-trying a batch whose outcome is unknown or that reverted. Default 2000. */
@@ -157,6 +181,7 @@ interface OrderRecord {
   remaining: bigint;
   pending: bigint;
   filled: bigint;
+  reduceOnly: boolean;
   /** The trader asked for a cancel (off-chain or on-chain); never give liquidity back. */
   userCancelled: boolean;
   closed?: { status: "cancelled" | "expired" | "rejected"; reason: string };
@@ -168,8 +193,23 @@ interface OrderRecord {
 interface BookEffects {
   fills: BookFill[];
   expired: string[];
-  selfTradeCancelled?: { id: string; size: bigint }[];
+  cancelled?: { id: string; size: bigint; reason: CancelReason }[];
 }
+
+interface MarketState {
+  /** Last index price read; null if the last read failed (market halted). */
+  index: bigint | null;
+  /** Band from the last successful read; kept while the index is unavailable. */
+  band: Band | undefined;
+}
+
+const CANCEL_TEXT: Record<CancelReason, string> = {
+  ioc: "IOC remainder cancelled",
+  self_trade: "self-trade prevention: would match own resting order",
+  price_band: "price outside the oracle price band",
+  halted: "exchange paused or market inactive: only reduce-only orders can trade",
+  post_only: "post-only order would have taken liquidity",
+};
 
 export interface EngineEvents {
   /** The visible book of a market changed. */
@@ -202,7 +242,19 @@ export class Engine extends EventEmitter<EngineEvents> {
   private readonly ordersByTrader = new Map<string, Set<Hex>>();
   /** trader:nonce -> hash of the order that uses it. */
   private readonly usedNonces = new Map<string, Hex>();
-  private readonly cancelledNonces = new Set<string>();
+  private readonly dead: DeadNonceStore;
+  /** Orders currently between validation and the book (hash -> order as submitted). */
+  private readonly intake = new Map<Hex, Order>();
+  private readonly traderLocks = new Map<string, Promise<unknown>>();
+  /** trader -> unix seconds of recent at-fault on-chain failures. */
+  private readonly faults = new Map<string, number[]>();
+  private readonly marketState = new Map<number, MarketState>();
+  private exchangePaused = false;
+  private bandBps: bigint | null = null;
+  private chainStateAt = 0;
+  private marketsAt = 0;
+  private refreshing: Promise<void> | null = null;
+  private refreshTimer: NodeJS.Timeout | null = null;
   private readonly trades = new Map<number, Trade[]>();
   private readonly lastPrice = new Map<number, bigint>();
 
@@ -212,6 +264,12 @@ export class Engine extends EventEmitter<EngineEvents> {
   private readonly log: Logger;
   private readonly clock: () => number;
   private readonly expiryBuffer: bigint;
+  private readonly minTimeToExpiry: bigint;
+  private readonly maxTimeToExpiry: bigint;
+  private readonly faultThreshold: number;
+  private readonly faultWindowSec: number;
+  private readonly maxChainStateAgeMs: number;
+  private readonly marketRefreshMs: number;
   private readonly maxBatchSize: number;
   private readonly retryDelayMs: number;
   private readonly maxBatchReverts: number;
@@ -240,7 +298,15 @@ export class Engine extends EventEmitter<EngineEvents> {
     this.preTradeChecks = (opts.preTradeChecks ?? true) && opts.chain !== undefined;
     this.log = opts.logger ?? silentLogger;
     this.clock = opts.now ?? (() => Math.floor(Date.now() / 1000));
-    this.expiryBuffer = BigInt(opts.expiryBufferSec ?? 5);
+    this.expiryBuffer = BigInt(opts.expiryBufferSec ?? 30);
+    const minTtl = BigInt(opts.minTimeToExpirySec ?? 60);
+    this.minTimeToExpiry = minTtl > this.expiryBuffer ? minTtl : this.expiryBuffer;
+    this.maxTimeToExpiry = BigInt(opts.maxTimeToExpirySec ?? 7 * 24 * 3600);
+    this.dead = opts.deadNonces ?? new MemoryDeadNonceStore();
+    this.faultThreshold = opts.faultThreshold ?? 3;
+    this.faultWindowSec = opts.faultWindowSec ?? 600;
+    this.maxChainStateAgeMs = opts.maxChainStateAgeMs ?? 30_000;
+    this.marketRefreshMs = opts.marketRefreshMs ?? 30_000;
     this.maxBatchSize = opts.maxBatchSize ?? 20;
     this.retryDelayMs = opts.retryDelayMs ?? 2000;
     this.maxBatchReverts = opts.maxBatchReverts ?? 3;
@@ -250,25 +316,98 @@ export class Engine extends EventEmitter<EngineEvents> {
       this.markets.set(m.marketId, m);
       this.books.set(m.marketId, new OrderBook(m.minOrderSize));
       this.trades.set(m.marketId, []);
+      this.marketState.set(m.marketId, { index: null, band: undefined });
     }
+    this.marketsAt = Date.now();
   }
 
   // ------------------------------------------------------------------ lifecycle
 
-  /** Start the periodic expiry sweep. */
-  start(sweepIntervalMs = 1000): void {
+  /** Start the periodic expiry sweep and, with a chain reader, the chain-state refresh. */
+  start(sweepIntervalMs = 1000, chainRefreshMs = 2000): void {
     if (this.sweepTimer) return;
     this.sweepTimer = setInterval(() => this.sweepExpired(), sweepIntervalMs);
     this.sweepTimer.unref();
+    if (this.chain) {
+      void this.refreshChainState();
+      this.refreshTimer = setInterval(() => void this.refreshChainState(), chainRefreshMs);
+      this.refreshTimer.unref();
+    }
   }
 
   /** Stop timers and the settlement loop (the batch in flight, if any, is awaited). */
   async stop(): Promise<void> {
     this.stopped = true;
     if (this.sweepTimer) clearInterval(this.sweepTimer);
-    this.sweepTimer = null;
+    if (this.refreshTimer) clearInterval(this.refreshTimer);
+    this.sweepTimer = this.refreshTimer = null;
     this.wakeRetry?.();
     await this.loop;
+  }
+
+  /**
+   * Re-read pause flag, index prices (hence price bands) and, now and then, market
+   * parameters. Resting orders that are now on the wrong side of their band are
+   * cancelled. A market whose index cannot be read is halted for new orders until it
+   * can. Never rejects.
+   */
+  refreshChainState(): Promise<void> {
+    if (!this.chain) return Promise.resolve();
+    this.refreshing ??= this.doRefresh(this.chain).finally(() => (this.refreshing = null));
+    return this.refreshing;
+  }
+
+  private async doRefresh(chain: ChainReader): Promise<void> {
+    try {
+      this.bandBps ??= await chain.maxPriceDeviationBps();
+      this.exchangePaused = await chain.paused();
+      if (Date.now() - this.marketsAt >= this.marketRefreshMs) {
+        for (const [marketId, old] of this.markets) {
+          const fresh = await chain.getMarket(marketId);
+          this.markets.set(marketId, { ...fresh, symbol: fresh.symbol || old.symbol });
+          this.books.get(marketId)!.minOrderSize = fresh.minOrderSize;
+        }
+        this.marketsAt = Date.now();
+      }
+      for (const [marketId, st] of this.marketState) {
+        try {
+          st.index = await chain.indexPrice(marketId);
+          st.band = priceBand(st.index, this.bandBps);
+        } catch (e) {
+          if (st.index !== null) this.log.warn("index price unavailable; market halted", { marketId, error: errMessage(e) });
+          st.index = null;
+        }
+      }
+      this.chainStateAt = Date.now();
+    } catch (e) {
+      for (const st of this.marketState.values()) st.index = null;
+      this.log.warn("chain state refresh failed; markets halted", { error: errMessage(e) });
+    }
+    try {
+      for (const [marketId, st] of this.marketState) {
+        if (!st.band) continue;
+        const pruned = this.books.get(marketId)!.pruneOutOfBand(st.band);
+        if (pruned.length === 0) continue;
+        this.applyBookEffects(marketId, { fills: [], expired: [], cancelled: pruned.map((o) => ({ ...o, reason: "price_band" as const })) });
+        this.emit("book", marketId);
+      }
+    } catch (e) {
+      this.log.error("error while enforcing price bands", { error: errMessage(e) });
+    }
+  }
+
+  private async ensureChainState(): Promise<void> {
+    if (!this.chain) return;
+    if (this.chainStateAt === 0 || Date.now() - this.chainStateAt > this.maxChainStateAgeMs) await this.refreshChainState();
+  }
+
+  /** Current exchange-level view the engine matches under (for /health). */
+  chainStatus(): { paused: boolean; markets: { marketId: number; indexPrice: bigint | null; band: Band | null }[] } | null {
+    if (!this.chain) return null;
+    return {
+      paused: this.exchangePaused,
+      markets: [...this.marketState].map(([marketId, st]) => ({ marketId, indexPrice: st.index, band: st.band ?? null })),
+    };
   }
 
   /** Resolves once every queued match has reached a final on-chain outcome. */
@@ -314,13 +453,23 @@ export class Engine extends EventEmitter<EngineEvents> {
 
   /** Orders of a trader that are resting or still have matches awaiting settlement. */
   getOpenOrders(trader: Address): OrderView[] {
-    const hashes = this.ordersByTrader.get(trader.toLowerCase());
+    return this.liveOrders(trader.toLowerCase()).map((rec) => this.view(rec));
+  }
+
+  /**
+   * Live records of a trader. Orders that are neither resting nor awaiting settlement
+   * can never become live again, so they are dropped from the per-trader index here.
+   */
+  private liveOrders(traderKey: string): OrderRecord[] {
+    const hashes = this.ordersByTrader.get(traderKey);
     if (!hashes) return [];
-    const out: OrderView[] = [];
+    const out: OrderRecord[] = [];
     for (const h of hashes) {
       const rec = this.orders.get(h)!;
-      if (rec.remaining > 0n || rec.pending > 0n) out.push(this.view(rec));
+      if (rec.remaining > 0n || rec.pending > 0n) out.push(rec);
+      else hashes.delete(h);
     }
+    if (hashes.size === 0) this.ordersByTrader.delete(traderKey);
     return out;
   }
 
@@ -355,35 +504,82 @@ export class Engine extends EventEmitter<EngineEvents> {
     if (order.size < market.minOrderSize) {
       throw new EngineError("BELOW_MIN_SIZE", `size is below the market minimum ${market.minOrderSize}`);
     }
-    if (this.isExpired(order)) throw new EngineError("EXPIRED", "order is expired or expires too soon");
+    const now = BigInt(this.clock());
+    if (order.expiry === 0n) throw new EngineError("INVALID_EXPIRY", "orders must have an expiry");
+    if (order.expiry <= now + this.minTimeToExpiry) {
+      throw new EngineError("EXPIRED", `order is expired or expires in less than ${this.minTimeToExpiry} seconds`);
+    }
+    if (order.expiry > now + this.maxTimeToExpiry) {
+      throw new EngineError("INVALID_EXPIRY", `expiry must be at most ${this.maxTimeToExpiry} seconds from now`);
+    }
 
     const hash = hashOrder(this.domain, order);
     const traderKey = order.trader.toLowerCase();
-    this.checkNotSeen(hash, traderKey, order.nonce);
-
-    if (!(await verifyOrderSignature(this.domain, order, req.signature))) {
-      throw new EngineError("BAD_SIGNATURE", "signature is not a canonical EIP-712 signature by order.trader");
+    this.checkNotSeen(hash, order);
+    if (this.isSuspended(traderKey)) {
+      throw new EngineError("TRADER_SUSPENDED", "too many of this trader's orders failed on-chain recently; try again later");
     }
 
-    const priorFilled = this.preTradeChecks ? await this.preTradeCheck(order, hash, market) : 0n;
+    // From here on a signed Cancel for this hash is honoured even though the order is
+    // not in the book yet (the Cancel signature is checked on its own, so it does not
+    // matter that this order's signature has not been verified at this point).
+    this.intake.set(hash, order);
+    try {
+      if (!(await verifyOrderSignature(this.domain, order, req.signature))) {
+        throw new EngineError("BAD_SIGNATURE", "signature is not a canonical EIP-712 signature by order.trader");
+      }
+      // One submission per trader at a time, so that the aggregate margin check sees
+      // every earlier order of the trader.
+      return await this.withTraderLock(traderKey, async () => {
+        await this.ensureChainState();
+        const state = this.marketState.get(order.marketId)!;
+        if (this.chain && state.index === null) {
+          throw new EngineError("MARKET_HALTED", "no fresh index price for this market; not accepting orders");
+        }
+        if (this.exchangePaused && !order.reduceOnly) {
+          throw new EngineError("EXCHANGE_PAUSED", "exchange is paused: only reduce-only orders are accepted");
+        }
+        const priorFilled = this.preTradeChecks ? await this.preTradeCheck(order, hash) : 0n;
+        return this.insert(req, hash, priorFilled);
+      });
+    } finally {
+      this.intake.delete(hash);
+    }
+  }
 
-    // ---- synchronous from here: no awaits between the re-checks and the book update.
-    this.checkNotSeen(hash, traderKey, order.nonce);
-    const now = this.bookNow();
+  /** Final checks and the book update. Synchronous: nothing can interleave. */
+  private insert(req: SubmitRequest, hash: Hex, priorFilled: bigint): SubmitResult {
+    const { order } = req;
+    const postOnly = req.postOnly ?? false;
+    const ioc = req.ioc ?? false;
+    const traderKey = order.trader.toLowerCase();
+    const market = this.markets.get(order.marketId)!;
+    this.checkNotSeen(hash, order);
     const book = this.books.get(order.marketId)!;
-    const bookOrder: BookOrder = { id: hash, trader: traderKey, isBuy: order.isBuy, price: order.limitPrice, expiry: order.expiry };
+    const bookOrder: BookOrder = {
+      id: hash,
+      trader: traderKey,
+      isBuy: order.isBuy,
+      price: order.limitPrice,
+      expiry: order.expiry,
+      postOnly,
+      reduceOnly: order.reduceOnly,
+    };
     const placeSize = order.size - priorFilled;
-    const res = book.place(bookOrder, placeSize, { now, postOnly, ioc });
+    // The remainder of an order that is already partly filled on-chain may be below the minimum.
+    const res = book.place(bookOrder, placeSize, { ...this.matchOptions(order.marketId), postOnly, ioc, allowBelowMin: priorFilled > 0n });
     if (!res.accepted) {
       this.applyBookEffects(order.marketId, { fills: [], expired: res.expired });
       if (res.expired.length > 0) this.emit("book", order.marketId);
       switch (res.reason) {
         case "post_only_would_cross":
           throw new EngineError("POST_ONLY_WOULD_CROSS", "post-only order would take liquidity");
+        case "post_only_outside_band":
+          throw new EngineError("PRICE_OUTSIDE_BAND", "post-only order is priced on the wrong side of the oracle price band");
         case "expired":
           throw new EngineError("EXPIRED", "order is expired or expires too soon");
         case "below_min_size":
-          throw new EngineError("BELOW_MIN_SIZE", `unfilled size is below the market minimum ${market.minOrderSize}`);
+          throw new EngineError("BELOW_MIN_SIZE", `size is below the market minimum ${market.minOrderSize}`);
         case "duplicate":
           throw new EngineError("DUPLICATE_ORDER", "order already submitted");
         default:
@@ -398,6 +594,7 @@ export class Engine extends EventEmitter<EngineEvents> {
       traderKey,
       postOnly,
       ioc,
+      reduceOnly: order.reduceOnly,
       seq: res.seq,
       remaining: placeSize,
       pending: 0n,
@@ -411,14 +608,13 @@ export class Engine extends EventEmitter<EngineEvents> {
     let set = this.ordersByTrader.get(traderKey);
     if (!set) this.ordersByTrader.set(traderKey, (set = new Set()));
     set.add(hash);
+    // An IOC order must never come back as a resting order, whatever happens to it.
+    if (ioc) this.markDead(order);
 
     this.applyBookEffects(order.marketId, { fills: res.fills, expired: res.expired });
     if (res.cancelled > 0n) {
       rec.remaining -= res.cancelled;
-      rec.closed = {
-        status: "cancelled",
-        reason: res.cancelReason === "self_trade" ? "self-trade prevention: would match own resting order" : "IOC remainder cancelled",
-      };
+      this.close(rec, "cancelled", CANCEL_TEXT[res.cancelReason ?? "ioc"]);
     }
     if (rec.remaining !== res.rested) throw new Error("invariant violated: record and book disagree on resting size");
     this.emit("book", order.marketId);
@@ -438,35 +634,56 @@ export class Engine extends EventEmitter<EngineEvents> {
     };
   }
 
-  /** Cancel by order hash with a signed EIP-712 `Cancel(trader, nonce)`. Idempotent. */
+  /**
+   * Cancel by order hash with a signed EIP-712 `Cancel(trader, nonce)`. Idempotent.
+   * The (trader, nonce) pair is durably recorded as dead before this resolves. Works
+   * for an order that is still in its intake checks: it will then not enter the book.
+   */
   async cancel(orderHash: Hex, signature: string): Promise<OrderView> {
-    const rec = this.orders.get(orderHash.toLowerCase() as Hex);
-    if (!rec) throw new EngineError("NOT_FOUND", "unknown order");
-    if (!(await verifyCancelSignature(this.domain, rec.order.trader, rec.order.nonce, signature))) {
+    const hash = orderHash.toLowerCase() as Hex;
+    const order = this.orders.get(hash)?.order ?? this.intake.get(hash);
+    if (!order) throw new EngineError("NOT_FOUND", "unknown order");
+    if (!(await verifyCancelSignature(this.domain, order.trader, order.nonce, signature))) {
       throw new EngineError("BAD_SIGNATURE", "signature is not a canonical EIP-712 Cancel signature by the order's trader");
     }
-    this.cancelNonce(rec.order.trader, rec.order.nonce, "cancelled by trader");
-    return this.view(rec);
+    this.cancelNonce(order.trader, order.nonce, "cancelled by trader", order.expiry);
+    const rec = this.orders.get(hash);
+    if (rec) return this.view(rec);
+    // Cancelled before it reached the book.
+    return {
+      orderHash: hash,
+      order,
+      status: "cancelled",
+      remaining: 0n,
+      pending: 0n,
+      filled: 0n,
+      postOnly: false,
+      ioc: false,
+      reason: "cancelled by trader",
+      createdAt: Date.now(),
+    };
   }
 
   /**
    * Mark (trader, nonce) as cancelled: the order using it (if any) leaves the book and
    * later orders with that nonce are rejected. Also called for on-chain OrderCancelled.
-   * Matches already handed to settlement are not recalled.
+   * Matches already handed to settlement are not recalled. Throws if the cancel cannot
+   * be made durable (nothing is changed then).
    */
-  cancelNonce(trader: Address, nonce: bigint, reason: string): void {
+  cancelNonce(trader: Address, nonce: bigint, reason: string, expiry?: bigint): void {
     const traderKey = trader.toLowerCase();
-    const key = nonceKey(traderKey, nonce);
-    this.cancelledNonces.add(key);
-    const hash = this.usedNonces.get(key);
+    const hash = this.usedNonces.get(nonceKey(traderKey, nonce));
     const rec = hash && this.orders.get(hash);
+    // Without a known expiry keep the entry for as long as any acceptable order could live.
+    const until = expiry ?? rec?.order.expiry ?? BigInt(this.clock()) + this.maxTimeToExpiry + 1n;
+    this.dead.add(trader, nonce, until);
     if (!rec || rec.userCancelled) return;
     rec.userCancelled = true;
     if (rec.closed) return;
     if (rec.remaining > 0n) {
       this.books.get(rec.order.marketId)!.cancel(rec.hash);
       rec.remaining = 0n;
-      rec.closed = { status: "cancelled", reason };
+      this.close(rec, "cancelled", reason);
       this.emit("book", rec.order.marketId);
     }
   }
@@ -474,6 +691,7 @@ export class Engine extends EventEmitter<EngineEvents> {
   /** Drop expired resting orders from every book. */
   sweepExpired(): void {
     const now = this.bookNow();
+    this.dead.prune(BigInt(this.clock()));
     for (const [marketId, book] of this.books) {
       const expired = book.pruneExpired(now);
       if (expired.length === 0) continue;
@@ -492,41 +710,109 @@ export class Engine extends EventEmitter<EngineEvents> {
     return order.expiry !== 0n && order.expiry <= this.bookNow();
   }
 
-  private checkNotSeen(hash: Hex, traderKey: string, nonce: bigint): void {
+  private checkNotSeen(hash: Hex, order: Order): void {
     if (this.orders.has(hash)) throw new EngineError("DUPLICATE_ORDER", "order already submitted");
-    const key = nonceKey(traderKey, nonce);
-    if (this.cancelledNonces.has(key)) throw new EngineError("NONCE_CANCELLED", "nonce has been cancelled");
-    if (this.usedNonces.has(key)) throw new EngineError("NONCE_REUSED", "nonce already used by another order of this trader");
+    if (this.dead.has(order.trader, order.nonce)) {
+      throw new EngineError("NONCE_CANCELLED", "this nonce was cancelled or its order was closed; sign a new order");
+    }
+    if (this.usedNonces.has(nonceKey(order.trader.toLowerCase(), order.nonce))) {
+      throw new EngineError("NONCE_REUSED", "nonce already used by another order of this trader");
+    }
   }
 
-  /** Returns the size already filled on-chain. */
-  private async preTradeCheck(order: Order, hash: Hex, market: MarketConfig): Promise<bigint> {
-    const chain = this.chain!;
-    let cancelled: boolean, filled: bigint, position: bigint, free: bigint, index: bigint;
+  private matchOptions(marketId: number): RestoreOptions {
+    return {
+      now: this.bookNow(),
+      band: this.marketState.get(marketId)?.band,
+      reduceOnlyMakersOnly: this.exchangePaused || !this.markets.get(marketId)!.active,
+    };
+  }
+
+  private async withTraderLock<T>(traderKey: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.traderLocks.get(traderKey) ?? Promise.resolve();
+    const run = prev.then(fn, fn);
+    const tail = run.catch(() => {});
+    this.traderLocks.set(traderKey, tail);
     try {
-      [cancelled, filled, position] = await Promise.all([
-        chain.isCancelled(order.trader, order.nonce),
-        chain.filledSize(hash),
-        chain.positionSize(order.trader, order.marketId),
-      ]);
+      return await run;
+    } finally {
+      if (this.traderLocks.get(traderKey) === tail) this.traderLocks.delete(traderKey);
+    }
+  }
+
+  private isSuspended(traderKey: string): boolean {
+    const list = this.faults.get(traderKey);
+    if (!list) return false;
+    const cutoff = this.clock() - this.faultWindowSec;
+    while (list.length > 0 && list[0]! <= cutoff) list.shift();
+    if (list.length === 0) this.faults.delete(traderKey);
+    return list.length >= this.faultThreshold;
+  }
+
+  private markDead(order: Order): void {
+    try {
+      this.dead.add(order.trader, order.nonce, order.expiry);
+    } catch (e) {
+      // The in-memory set already holds it; only durability across a restart is lost.
+      this.log.error("could not persist dead nonce", { trader: order.trader, nonce: order.nonce, error: errMessage(e) });
+    }
+  }
+
+  /** Close an order for good. Everything but plain expiry also kills its nonce. */
+  private close(rec: OrderRecord, status: "cancelled" | "expired" | "rejected", reason: string): void {
+    if (rec.closed) return;
+    rec.closed = { status, reason };
+    if (status !== "expired") this.markDead(rec.order);
+  }
+
+  /**
+   * On-chain checks before an order enters the book: nonce not cancelled, not already
+   * filled, reduce-only has something to reduce, and free collateral covers this order
+   * together with all of the trader's other open orders (see `requiredCollateral`).
+   * Returns the size already filled on-chain.
+   */
+  private async preTradeCheck(order: Order, hash: Hex): Promise<bigint> {
+    const chain = this.chain!;
+    const traderKey = order.trader.toLowerCase();
+    try {
+      const [cancelled, filled] = await Promise.all([chain.isCancelled(order.trader, order.nonce), chain.filledSize(hash)]);
       if (cancelled) {
-        this.cancelledNonces.add(nonceKey(order.trader.toLowerCase(), order.nonce));
+        this.markDead(order);
         throw new EngineError("NONCE_CANCELLED", "nonce has been cancelled on-chain");
       }
       if (filled >= order.size) throw new EngineError("ALREADY_FILLED", "order is already fully filled on-chain");
-      const unfilled = order.size - filled;
-      if (isReducing(position, order.isBuy, unfilled)) return filled;
-      const opposite = position !== 0n && (order.isBuy ? position < 0n : position > 0n);
+
       if (order.reduceOnly) {
+        // Enforced per fill by the contract; here only the obvious dead-on-arrival case.
+        const position = await chain.positionSize(order.trader, order.marketId);
+        const opposite = position !== 0n && (order.isBuy ? position < 0n : position > 0n);
         if (!opposite) throw new EngineError("REDUCE_ONLY_NO_POSITION", "reduce-only order has no opposite position to reduce");
         return filled;
       }
-      [free, index] = await Promise.all([chain.freeCollateral(order.trader), chain.indexPrice(order.marketId)]);
-      const absPos = position < 0n ? -position : position;
-      const added = opposite ? unfilled - absPos : unfilled;
-      const required = (notionalUsdc(added, index) * market.initialMarginBps) / BPS;
+
+      const exposures: OpenExposure[] = this.liveOrders(traderKey)
+        .filter((r) => !r.reduceOnly)
+        .map((r) => ({ marketId: r.order.marketId, isBuy: r.order.isBuy, size: r.remaining + r.pending, limitPrice: r.order.limitPrice }));
+      exposures.push({ marketId: order.marketId, isBuy: order.isBuy, size: order.size - filled, limitPrice: order.limitPrice });
+      const marketIds = [...new Set(exposures.map((e) => e.marketId))];
+      const [free, ...positions] = await Promise.all([
+        chain.freeCollateral(order.trader),
+        ...marketIds.map((id) => chain.positionSize(order.trader, id)),
+      ]);
+      const marginMarkets = new Map<number, MarginMarket>();
+      marketIds.forEach((id, i) => {
+        const st = this.marketState.get(id)!;
+        const cfg = this.markets.get(id)!;
+        // A halted market's orders cannot be valued (and cannot trade); skip them.
+        if (st.index === null) return;
+        marginMarkets.set(id, { index: st.index, band: st.band, position: positions[i]!, initialMarginBps: cfg.initialMarginBps, takerFeeBps: cfg.takerFeeBps });
+      });
+      const required = requiredCollateral(exposures, marginMarkets);
       if (free < required) {
-        throw new EngineError("INSUFFICIENT_MARGIN", `free collateral ${free} is below the initial margin ${required} for this order`);
+        throw new EngineError(
+          "INSUFFICIENT_MARGIN",
+          `free collateral ${free} is below the ${required} needed for this order together with the trader's other open orders`,
+        );
       }
       return filled;
     } catch (e) {
@@ -558,7 +844,15 @@ export class Engine extends EventEmitter<EngineEvents> {
   }
 
   private toBookOrder(rec: OrderRecord): BookOrder {
-    return { id: rec.hash, trader: rec.traderKey, isBuy: rec.order.isBuy, price: rec.order.limitPrice, expiry: rec.order.expiry };
+    return {
+      id: rec.hash,
+      trader: rec.traderKey,
+      isBuy: rec.order.isBuy,
+      price: rec.order.limitPrice,
+      expiry: rec.order.expiry,
+      postOnly: rec.postOnly,
+      reduceOnly: rec.reduceOnly,
+    };
   }
 
   /** Mirror what the book did into the order records and queue the fills for settlement. */
@@ -587,13 +881,13 @@ export class Engine extends EventEmitter<EngineEvents> {
       const rec = this.orders.get(id as Hex);
       if (!rec || rec.closed) continue;
       rec.remaining = 0n;
-      rec.closed = { status: "expired", reason: "order expired" };
+      this.close(rec, "expired", "order expired");
     }
-    for (const { id } of fx.selfTradeCancelled ?? []) {
+    for (const { id, reason } of fx.cancelled ?? []) {
       const rec = this.orders.get(id as Hex);
       if (!rec || rec.closed) continue;
       rec.remaining = 0n;
-      rec.closed = { status: "cancelled", reason: "self-trade prevention: would match own resting order" };
+      this.close(rec, "cancelled", CANCEL_TEXT[reason]);
     }
     if (fx.fills.length > 0) this.kick();
   }
@@ -640,6 +934,8 @@ export class Engine extends EventEmitter<EngineEvents> {
         continue;
       }
       const verdicts = new Map<number, Verdict>();
+      // Failures are judged, and liquidity is given back, under the current pause flag and bands.
+      if (results.some((r) => r.status === "failed")) await this.refreshChainState();
       for (let i = 0; i < results.length; i++) {
         const r = results[i]!;
         if (r.status === "failed") verdicts.set(i, await this.classify(batch.matches[i]!, r.reason));
@@ -727,11 +1023,15 @@ export class Engine extends EventEmitter<EngineEvents> {
 
   /**
    * A match failed on-chain: neither order was filled by it.
-   *  - A side at fault is removed from the book for good ("rejected").
-   *  - An innocent side gets the size back at its original time priority.
-   *  - If no side can be blamed, the taker is dropped (it never retries) and the
-   *    maker gets its size back plus a strike; `maxOrderStrikes` consecutive strikes
-   *    remove it. So no order can retry a failing match forever.
+   *  - A side at fault is removed from the book for good ("rejected") and the failure
+   *    is counted against its trader.
+   *  - An innocent side gets the size back: a resting order at its original time
+   *    priority, an IOC order by being matched again against the remaining book.
+   *  - Global condition (pause, stale oracle, price band, OI cap): nobody is at fault.
+   *    The taker is cancelled, the maker gets its size back, no strike.
+   *  - Cause unknown: the taker is dropped and the maker gets its size back plus a
+   *    strike; `maxOrderStrikes` consecutive strikes remove it.
+   * In every case the pair cannot be re-matched, so nothing retries forever.
    */
   private applyFailed(m: Match, verdict: Verdict, reason: Hex): void {
     this.failedCount++;
@@ -739,7 +1039,6 @@ export class Engine extends EventEmitter<EngineEvents> {
     const taker = this.orders.get(m.takerHash)!;
     maker.pending -= m.fillSize;
     taker.pending -= m.fillSize;
-    const unattributed = !verdict.maker.atFault && !verdict.taker.atFault;
     this.log.warn("match failed on-chain", {
       match: m.id,
       makerOrderHash: m.makerHash,
@@ -747,15 +1046,23 @@ export class Engine extends EventEmitter<EngineEvents> {
       revertData: reason,
       makerFault: verdict.maker.reason ?? null,
       takerFault: verdict.taker.reason ?? null,
+      global: verdict.global ?? null,
     });
 
-    if (verdict.taker.atFault) this.reject(taker, `match failed on-chain: ${verdict.taker.reason ?? "order at fault"}`);
-    else if (unattributed) this.reject(taker, "match failed on-chain (cause not attributable); taker order dropped");
+    if (verdict.global) {
+      this.remove(taker, "cancelled", `match could not settle on-chain: ${verdict.global}`);
+      this.giveBack(maker, m.fillSize);
+      return;
+    }
+    const unattributed = !verdict.maker.atFault && !verdict.taker.atFault;
+
+    if (verdict.taker.atFault) this.rejectAtFault(taker, verdict.taker.reason);
+    else if (unattributed) this.remove(taker, "rejected", "match failed on-chain (cause not attributable); taker order dropped");
 
     if (verdict.maker.atFault) {
-      this.reject(maker, `match failed on-chain: ${verdict.maker.reason ?? "order at fault"}`);
+      this.rejectAtFault(maker, verdict.maker.reason);
     } else if (unattributed && ++maker.strikes >= this.maxOrderStrikes) {
-      this.reject(maker, "matches failed on-chain repeatedly");
+      this.remove(maker, "rejected", "matches failed on-chain repeatedly");
     } else {
       this.giveBack(maker, m.fillSize);
     }
@@ -764,33 +1071,54 @@ export class Engine extends EventEmitter<EngineEvents> {
     if (!verdict.taker.atFault && !unattributed) this.giveBack(taker, m.fillSize);
   }
 
-  private reject(rec: OrderRecord, reason: string): void {
+  private rejectAtFault(rec: OrderRecord, why: string | undefined): void {
+    let list = this.faults.get(rec.traderKey);
+    if (!list) this.faults.set(rec.traderKey, (list = []));
+    list.push(this.clock());
+    this.remove(rec, "rejected", `match failed on-chain: ${why ?? "order at fault"}`);
+  }
+
+  /** Take an order out of the book for good. */
+  private remove(rec: OrderRecord, status: "cancelled" | "rejected", reason: string): void {
     if (rec.closed) return;
     if (rec.remaining > 0n) this.books.get(rec.order.marketId)!.cancel(rec.hash);
     rec.remaining = 0n;
-    rec.closed = { status: "rejected", reason };
+    this.close(rec, status, reason);
   }
 
-  /** Return `size` of an undone match to an innocent order, if it is still eligible to rest. */
+  /** Return `size` of an undone match to an innocent order, if it is still eligible. */
   private giveBack(rec: OrderRecord, size: bigint): void {
     if (rec.closed) return;
     if (rec.userCancelled) {
-      rec.closed = { status: "cancelled", reason: "cancelled by trader" };
+      this.close(rec, "cancelled", "cancelled by trader");
       return;
     }
-    if (rec.ioc) {
-      rec.closed = { status: "cancelled", reason: "IOC order: match failed on-chain, size not re-posted" };
-      return;
-    }
+    const marketId = rec.order.marketId;
+    const book = this.books.get(marketId)!;
     if (this.isExpired(rec.order)) {
-      if (rec.remaining > 0n) this.books.get(rec.order.marketId)!.cancel(rec.hash);
+      if (rec.remaining > 0n) book.cancel(rec.hash);
       rec.remaining = 0n;
-      rec.closed = { status: "expired", reason: "order expired" };
+      this.close(rec, "expired", "order expired");
       return;
     }
-    const book = this.books.get(rec.order.marketId)!;
+    const opts = this.matchOptions(marketId);
+    if (rec.ioc) {
+      // An IOC order never rests: run the returned size against the book once more.
+      const res = book.place(this.toBookOrder(rec), size, { ...opts, ioc: true, allowBelowMin: true });
+      if (!res.accepted) {
+        this.applyBookEffects(marketId, { fills: [], expired: res.expired });
+        this.close(rec, "cancelled", "IOC order: match failed on-chain and the size could not be matched again");
+        return;
+      }
+      rec.remaining += size;
+      this.applyBookEffects(marketId, { fills: res.fills, expired: res.expired });
+      if (res.cancelled > 0n) {
+        rec.remaining -= res.cancelled;
+        this.close(rec, "cancelled", res.fills.length > 0 ? CANCEL_TEXT.ioc : "IOC order: match failed on-chain, nothing else to match");
+      }
+      return;
+    }
     rec.remaining += size;
-    const fx = book.restore(this.toBookOrder(rec), rec.seq, size, this.bookNow());
-    this.applyBookEffects(rec.order.marketId, fx);
+    this.applyBookEffects(marketId, book.restore(this.toBookOrder(rec), rec.seq, size, opts));
   }
 }

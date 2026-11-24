@@ -79,6 +79,11 @@ class FakeRpc implements SettlerRpc {
   async getReceipt(hash: Hex) {
     return this.receipts.get(hash) ?? null;
   }
+  /** On-chain filledSize per order hash. */
+  filled = new Map<Hex, bigint>();
+  async filledSize(hash: Hex) {
+    return this.filled.get(hash) ?? 0n;
+  }
   mine(hash: Hex, receipt: RpcReceipt) {
     this.receipts.set(hash, receipt);
     this.minedNonce++;
@@ -88,7 +93,7 @@ class FakeRpc implements SettlerRpc {
   }
 }
 
-function setup(opts: { maxRounds?: number; logger?: Logger } = {}) {
+function setup(opts: { maxRounds?: number; logger?: Logger; bumpAfterRounds?: number; maxFeePerGasCap?: bigint } = {}) {
   const rpc = new FakeRpc();
   const settler = new ViemSettler({
     rpc,
@@ -99,6 +104,9 @@ function setup(opts: { maxRounds?: number; logger?: Logger } = {}) {
     pollIntervalMs: 1,
     maxRounds: opts.maxRounds ?? 2,
     logger: opts.logger,
+    bumpAfterRounds: opts.bumpAfterRounds,
+    maxFeePerGasCap: opts.maxFeePerGasCap,
+    releasePolls: 3,
   });
   return { rpc, settler };
 }
@@ -116,7 +124,7 @@ describe("ViemSettler", () => {
 
     expect(rpc.sent).toHaveLength(1);
     const tx = parseTransaction(rpc.sent[0]!);
-    expect(tx).toMatchObject({ nonce: 7, chainId: DOMAIN.chainId, maxFeePerGas: 100n, maxPriorityFeePerGas: 10n, gas: 300_000n + 150_000n });
+    expect(tx).toMatchObject({ nonce: 7, chainId: DOMAIN.chainId, maxFeePerGas: 100n, maxPriorityFeePerGas: 10n, gas: 300_000n + 500_000n });
     expect(tx.to!.toLowerCase()).toBe(EXCHANGE.toLowerCase());
     const call = decodeFunctionData({ abi: exchangeAbi, data: tx.data! });
     expect(call.functionName).toBe("settleMatches");
@@ -148,8 +156,8 @@ describe("ViemSettler", () => {
     expect(rpc.sent).toHaveLength(1);
   });
 
-  it("when broadcasting keeps failing, a later retry of the same batch re-sends the identical transaction", async () => {
-    const { rpc, settler } = setup({ maxRounds: 2 });
+  it("when broadcasting keeps failing, the batch stays bound to its nonce across retries and settles once", async () => {
+    const { rpc, settler } = setup({ maxRounds: 2, bumpAfterRounds: 100 });
     const batch: Batch = { id: "b1", matches: [await makeMatch("m1")] };
     let down = true;
     rpc.onSend = () => {
@@ -165,7 +173,7 @@ describe("ViemSettler", () => {
   });
 
   it("an accepted but unmined transaction is replaced with higher fees under the same nonce; whichever is mined counts once", async () => {
-    const { rpc, settler } = setup({ maxRounds: 3 });
+    const { rpc, settler } = setup({ maxRounds: 3, bumpAfterRounds: 1 });
     const batch: Batch = { id: "b1", matches: [await makeMatch("m1")] };
     const hashes: Hex[] = [];
     rpc.onSend = (_raw, hash, n) => {
@@ -223,6 +231,76 @@ describe("ViemSettler", () => {
     await expect(settler.settle(batch)).rejects.toBeInstanceOf(BatchRevertedError);
     expect((await settler.settle(batch)).map((r) => r.status)).toEqual(["settled"]);
     expect(rpc.nonces()).toEqual([7, 8]);
+  });
+
+  it("S1: a transaction whose broadcast call errored client-side is still fee-bumped under the same nonce", async () => {
+    const { rpc, settler } = setup({ maxRounds: 3, bumpAfterRounds: 2 });
+    const matches = [await makeMatch("m1")];
+    rpc.onSend = (_r, _h, n) => {
+      // 1st: the HTTP call times out although the node accepted the tx; afterwards: "already known".
+      throw new Error(n === 1 ? "request timed out" : "already known");
+    };
+    for (let i = 0; i < 3; i++) await settler.settle({ id: "b1", matches }).catch(() => {});
+    const txs = rpc.sent.map((raw) => parseTransaction(raw));
+    expect(new Set(rpc.sent).size).toBeGreaterThan(2); // replaced several times
+    expect(new Set(txs.map((t) => t.nonce))).toEqual(new Set([7])); // always the same nonce
+    expect(txs.at(-1)!.maxFeePerGas!).toBeGreaterThan(txs[0]!.maxFeePerGas!);
+    expect(txs.at(-1)!.maxPriorityFeePerGas!).toBeGreaterThan(txs[0]!.maxPriorityFeePerGas!);
+    // and once any of them is mined the batch resolves
+    rpc.onSend = (_r, hash) => ok(matches);
+    expect((await settler.settle({ id: "b1", matches })).map((r) => r.status)).toEqual(["settled"]);
+  });
+
+  it("never signs above the fee cap", async () => {
+    const { rpc, settler } = setup({ maxRounds: 4, bumpAfterRounds: 1, maxFeePerGasCap: 130n });
+    const matches = [await makeMatch("m1")];
+    for (let i = 0; i < 2; i++) await settler.settle({ id: "b1", matches }).catch(() => {});
+    const fees = rpc.sent.map((raw) => parseTransaction(raw).maxFeePerGas);
+    expect(rpc.sent.length).toBe(8);
+    expect(new Set(fees)).toEqual(new Set([100n, 126n])); // 158 would exceed the cap: keep re-broadcasting 126
+    // a first attempt is clamped as well
+    const capped = setup({ maxFeePerGasCap: 60n });
+    capped.rpc.onSend = () => ok(matches);
+    await capped.settler.settle({ id: "b1", matches });
+    expect(parseTransaction(capped.rpc.sent[0]!)).toMatchObject({ maxFeePerGas: 60n, maxPriorityFeePerGas: 10n });
+  });
+
+  it("S2: nonce gone and receipt not served, but the orders were filled on-chain => the batch is NOT released", async () => {
+    const { rpc, settler } = setup({ maxRounds: 1 });
+    const matches = [await makeMatch("m1")];
+    let hidden: { hash: Hex; receipt: RpcReceipt } | null = null;
+    rpc.onSend = (_raw, hash, n) => {
+      if (n === 1) {
+        // Mined: the nonce advances and filledSize moves, but this backend does not serve the receipt yet.
+        rpc.minedNonce++;
+        rpc.filled.set(matches[0]!.makerHash, matches[0]!.fillSize);
+        rpc.filled.set(matches[0]!.takerHash, matches[0]!.fillSize);
+        hidden = { hash, receipt: ok(matches) };
+        return null;
+      }
+      throw new Error("nonce too low");
+    };
+    const first = await settler.settle({ id: "b1", matches }).catch((e) => e);
+    expect(first).toBeInstanceOf(Error);
+    expect(first).not.toBeInstanceOf(BatchRevertedError);
+    expect(first.message).toMatch(/appears mined/);
+    // still unresolved a round later
+    expect(await settler.settle({ id: "b1", matches }).catch((e) => e)).not.toBeInstanceOf(BatchRevertedError);
+    rpc.receipts.set(hidden!.hash, hidden!.receipt); // the receipt becomes visible
+    const done = await settler.settle({ id: "b1", matches });
+    expect(done).toEqual([{ status: "settled", txHash: hidden!.hash }]);
+    expect(new Set(rpc.nonces())).toEqual(new Set([7])); // nothing was ever signed for another nonce
+  });
+
+  it("a receipt that shows up during the extra polls is used instead of releasing the batch", async () => {
+    const { rpc, settler } = setup({ maxRounds: 1 });
+    const matches = [await makeMatch("m1")];
+    rpc.onSend = (_raw, hash) => {
+      rpc.minedNonce++;
+      setTimeout(() => rpc.receipts.set(hash, ok(matches)), 16); // just after the normal wait ends
+      return null;
+    };
+    expect((await settler.settle({ id: "b1", matches })).map((r) => r.status)).toEqual(["settled"]);
   });
 
   it("rejects concurrent use", async () => {

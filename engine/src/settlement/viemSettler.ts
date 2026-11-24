@@ -34,6 +34,8 @@ export interface SettlerRpc {
   sendRawTransaction(raw: Hex): Promise<void>;
   /** null while the transaction is not mined. */
   getReceipt(hash: Hex): Promise<RpcReceipt | null>;
+  /** `Exchange.filledSize(orderHash)` at the latest block. */
+  filledSize(orderHash: Hex): Promise<bigint>;
 }
 
 export interface ViemSettlerOptions {
@@ -51,6 +53,17 @@ export interface ViemSettlerOptions {
   maxRounds?: number;
   /** Upper bound for the gas limit. Default 25,000,000. */
   gasLimitCap?: bigint;
+  /**
+   * Gas the contract insists on having left before each match
+   * (300,000 + 100,000 x marketCount); added on top of the estimate. Default 500,000.
+   */
+  gasFloorPerMatch?: bigint;
+  /** Unmined broadcast rounds after which the transaction is replaced with higher fees. Default 2. */
+  bumpAfterRounds?: number;
+  /** Never sign with a maxFeePerGas above this (wei). Default: no cap. */
+  maxFeePerGasCap?: bigint;
+  /** Extra receipt polls before a batch is declared lost to a foreign transaction. Default 5. */
+  releasePolls?: number;
 }
 
 interface Attempt {
@@ -67,8 +80,18 @@ interface InFlight {
   gas: bigint;
   /** Every transaction signed for this batch. All share one nonce, so at most one can be mined. */
   attempts: Attempt[];
-  /** The last broadcast was accepted but not mined in time: replace with higher fees. */
-  bump: boolean;
+  /** Consecutive rounds in which the latest attempt was broadcast (or known to the node) but not mined. */
+  unminedRounds: number;
+  /** On-chain filledSize of every order in the batch, read before the first broadcast. */
+  baseline: Map<Hex, bigint>;
+}
+
+/** Broadcast errors that mean the node has (or had) the transaction. */
+const ACCEPTED_SEND_ERROR = /already known|known transaction|already imported|nonce too low|nonce has already been used|replacement transaction underpriced/i;
+
+function isAcceptedSendError(e: unknown): boolean {
+  const e2 = e as { message?: string; details?: string; shortMessage?: string };
+  return ACCEPTED_SEND_ERROR.test(`${e2?.message ?? ""} ${e2?.details ?? ""} ${e2?.shortMessage ?? ""} ${String(e)}`);
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -81,8 +104,15 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
  * ever be mined, and the outcome is looked up by the locally computed hashes. The
  * binding survives a failed `settle` call and is only released when
  *  (a) one of the batch's transactions is mined (success or revert), or
- *  (b) the nonce was provably consumed by a foreign transaction (none of ours mined),
- * both of which make any earlier transaction of the batch permanently invalid.
+ *  (b) the nonce is gone on-chain, none of our transactions shows a receipt after
+ *      several polls, AND `filledSize` of every order in the batch still equals the
+ *      value read before the first broadcast - i.e. the chain itself shows that no
+ *      match of the batch was applied. If any `filledSize` moved, the batch did land
+ *      and the settler keeps waiting for its receipt instead of releasing.
+ *
+ * Fees: a transaction that stays unmined for `bumpAfterRounds` rounds is replaced
+ * (same nonce) with fees raised by 25%, up to `maxFeePerGasCap`. Broadcast errors do
+ * not prevent that: with a shared nonce a replacement is always safe.
  *
  * Nonces: transactions are strictly sequential; the next nonce is
  * max(local counter, chain "pending" count). The operator key must not be used by
@@ -98,6 +128,10 @@ export class ViemSettler implements Settler {
   private readonly pollIntervalMs: number;
   private readonly maxRounds: number;
   private readonly gasLimitCap: bigint;
+  private readonly gasFloorPerMatch: bigint;
+  private readonly bumpAfterRounds: number;
+  private readonly maxFeePerGasCap: bigint | undefined;
+  private readonly releasePolls: number;
 
   private inflight: InFlight | null = null;
   private nextNonce = 0;
@@ -114,6 +148,10 @@ export class ViemSettler implements Settler {
     this.pollIntervalMs = opts.pollIntervalMs ?? 500;
     this.maxRounds = opts.maxRounds ?? 4;
     this.gasLimitCap = opts.gasLimitCap ?? 25_000_000n;
+    this.gasFloorPerMatch = opts.gasFloorPerMatch ?? 500_000n;
+    this.bumpAfterRounds = Math.max(1, opts.bumpAfterRounds ?? 2);
+    this.maxFeePerGasCap = opts.maxFeePerGasCap;
+    this.releasePolls = opts.releasePolls ?? 5;
   }
 
   async settle(batch: Batch): Promise<MatchResult[]> {
@@ -136,33 +174,38 @@ export class ViemSettler implements Settler {
 
     let lastSendError: unknown;
     for (let round = 0; round < this.maxRounds; round++) {
-      if (fl.attempts.length === 0 || fl.bump) await this.sign(fl);
+      if (fl.attempts.length === 0 || fl.unminedRounds >= this.bumpAfterRounds) await this.sign(fl);
       const attempt = fl.attempts[fl.attempts.length - 1]!;
       lastSendError = undefined;
       try {
         // Safe to repeat: the same raw transaction has the same hash.
         await this.rpc.sendRawTransaction(attempt.raw);
       } catch (e) {
-        // The node may or may not have it ("already known", timeouts, nonce too low...).
-        // Never assume: look for a receipt before doing anything else.
-        lastSendError = e;
+        // The node may or may not have it. Never assume: look for a receipt first.
+        if (!isAcceptedSendError(e)) lastSendError = e;
       }
-      const mined = await this.waitForReceipt(fl);
+      const mined = await this.waitForReceipt(fl, this.receiptTimeoutMs);
       if (mined) return this.finish(batch, fl, mined.hash, mined.receipt);
+      // Counted whether or not the broadcast call succeeded: the first call may have
+      // delivered the transaction and only its response got lost.
+      fl.unminedRounds++;
 
-      // Not mined. If the nonce is gone anyway, a foreign transaction took it and none
-      // of ours can ever be mined: the batch definitively did not settle.
+      // Not mined. If the nonce is gone anyway, find out what happened before deciding.
       const latest = await this.rpc.getNonce(this.account.address, "latest");
       if (latest > fl.nonce) {
-        // Give a lagging receipt index one more poll before concluding.
-        await sleep(this.pollIntervalMs);
-        const late = await this.findReceipt(fl);
+        const late = await this.waitForReceipt(fl, this.pollIntervalMs * this.releasePolls);
         if (late) return this.finish(batch, fl, late.hash, late.receipt);
-        this.inflight = null;
-        this.nextNonce = latest;
-        throw new BatchRevertedError(`operator nonce ${fl.nonce} was consumed by a transaction this settler did not send`);
+        if (await this.batchLeftNoTrace(batch, fl)) {
+          this.inflight = null;
+          this.nextNonce = latest;
+          throw new BatchRevertedError(
+            `operator nonce ${fl.nonce} was consumed, no transaction of batch ${batch.id} has a receipt and no order of the batch was filled`,
+          );
+        }
+        // Some order of the batch was filled: our transaction was mined, only its
+        // receipt is not being served. Keep the binding and keep looking.
+        throw new Error(`batch ${batch.id} (nonce ${fl.nonce}) appears mined but its receipt is not available yet`);
       }
-      fl.bump = lastSendError === undefined;
       this.log.warn("settlement transaction not mined yet", {
         batch: batch.id,
         nonce: fl.nonce,
@@ -176,6 +219,14 @@ export class ViemSettler implements Settler {
     );
   }
 
+  /** True iff on-chain filledSize of every order in the batch is still at its pre-broadcast value. */
+  private async batchLeftNoTrace(batch: Batch, fl: InFlight): Promise<boolean> {
+    for (const [hash, before] of fl.baseline) {
+      if ((await this.rpc.filledSize(hash)) !== before) return false;
+    }
+    return true;
+  }
+
   /** Bind the batch to calldata, a gas limit and a nonce. Nothing is signed yet. */
   private async prepare(batch: Batch): Promise<InFlight> {
     const data = encodeFunctionData({
@@ -184,17 +235,25 @@ export class ViemSettler implements Settler {
       args: [batch.matches.map((m) => ({ maker: m.maker, makerSig: m.makerSig, taker: m.taker, takerSig: m.takerSig, fillSize: m.fillSize }))],
     });
     const estimate = await this.rpc.estimateGas({ from: this.account.address, to: this.exchange, data });
-    // Generous head-room: the contract isolates each match in an inner call, and an
-    // inner call starved of gas would look like a (wrongly attributed) MatchFailed.
-    let gas = (estimate * 3n) / 2n + 50_000n * BigInt(batch.matches.length);
+    // Head-room on top of the estimate: the contract reverts the whole batch with
+    // InsufficientGas when less than its per-match floor is left before a match.
+    let gas = (estimate * 3n) / 2n + this.gasFloorPerMatch;
     if (gas > this.gasLimitCap) gas = estimate > this.gasLimitCap ? estimate : this.gasLimitCap;
+    const baseline = new Map<Hex, bigint>();
+    for (const m of batch.matches) {
+      for (const hash of [m.makerHash, m.takerHash]) {
+        if (!baseline.has(hash)) baseline.set(hash, await this.rpc.filledSize(hash));
+      }
+    }
     const pending = await this.rpc.getNonce(this.account.address, "pending");
     const nonce = Math.max(pending, this.nextNonce);
-    return (this.inflight = { batchId: batch.id, nonce, data, gas, attempts: [], bump: false });
+    return (this.inflight = { batchId: batch.id, nonce, data, gas, attempts: [], unminedRounds: 0, baseline });
   }
 
+  /** Sign the first attempt, or a replacement with higher fees (if the cap leaves room for one). */
   private async sign(fl: InFlight): Promise<void> {
     let fees = await this.rpc.estimateFees();
+    const cap = this.maxFeePerGasCap;
     const prev = fl.attempts[fl.attempts.length - 1];
     if (prev) {
       // Replacement transactions must raise both fee fields (>= 10% on most clients).
@@ -204,7 +263,16 @@ export class ViemSettler implements Settler {
         maxPriorityFeePerGas:
           fees.maxPriorityFeePerGas > up(prev.maxPriorityFeePerGas) ? fees.maxPriorityFeePerGas : up(prev.maxPriorityFeePerGas),
       };
+      if (cap !== undefined && fees.maxFeePerGas > cap) {
+        // No room for a valid replacement: keep re-broadcasting the last attempt.
+        this.log.warn("fee cap reached; not replacing the settlement transaction", { nonce: fl.nonce, cap });
+        fl.unminedRounds = 0;
+        return;
+      }
+    } else if (cap !== undefined && fees.maxFeePerGas > cap) {
+      fees = { maxFeePerGas: cap, maxPriorityFeePerGas: fees.maxPriorityFeePerGas > cap ? cap : fees.maxPriorityFeePerGas };
     }
+    if (fees.maxPriorityFeePerGas > fees.maxFeePerGas) fees.maxPriorityFeePerGas = fees.maxFeePerGas;
     const raw = await this.account.signTransaction({
       type: "eip1559",
       chainId: this.chainId,
@@ -216,7 +284,7 @@ export class ViemSettler implements Settler {
       ...fees,
     });
     fl.attempts.push({ hash: keccak256(raw), raw, ...fees });
-    fl.bump = false;
+    fl.unminedRounds = 0;
   }
 
   private async findReceipt(fl: InFlight): Promise<{ hash: Hex; receipt: RpcReceipt } | null> {
@@ -227,8 +295,8 @@ export class ViemSettler implements Settler {
     return null;
   }
 
-  private async waitForReceipt(fl: InFlight): Promise<{ hash: Hex; receipt: RpcReceipt } | null> {
-    const deadline = Date.now() + this.receiptTimeoutMs;
+  private async waitForReceipt(fl: InFlight, timeoutMs: number): Promise<{ hash: Hex; receipt: RpcReceipt } | null> {
+    const deadline = Date.now() + timeoutMs;
     for (;;) {
       try {
         const found = await this.findReceipt(fl);
@@ -311,8 +379,9 @@ export function parseSettlementLogs(matches: Match[], logs: RpcLog[], exchange: 
 }
 
 /** SettlerRpc backed by a viem public client. */
-export function viemSettlerRpc(client: PublicClient): SettlerRpc {
+export function viemSettlerRpc(client: PublicClient, exchange: Address): SettlerRpc {
   return {
+    filledSize: (orderHash) => client.readContract({ address: exchange, abi: exchangeAbi, functionName: "filledSize", args: [orderHash] }),
     getNonce: (address, tag) => client.getTransactionCount({ address, blockTag: tag }),
     async estimateGas({ from, to, data }) {
       try {

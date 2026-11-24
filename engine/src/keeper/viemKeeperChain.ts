@@ -26,7 +26,10 @@ export class ViemKeeperChain implements KeeperChain {
     for (const l of fills) {
       out.push({ trader: l.args.maker, marketId: l.args.marketId }, { trader: l.args.taker, marketId: l.args.marketId });
     }
-    for (const l of liquidations) out.push({ trader: l.args.trader, marketId: l.args.marketId });
+    // A liquidator takes the position over, so it holds one afterwards as well.
+    for (const l of liquidations) {
+      out.push({ trader: l.args.trader, marketId: l.args.marketId }, { trader: l.args.liquidator, marketId: l.args.marketId });
+    }
     return out;
   }
 
@@ -72,6 +75,14 @@ export class ViemKeeperChain implements KeeperChain {
       args: [marketId],
     });
     await this.mined(await this.wallet.writeContract(request));
+  }
+
+  lastFundingTime(marketId: number): Promise<bigint> {
+    return this.client.readContract({ address: this.exchange, abi: exchangeAbi, functionName: "lastFundingTime", args: [marketId] });
+  }
+
+  async blockTimestamp(): Promise<bigint> {
+    return (await this.client.getBlock({ blockTag: "latest" })).timestamp;
   }
 
   private async mined(hash: `0x${string}`): Promise<void> {

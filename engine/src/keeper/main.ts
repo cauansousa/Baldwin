@@ -1,6 +1,5 @@
 import { createPublicClient, createWalletClient, http, type PublicClient } from "viem";
-import { privateKeyToAccount } from "viem/accounts";
-import { chainFor, loadKeeperConfig } from "../config.ts";
+import { accountFromKey, chainFor, loadKeeperConfig } from "../config.ts";
 import { consoleLogger as log, errMessage } from "../types.ts";
 import { Keeper } from "./keeper.ts";
 import { ViemKeeperChain } from "./viemKeeperChain.ts";
@@ -13,7 +12,7 @@ async function main(): Promise<void> {
   }
   const cfg = loadKeeperConfig();
   const { deployment } = cfg;
-  const account = privateKeyToAccount(cfg.keeperKey);
+  const account = accountFromKey(cfg.keeperKey, "KEEPER_PRIVATE_KEY");
   if (process.env.OPERATOR_PRIVATE_KEY && process.env.OPERATOR_PRIVATE_KEY.replace(/^0x/, "").toLowerCase() === cfg.keeperKey.slice(2).toLowerCase()) {
     throw new Error("KEEPER_PRIVATE_KEY must differ from OPERATOR_PRIVATE_KEY: the engine manages the operator's nonces on its own");
   }
@@ -25,8 +24,21 @@ async function main(): Promise<void> {
     throw new Error(`RPC chain id ${chainId} does not match the deployment file (${deployment.chainId})`);
   }
 
+  const keeperChain = new ViemKeeperChain(client, wallet, account, deployment.exchange);
+  // Liquidating means taking the position over, which the keeper has to margin itself.
+  if (cfg.minFreeCollateral > 0n) {
+    const free = await keeperChain.ownFreeCollateral();
+    if (free < cfg.minFreeCollateral) {
+      log.warn("keeper has too little free collateral in the Exchange: it will not be able to take over positions", {
+        keeper: account.address,
+        freeCollateral: free,
+        expectedAtLeast: cfg.minFreeCollateral,
+      });
+    }
+  }
+
   const keeper = new Keeper({
-    chain: new ViemKeeperChain(client, wallet, account, deployment.exchange),
+    chain: keeperChain,
     marketIds: deployment.markets.map((m) => m.marketId),
     self: account.address,
     startBlock: cfg.startBlock,

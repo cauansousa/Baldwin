@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { Keeper, type KeeperChain } from "../src/keeper/keeper.ts";
 import type { Address } from "../src/types.ts";
-import { alice, bob } from "./helpers.ts";
+import { ViemKeeperChain } from "../src/keeper/viemKeeperChain.ts";
+import { alice, bob, carol } from "./helpers.ts";
 
 class FakeKeeperChain implements KeeperChain {
   head = 10n;
@@ -47,9 +48,20 @@ class FakeKeeperChain implements KeeperChain {
   async initialMarginBps() {
     return 2000n;
   }
+  /** Chain clock and per-market last funding time. */
+  time = 10_000n;
+  lastFunding = new Map<number, bigint>();
   async updateFunding(marketId: number) {
     if (this.fundingFails) throw new Error("revert");
     this.funding.push(marketId);
+    this.lastFunding.set(marketId, this.time > BigInt(this.wall()) ? this.time : BigInt(this.wall()));
+  }
+  wall: () => number = () => 0;
+  async lastFundingTime(marketId: number) {
+    return this.lastFunding.get(marketId) ?? 0n;
+  }
+  async blockTimestamp() {
+    return this.time;
   }
 }
 
@@ -119,20 +131,56 @@ describe("Keeper", () => {
     expect(chain.liquidations).toEqual([]);
   });
 
-  it("updates funding for every market at start and then once per interval; retries after a failure", async () => {
+  it("schedules funding from the on-chain lastFundingTime: no call before the interval, one when due, retry after a failure", async () => {
     const chain = new FakeKeeperChain();
+    chain.time = 10_000n;
+    chain.lastFunding.set(1, 9_000n); // 1000 s ago
+    chain.lastFunding.set(2, 6_400n); // exactly one interval ago
     let now = 10_000;
+    chain.wall = () => now;
     const keeper = new Keeper({ chain, marketIds: [1, 2], fundingIntervalSec: 3600, now: () => now });
     await keeper.tick();
-    expect(chain.funding).toEqual([1, 2]);
-    now += 3599;
+    expect(chain.funding).toEqual([2]); // a freshly started keeper does not call what is not due
     await keeper.tick();
-    expect(chain.funding).toEqual([1, 2]);
-    now += 1;
+    expect(chain.funding).toEqual([2]);
+    // market 1 becomes due by wall clock even if no block has been mined since
+    now = 12_600;
     chain.fundingFails = true;
     await keeper.tick();
+    expect(chain.funding).toEqual([2]);
     chain.fundingFails = false;
     await keeper.tick();
-    expect(chain.funding).toEqual([1, 2, 1, 2]);
+    expect(chain.funding).toEqual([2, 1]);
+    // someone else updated funding in the meantime: the keeper follows the chain, not its own clock
+    chain.lastFunding.set(2, 12_000n);
+    now = 13_700; // 3700 s after the keeper's own call for market 2, but only 1700 s after the on-chain one
+    await keeper.tick();
+    expect(chain.funding).toEqual([2, 1]);
+    // chain time ahead of the wall clock counts too
+    chain.time = 15_600n;
+    await keeper.tick();
+    expect(chain.funding).toEqual([2, 1, 2]);
+  });
+});
+
+describe("ViemKeeperChain", () => {
+  it("tracks maker, taker, liquidated trader and the liquidator (who takes the position over)", async () => {
+    const calls: string[] = [];
+    const client = {
+      getContractEvents: async ({ eventName }: { eventName: string }) => {
+        calls.push(eventName);
+        return eventName === "Fill"
+          ? [{ args: { marketId: 1, maker: alice.address, taker: bob.address } }]
+          : [{ args: { marketId: 2, trader: alice.address, liquidator: carol.address } }];
+      },
+    };
+    const kc = new ViemKeeperChain(client as never, {} as never, carol, "0x5FbDB2315678afecb367f032d93F642f64180aa3");
+    expect(await kc.touchedPositions(0n, 10n)).toEqual([
+      { trader: alice.address, marketId: 1 },
+      { trader: bob.address, marketId: 1 },
+      { trader: alice.address, marketId: 2 },
+      { trader: carol.address, marketId: 2 },
+    ]);
+    expect(calls.sort()).toEqual(["Fill", "Liquidation"]);
   });
 });

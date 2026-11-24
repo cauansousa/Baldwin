@@ -24,11 +24,15 @@ export const MARKET: MarketConfig = {
   symbol: "BTC-USD",
   active: true,
   minOrderSize: wad("0.01"),
+  maxOpenInterest: wad(1000),
   initialMarginBps: 2000n,
   maintenanceMarginBps: 1000n,
   makerFeeBps: 2n,
   takerFeeBps: 5n,
 };
+
+/** The test clock starts at 1000; orders live for a day unless a test says otherwise. */
+export const DEFAULT_EXPIRY = 1_000n + 86_400n;
 
 let nonce = 1n;
 export function makeOrder(trader: TestAccount, isBuy: boolean, price: number | string, size: number | string, extra: Partial<Order> = {}): Order {
@@ -40,7 +44,7 @@ export function makeOrder(trader: TestAccount, isBuy: boolean, price: number | s
     size: wad(size),
     limitPrice: wad(price),
     nonce: nonce++,
-    expiry: 0n,
+    expiry: DEFAULT_EXPIRY,
     ...extra,
   };
 }
@@ -85,11 +89,33 @@ export class FakeChain implements ChainReader {
   }
   async indexPrice() {
     this.check();
+    if (this.indexFails) throw new Error("StalePrice");
     return this.index;
   }
   async blockTimestamp() {
     this.check();
     return this.time;
+  }
+  isPaused = false;
+  deviationBps = 500n;
+  oi = { longs: 0n, shorts: 0n };
+  indexFails = false;
+  market: MarketConfig = MARKET;
+  async paused() {
+    this.check();
+    return this.isPaused;
+  }
+  async maxPriceDeviationBps() {
+    this.check();
+    return this.deviationBps;
+  }
+  async openInterest() {
+    this.check();
+    return this.oi;
+  }
+  async getMarket(marketId: number) {
+    this.check();
+    return { ...this.market, marketId };
   }
 }
 
@@ -114,6 +140,9 @@ export function harness(opts: Partial<EngineOptions> & { withChain?: boolean } =
     ...(withChain ? { chain } : {}),
     now: () => clock.now,
     retryDelayMs: 1,
+    // Tests that are about expiry timing set these themselves.
+    expiryBufferSec: 5,
+    minTimeToExpirySec: 0,
     ...rest,
   });
   return {

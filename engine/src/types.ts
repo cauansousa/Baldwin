@@ -10,6 +10,8 @@ export interface MarketConfig {
   symbol: string;
   active: boolean;
   minOrderSize: bigint;
+  /** Base WAD, per side. */
+  maxOpenInterest: bigint;
   initialMarginBps: bigint;
   maintenanceMarginBps: bigint;
   makerFeeBps: bigint;

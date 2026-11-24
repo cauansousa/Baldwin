@@ -18,6 +18,10 @@ export interface KeeperChain {
   initialMarginBps(marketId: number): Promise<bigint>;
   /** Resolves once mined. */
   updateFunding(marketId: number): Promise<void>;
+  /** Unix seconds of the market's last funding accrual on-chain. */
+  lastFundingTime(marketId: number): Promise<bigint>;
+  /** Timestamp of the latest block, unix seconds. */
+  blockTimestamp(): Promise<bigint>;
 }
 
 export interface KeeperOptions {
@@ -29,7 +33,7 @@ export interface KeeperOptions {
   maxBlockRange?: bigint;
   /** The keeper's own address: never liquidated by itself. */
   self?: Address;
-  /** Seconds between updateFunding rounds. Default 3600. */
+  /** The contract's funding interval in seconds. Default 3600. */
   fundingIntervalSec?: number;
   /** Unix seconds. */
   now?: () => number;
@@ -46,14 +50,14 @@ export interface KeeperOptions {
  *     The whole position is tried first. In the current Exchange the liquidator takes
  *     the position over and must margin it, so if that fails the keeper retries with
  *     the size its own free collateral supports;
- *  3. calls `updateFunding` for every market when the funding interval has elapsed
- *     (and once at start-up; the contract ignores calls that come too early).
+ *  3. calls `updateFunding` for every market whose on-chain `lastFundingTime` is at
+ *     least one funding interval old. The schedule lives on-chain: a restarted keeper
+ *     neither skips nor repeats a round, and a failed call is retried on the next tick.
  */
 export class Keeper {
   /** trader (lower-case) -> markets with a possibly open position. */
   private readonly tracked = new Map<string, { trader: Address; markets: Set<number> }>();
   private nextBlock: bigint;
-  private nextFundingAt = 0;
   private readonly chain: KeeperChain;
   private readonly marketIds: number[];
   private readonly maxRange: bigint;
@@ -160,19 +164,20 @@ export class Keeper {
   }
 
   private async updateFunding(): Promise<void> {
-    const now = this.now();
-    if (now < this.nextFundingAt) return;
-    let allOk = true;
+    // The contract compares against block time; a new block cannot be older than
+    // either the latest block or (on a live chain) the wall clock.
+    const blockTime = await this.chain.blockTimestamp();
+    const wall = BigInt(this.now());
+    const now = blockTime > wall ? blockTime : wall;
     for (const marketId of this.marketIds) {
       try {
+        const last = await this.chain.lastFundingTime(marketId);
+        if (now < last + BigInt(this.fundingIntervalSec)) continue;
         await this.chain.updateFunding(marketId);
         this.log.info("funding updated", { marketId });
       } catch (e) {
-        allOk = false;
         this.log.warn("updateFunding failed", { marketId, error: errMessage(e) });
       }
     }
-    // On any failure the whole round is retried on the next tick (extra calls are no-ops on-chain).
-    if (allOk) this.nextFundingAt = now + this.fundingIntervalSec;
   }
 }

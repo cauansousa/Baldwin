@@ -27,6 +27,7 @@ type Channel = (typeof CHANNELS)[number];
 
 interface Client {
   ws: WebSocket;
+  ip: string;
   subs: Set<string>;
   alive: boolean;
   msgCount: number;
@@ -34,9 +35,12 @@ interface Client {
 
 const subKey = (channel: Channel, marketId: number) => `${channel}:${marketId}`;
 
-export function attachWebSocket(server: Server, engine: Engine, opts: { limiter: RateLimiter; trustProxy: boolean }): { close(): void } {
+export function attachWebSocket(server: Server, engine: Engine, opts: { limiter: RateLimiter; trustProxy: boolean; maxConnections: number; maxConnectionsPerIp: number },
+): { close(): void } {
   const wss = new WebSocketServer({ noServer: true, maxPayload: 4096 });
   const clients = new Set<Client>();
+  const perIp = new Map<string, number>();
+  let total = 0;
 
   const clientIp = (req: IncomingMessage): string => {
     const fwd = opts.trustProxy ? req.headers["x-forwarded-for"] : undefined;
@@ -50,11 +54,33 @@ export function attachWebSocket(server: Server, engine: Engine, opts: { limiter:
       socket.end("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
       return;
     }
-    if (!opts.limiter.take(clientIp(req))) {
+    const ip = clientIp(req);
+    if (!opts.limiter.take(ip)) {
       socket.end("HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n");
       return;
     }
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+    if ((perIp.get(ip) ?? 0) >= opts.maxConnectionsPerIp) {
+      socket.end("HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n");
+      return;
+    }
+    if (total >= opts.maxConnections) {
+      socket.end("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
+      return;
+    }
+    // Counted here, before the asynchronous handshake, so a burst cannot overshoot.
+    perIp.set(ip, (perIp.get(ip) ?? 0) + 1);
+    total++;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      total--;
+      const n = (perIp.get(ip) ?? 1) - 1;
+      if (n <= 0) perIp.delete(ip);
+      else perIp.set(ip, n);
+    };
+    socket.once("close", release);
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req, ip));
   };
   server.on("upgrade", onUpgrade);
 
@@ -72,8 +98,8 @@ export function attachWebSocket(server: Server, engine: Engine, opts: { limiter:
     return { type: "snapshot", channel: "orderbook", marketId, data: { bids, asks } };
   };
 
-  wss.on("connection", (ws: WebSocket) => {
-    const c: Client = { ws, subs: new Set(), alive: true, msgCount: 0 };
+  wss.on("connection", (ws: WebSocket, _req: IncomingMessage, ip: string) => {
+    const c: Client = { ws, ip, subs: new Set(), alive: true, msgCount: 0 };
     clients.add(c);
     ws.on("pong", () => (c.alive = true));
     ws.on("close", () => clients.delete(c));

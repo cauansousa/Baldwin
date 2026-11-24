@@ -147,15 +147,37 @@ describe("pre-trade chain checks", () => {
 
   it("rejects orders the account cannot margin, but lets position-reducing orders through", async () => {
     const h = harness({ withChain: true });
-    // 1 BTC at index 100 with 20% initial margin needs 20 USDC
-    h.chain.free.set(alice.address.toLowerCase(), 19_999_999n);
+    // 1 BTC at index 100: 20% initial margin = 20 USDC, plus taker fee 5 bps of 100 = 0.05 (+ rounding)
+    h.chain.free.set(alice.address.toLowerCase(), 20_050_001n);
     expect(await code(h.place(alice, true, 100, 1))).toBe("INSUFFICIENT_MARGIN");
-    h.chain.free.set(alice.address.toLowerCase(), 20_000_000n);
+    h.chain.free.set(alice.address.toLowerCase(), 20_050_002n);
     expect(await code(h.place(alice, true, 100, 1))).toBe("OK");
     h.chain.free.set(bob.address.toLowerCase(), 0n);
     h.chain.positions.set(`${bob.address.toLowerCase()}:1`, wad(2));
-    expect(await code(h.place(bob, false, 200, 2))).toBe("OK"); // closes the long
-    expect(await code(h.place(bob, false, 200, 3))).toBe("INSUFFICIENT_MARGIN"); // would flip to a short
+    expect(await code(h.place(bob, false, 104, 2))).toBe("OK"); // closes the long: needs nothing
+    expect(await code(h.place(bob, false, 104, 1))).toBe("OK"); // short 1 after both: still less exposure than long 2
+    expect(await code(h.place(bob, false, 104, 4))).toBe("INSUFFICIENT_MARGIN"); // all three: short 5, more exposure than before
+  });
+
+  it("checks margin for all of a trader's open orders together, including fees and off-index prices", async () => {
+    const h = harness({ withChain: true });
+    const me = alice.address.toLowerCase();
+    // Enough for one order of 1 @ 100 (20.05) but not for two.
+    h.chain.free.set(me, 30_000_000n);
+    expect(await code(h.place(alice, true, 100, 1))).toBe("OK");
+    expect(await code(h.place(alice, true, 99, 1))).toBe("INSUFFICIENT_MARGIN");
+    // Opposite-side orders do not add up: worst case is still 1 unit either way.
+    expect(await code(h.place(alice, false, 104, 1))).toBe("OK");
+    // Concurrent submissions cannot both slip through.
+    h.chain.free.set(bob.address.toLowerCase(), 30_000_000n);
+    const results = await Promise.all([code(h.place(bob, true, 100, 1)), code(h.place(bob, true, 100, 1))]);
+    expect(results.sort()).toEqual(["INSUFFICIENT_MARGIN", "OK"]);
+    // Buying above the index costs the difference immediately: 1 @ 105 with index 100
+    // needs 20 (margin) + 5 (loss vs index) + 0.0525 (fee).
+    h.chain.free.set(carol.address.toLowerCase(), 25_000_000n);
+    expect(await code(h.place(carol, true, 105, 1))).toBe("INSUFFICIENT_MARGIN");
+    h.chain.free.set(carol.address.toLowerCase(), 25_052_502n);
+    expect(await code(h.place(carol, true, 105, 1))).toBe("OK");
   });
 
   it("rejects reduce-only orders without an opposite position", async () => {
@@ -165,12 +187,21 @@ describe("pre-trade chain checks", () => {
     expect(await code(h.place(alice, false, 100, 1, { order: { reduceOnly: true } }))).toBe("OK");
   });
 
-  it("answers 503-style when the chain cannot be read", async () => {
+  it("halts intake (503) while the chain cannot be read, and resumes when it can", async () => {
     const h = harness({ withChain: true });
     h.chain.fail = true;
     const e = await h.place(alice, true, 100, 1).catch((x) => x);
     expect(e).toBeInstanceOf(EngineError);
-    expect(e).toMatchObject({ code: "CHAIN_UNAVAILABLE", httpStatus: 503 });
+    expect(e).toMatchObject({ code: "MARKET_HALTED", httpStatus: 503 });
+    h.chain.fail = false;
+    expect(await code(h.place(alice, true, 100, 1))).toBe("OK");
+  });
+
+  it("a chain read failing during the pre-trade check is a 503, not an acceptance", async () => {
+    const h = harness({ withChain: true });
+    await h.engine.refreshChainState();
+    h.chain.fail = true;
+    expect(await h.place(alice, true, 100, 1).catch((x) => x)).toMatchObject({ code: "CHAIN_UNAVAILABLE", httpStatus: 503 });
   });
 });
 

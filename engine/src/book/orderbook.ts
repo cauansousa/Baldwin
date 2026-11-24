@@ -10,6 +10,23 @@
  * - Expired resting orders are dropped lazily when reached and by `pruneExpired`.
  *   An order is expired when `expiry !== 0n && expiry <= now` (the caller may pass
  *   `now` with a safety margin added).
+ * - Price band (optional, mirrors the contract's oracle band [lo, hi] for fill prices):
+ *     * Invariant: no bid rests above `hi` and no ask rests below `lo`. Hence every
+ *       crossing pair in the book has its maker price inside the band.
+ *     * An incoming order trades as if its limit were clamped into the band (a buy
+ *       never pays more than `hi`, a sell never accepts less than `lo`). Nothing is
+ *       skipped: makers outside the band are always behind all makers inside it in
+ *       price priority, so matching simply stops when the next maker is outside.
+ *     * A remainder that would rest on the wrong side (bid above `hi`, ask below
+ *       `lo`) is cancelled instead of resting.
+ *     * `pruneOutOfBand` removes resting orders that ended up on the wrong side
+ *       after the band moved. Orders beyond the far side (bid below `lo`, ask above
+ *       `hi`) rest untouched and become matchable when the band reaches them.
+ * - Post-only orders never take liquidity: rejected on arrival if they would, and
+ *   cancelled if a later `restore` would make them the taker.
+ * - `reduceOnlyMakersOnly` (exchange paused): an order may only trade with
+ *   reduce-only makers. Matching stops at the first maker that is not reduce-only
+ *   and the remainder is cancelled (it cannot rest across a better-priced order).
  * - The book is never left crossed.
  */
 
@@ -23,6 +40,16 @@ export interface BookOrder {
   price: bigint;
   /** Unix seconds; 0n = never expires. */
   expiry: bigint;
+  /** Never executes as taker. */
+  postOnly?: boolean;
+  /** Carried from the signed order; used by `reduceOnlyMakersOnly`. */
+  reduceOnly?: boolean;
+}
+
+/** Inclusive bounds for fill prices. */
+export interface Band {
+  lo: bigint;
+  hi: bigint;
 }
 
 export interface RestingOrder extends BookOrder {
@@ -40,8 +67,15 @@ export interface BookFill {
   takerIsBuy: boolean;
 }
 
-export type RejectReason = "below_min_size" | "invalid_price" | "expired" | "duplicate" | "post_only_would_cross" | "conflicting_flags";
-export type CancelReason = "ioc" | "self_trade";
+export type RejectReason =
+  | "below_min_size"
+  | "invalid_price"
+  | "expired"
+  | "duplicate"
+  | "post_only_would_cross"
+  | "post_only_outside_band"
+  | "conflicting_flags";
+export type CancelReason = "ioc" | "self_trade" | "price_band" | "halted" | "post_only";
 
 export interface PlaceOptions {
   /** Current time, unix seconds. */
@@ -50,6 +84,18 @@ export interface PlaceOptions {
   postOnly?: boolean;
   /** Immediate-or-cancel: never rest. */
   ioc?: boolean;
+  /** Fill-price band; see the file comment. */
+  band?: Band | undefined;
+  /** Accept a quantity below the market minimum (remainder of a partly filled order). */
+  allowBelowMin?: boolean;
+  /** Only trade with reduce-only makers (exchange paused). */
+  reduceOnlyMakersOnly?: boolean;
+}
+
+export interface RestoreOptions {
+  now: bigint;
+  band?: Band | undefined;
+  reduceOnlyMakersOnly?: boolean;
 }
 
 export type PlaceResult =
@@ -71,8 +117,8 @@ export type PlaceResult =
 export interface UncrossResult {
   fills: BookFill[];
   expired: string[];
-  /** Orders whose remainder was cancelled by self-trade prevention. */
-  selfTradeCancelled: { id: string; size: bigint }[];
+  /** Resting orders removed while uncrossing (self-trade, post-only as taker, band, pause). */
+  cancelled: { id: string; size: bigint; reason: CancelReason }[];
 }
 
 export interface Level {
@@ -90,7 +136,7 @@ export class OrderBook {
   private readonly byId = new Map<string, RestingOrder>();
   private nextSeq = 1n;
 
-  constructor(public readonly minOrderSize: bigint = 1n) {}
+  constructor(public minOrderSize: bigint = 1n) {}
 
   get(id: string): Readonly<RestingOrder> | undefined {
     return this.byId.get(id);
@@ -115,20 +161,29 @@ export class OrderBook {
   place(order: BookOrder, size: bigint, opts: PlaceOptions): PlaceResult {
     const { now } = opts;
     if (opts.postOnly && opts.ioc) return { accepted: false, reason: "conflicting_flags", expired: [] };
-    if (size <= 0n || size < this.minOrderSize) return { accepted: false, reason: "below_min_size", expired: [] };
+    if (size <= 0n || (size < this.minOrderSize && !opts.allowBelowMin)) return { accepted: false, reason: "below_min_size", expired: [] };
     if (order.price <= 0n) return { accepted: false, reason: "invalid_price", expired: [] };
     if (isExpired(order, now)) return { accepted: false, reason: "expired", expired: [] };
     if (this.byId.has(order.id)) return { accepted: false, reason: "duplicate", expired: [] };
 
     const opposite = order.isBuy ? this.asks : this.bids;
     const expired: string[] = [];
+    const wrongSide = isWrongSide(order, opts.band);
 
     if (opts.postOnly) {
+      if (wrongSide) return { accepted: false, reason: "post_only_outside_band", expired };
       this.dropExpiredHead(opposite, now, expired);
       const best = opposite[0];
       if (best && this.crosses(order.isBuy, order.price, best.price)) {
         return { accepted: false, reason: "post_only_would_cross", expired };
       }
+    }
+
+    // The taker never trades outside the band: clamp its limit into it.
+    let limit = order.price;
+    if (opts.band) {
+      if (order.isBuy && limit > opts.band.hi) limit = opts.band.hi;
+      if (!order.isBuy && limit < opts.band.lo) limit = opts.band.lo;
     }
 
     const seq = this.nextSeq++;
@@ -139,9 +194,13 @@ export class OrderBook {
     while (remaining > 0n) {
       this.dropExpiredHead(opposite, now, expired);
       const maker = opposite[0];
-      if (!maker || !this.crosses(order.isBuy, order.price, maker.price)) break;
+      if (!maker || !this.crosses(order.isBuy, limit, maker.price)) break;
       if (maker.trader === order.trader) {
         cancelReason = "self_trade";
+        break;
+      }
+      if (opts.reduceOnlyMakersOnly && !maker.reduceOnly) {
+        cancelReason = "halted";
         break;
       }
       const fillSize = remaining < maker.remaining ? remaining : maker.remaining;
@@ -158,6 +217,7 @@ export class OrderBook {
     let cancelled = 0n;
     if (remaining > 0n) {
       if (cancelReason === undefined && opts.ioc) cancelReason = "ioc";
+      if (cancelReason === undefined && wrongSide) cancelReason = "price_band";
       if (cancelReason !== undefined) {
         cancelled = remaining;
       } else {
@@ -185,35 +245,54 @@ export class OrderBook {
    * otherwise it is re-inserted. Re-insertion can cross the book (orders that arrived
    * in the meantime may rest at crossing prices), so the book is then uncrossed: the
    * order with the lower `seq` is the maker and its limit price is the fill price.
+   * A crossing pair that may not trade loses its newer order: same trader (STP),
+   * newer order is post-only (it would be the taker), or pause rules forbid the pair.
+   * An order that is expired or on the wrong side of the band is not restored.
    */
-  restore(order: BookOrder, seq: bigint, size: bigint, now: bigint): UncrossResult {
+  restore(order: BookOrder, seq: bigint, size: bigint, opts: RestoreOptions): UncrossResult {
     if (size <= 0n) throw new Error("restore size must be positive");
+    const { now } = opts;
+    const res: UncrossResult = { fills: [], expired: [], cancelled: [] };
+    // Keep the band invariant before anything can be matched.
+    if (opts.band) {
+      for (const o of this.pruneOutOfBand(opts.band)) {
+        res.cancelled.push({ ...o, reason: "price_band" });
+      }
+    }
     const existing = this.byId.get(order.id);
     if (existing) {
       existing.remaining += size;
-    } else if (!isExpired(order, now)) {
+    } else if (isExpired(order, now)) {
+      res.expired.push(order.id);
+      return res;
+    } else if (isWrongSide(order, opts.band)) {
+      res.cancelled.push({ id: order.id, size, reason: "price_band" });
+      return res;
+    } else {
       this.insert({ ...order, remaining: size, seq });
       if (seq >= this.nextSeq) this.nextSeq = seq + 1n;
-    } else {
-      return { fills: [], expired: [order.id], selfTradeCancelled: [] };
     }
-    return this.uncross(now);
+    this.uncross(opts, res);
+    return res;
   }
 
   /** Match resting orders against each other while best bid >= best ask. */
-  private uncross(now: bigint): UncrossResult {
-    const res: UncrossResult = { fills: [], expired: [], selfTradeCancelled: [] };
+  private uncross(opts: RestoreOptions, res: UncrossResult): void {
     for (;;) {
-      this.dropExpiredHead(this.bids, now, res.expired);
-      this.dropExpiredHead(this.asks, now, res.expired);
+      this.dropExpiredHead(this.bids, opts.now, res.expired);
+      this.dropExpiredHead(this.asks, opts.now, res.expired);
       const bid = this.bids[0];
       const ask = this.asks[0];
       if (!bid || !ask || bid.price < ask.price) break;
       const [maker, taker] = bid.seq < ask.seq ? [bid, ask] : [ask, bid];
-      if (bid.trader === ask.trader) {
-        // Same policy as for incoming orders: the newer order is cancelled.
+      let drop: CancelReason | undefined;
+      if (bid.trader === ask.trader) drop = "self_trade";
+      else if (taker.postOnly) drop = "post_only";
+      else if (opts.reduceOnlyMakersOnly && !(maker.reduceOnly && taker.reduceOnly)) drop = "halted";
+      if (drop) {
+        // Same policy as for incoming orders: the newer order gives way.
         this.remove(taker);
-        res.selfTradeCancelled.push({ id: taker.id, size: taker.remaining });
+        res.cancelled.push({ id: taker.id, size: taker.remaining, reason: drop });
         continue;
       }
       const size = bid.remaining < ask.remaining ? bid.remaining : ask.remaining;
@@ -223,7 +302,22 @@ export class OrderBook {
       if (bid.remaining === 0n) this.remove(bid);
       if (ask.remaining === 0n) this.remove(ask);
     }
-    return res;
+  }
+
+  /** Remove resting orders on the wrong side of the band (bids above hi, asks below lo). */
+  pruneOutOfBand(band: Band): { id: string; size: bigint }[] {
+    const out: { id: string; size: bigint }[] = [];
+    while (this.bids[0] && this.bids[0].price > band.hi) {
+      const o = this.bids.shift()!;
+      this.byId.delete(o.id);
+      out.push({ id: o.id, size: o.remaining });
+    }
+    while (this.asks[0] && this.asks[0].price < band.lo) {
+      const o = this.asks.shift()!;
+      this.byId.delete(o.id);
+      out.push({ id: o.id, size: o.remaining });
+    }
+    return out;
   }
 
   /** Remove every expired resting order. Returns their ids. */
@@ -291,6 +385,11 @@ export class OrderBook {
     if (i >= 0) side.splice(i, 1);
     this.byId.delete(o.id);
   }
+}
+
+function isWrongSide(order: { isBuy: boolean; price: bigint }, band: Band | undefined): boolean {
+  if (!band) return false;
+  return order.isBuy ? order.price > band.hi : order.price < band.lo;
 }
 
 function aggregate(side: RestingOrder[], maxLevels: number): Level[] {

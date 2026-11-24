@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { OrderBook, type BookOrder } from "../src/book/orderbook.ts";
+import { OrderBook, type BookOrder, type PlaceOptions } from "../src/book/orderbook.ts";
 
 const NOW = 1_000n;
 let n = 0;
 const o = (trader: string, isBuy: boolean, price: bigint, expiry = 0n): BookOrder => ({ id: `o${++n}`, trader, isBuy, price, expiry });
-const place = (book: OrderBook, order: BookOrder, size: bigint, opts: { postOnly?: boolean; ioc?: boolean; now?: bigint } = {}) => {
+const place = (book: OrderBook, order: BookOrder, size: bigint, opts: Partial<PlaceOptions> = {}) => {
   const r = book.place(order, size, { now: NOW, ...opts });
   if (!r.accepted) throw new Error(`rejected: ${r.reason}`);
   return r;
@@ -209,7 +209,7 @@ describe("OrderBook", () => {
       const ra = place(book, a, 5n);
       place(book, b, 5n);
       place(book, o("t", true, 100n), 2n);
-      expect(book.restore(a, ra.seq, 2n, NOW).fills).toEqual([]);
+      expect(book.restore(a, ra.seq, 2n, { now: NOW }).fills).toEqual([]);
       expect(book.get(a.id)!.remaining).toBe(5n);
       expect(place(book, o("u", true, 100n), 5n).fills.map((f) => f.makerId)).toEqual([a.id]);
     });
@@ -221,7 +221,7 @@ describe("OrderBook", () => {
       const ra = place(book, a, 1n);
       place(book, b, 1n);
       place(book, o("t", true, 100n), 1n); // consumes a
-      book.restore(a, ra.seq, 1n, NOW);
+      book.restore(a, ra.seq, 1n, { now: NOW });
       expect(place(book, o("u", true, 100n), 1n).fills.map((f) => f.makerId)).toEqual([a.id]);
     });
 
@@ -232,7 +232,7 @@ describe("OrderBook", () => {
       place(book, o("t", true, 100n), 2n); // consumes the ask
       const lateBid = o("c", true, 101n);
       place(book, lateBid, 1n); // rests: book has no asks
-      const r = book.restore(ask, ra.seq, 2n, NOW);
+      const r = book.restore(ask, ra.seq, 2n, { now: NOW });
       // the older order (the ask) is the maker: fill at 100, not 101
       expect(r.fills).toEqual([{ makerId: ask.id, takerId: lateBid.id, price: 100n, size: 1n, takerIsBuy: true }]);
       expect(book.get(ask.id)!.remaining).toBe(1n);
@@ -246,9 +246,9 @@ describe("OrderBook", () => {
       place(book, o("t", true, 100n), 1n);
       const ownBid = o("a", true, 100n);
       place(book, ownBid, 3n);
-      const r = book.restore(ask, ra.seq, 1n, NOW);
+      const r = book.restore(ask, ra.seq, 1n, { now: NOW });
       expect(r.fills).toEqual([]);
-      expect(r.selfTradeCancelled).toEqual([{ id: ownBid.id, size: 3n }]);
+      expect(r.cancelled).toEqual([{ id: ownBid.id, size: 3n, reason: "self_trade" }]);
       expect(book.get(ask.id)!.remaining).toBe(1n);
       expect(book.get(ownBid.id)).toBeUndefined();
     });
@@ -258,9 +258,125 @@ describe("OrderBook", () => {
       const ask = o("a", false, 100n, 1_200n);
       const ra = place(book, ask, 1n);
       place(book, o("t", true, 100n), 1n);
-      expect(book.restore(ask, ra.seq, 1n, 1_200n)).toEqual({ fills: [], expired: [ask.id], selfTradeCancelled: [] });
+      expect(book.restore(ask, ra.seq, 1n, { now: 1_200n })).toEqual({ fills: [], expired: [ask.id], cancelled: [] });
       expect(book.size).toBe(0);
     });
+  });
+
+  describe("post-only as taker", () => {
+    it("a resting post-only order that a restored older order would make the taker is cancelled instead", () => {
+      const book = new OrderBook();
+      const ask = o("a", false, 100n);
+      const ra = place(book, ask, 1n);
+      place(book, o("t", true, 100n), 1n); // consumes the ask
+      const postOnlyBid: BookOrder = { ...o("b", true, 101n), postOnly: true };
+      place(book, postOnlyBid, 1n, { postOnly: true }); // rests: no ask in the book
+      const r = book.restore(ask, ra.seq, 1n, { now: NOW });
+      expect(r.fills).toEqual([]);
+      expect(r.cancelled).toEqual([{ id: postOnlyBid.id, size: 1n, reason: "post_only" }]);
+      expect(book.get(ask.id)!.remaining).toBe(1n);
+      expect(book.bestBid()).toBeUndefined();
+    });
+
+    it("a restored post-only order may still be the maker", () => {
+      const book = new OrderBook();
+      const ask: BookOrder = { ...o("a", false, 100n), postOnly: true };
+      const ra = place(book, ask, 1n, { postOnly: true });
+      place(book, o("t", true, 100n), 1n);
+      const lateBid = o("c", true, 100n);
+      place(book, lateBid, 1n);
+      const r = book.restore(ask, ra.seq, 1n, { now: NOW });
+      expect(r.fills).toEqual([{ makerId: ask.id, takerId: lateBid.id, price: 100n, size: 1n, takerIsBuy: true }]);
+    });
+  });
+
+  describe("price band", () => {
+    const band = { lo: 95n, hi: 105n };
+
+    it("a taker never trades outside the band and its out-of-band remainder is cancelled, not rested", () => {
+      const book = new OrderBook();
+      const inBand = o("a", false, 104n);
+      const edge = o("b", false, 105n);
+      const outside = o("c", false, 106n);
+      for (const x of [inBand, edge, outside]) place(book, x, 1n, { band });
+      const t = o("t", true, 200n);
+      const r = place(book, t, 5n, { band });
+      expect(r.fills.map((f) => [f.makerId, f.price])).toEqual([[inBand.id, 104n], [edge.id, 105n]]);
+      expect(r).toMatchObject({ rested: 0n, cancelled: 3n, cancelReason: "price_band" });
+      expect(book.get(t.id)).toBeUndefined();
+      expect(book.get(outside.id)!.remaining).toBe(1n); // far-side orders rest untouched
+    });
+
+    it("sell side mirrors it: stops below lo, remainder cancelled", () => {
+      const book = new OrderBook();
+      const good = o("a", true, 95n);
+      const deep = o("b", true, 94n);
+      place(book, good, 1n, { band });
+      place(book, deep, 1n, { band });
+      const r = place(book, o("t", false, 1n), 3n, { band });
+      expect(r.fills.map((f) => f.makerId)).toEqual([good.id]);
+      expect(r).toMatchObject({ cancelled: 2n, cancelReason: "price_band" });
+      expect(book.get(deep.id)!.remaining).toBe(1n);
+    });
+
+    it("an order on the wrong side with nothing to match is accepted and fully cancelled; post-only is rejected", () => {
+      const book = new OrderBook();
+      expect(place(book, o("a", true, 106n), 1n, { band })).toMatchObject({ fills: [], rested: 0n, cancelled: 1n, cancelReason: "price_band" });
+      expect(book.size).toBe(0);
+      expect(book.place(o("a", false, 94n), 1n, { now: NOW, band, postOnly: true })).toMatchObject({ accepted: false, reason: "post_only_outside_band" });
+    });
+
+    it("orders at the band edge and beyond the far side rest", () => {
+      const book = new OrderBook();
+      expect(place(book, o("a", true, 105n), 1n, { band }).rested).toBe(1n);
+      expect(place(book, o("b", true, 10n), 1n, { band }).rested).toBe(1n);
+      expect(place(book, o("c", false, 1000n), 1n, { band }).rested).toBe(1n);
+    });
+
+    it("pruneOutOfBand removes exactly the resting orders on the wrong side after the band moved", () => {
+      const book = new OrderBook();
+      const b1 = o("a", true, 100n);
+      const b2 = o("b", true, 90n);
+      const a1 = o("c", false, 101n);
+      const a2 = o("d", false, 120n);
+      for (const x of [b1, b2, a1, a2]) place(book, x, 2n, { band });
+      expect(book.pruneOutOfBand(band)).toEqual([]);
+      // index falls: band is now [85, 95]
+      expect(book.pruneOutOfBand({ lo: 85n, hi: 95n })).toEqual([{ id: b1.id, size: 2n }]);
+      // index rises: band is now [110, 125]
+      expect(book.pruneOutOfBand({ lo: 110n, hi: 125n })).toEqual([{ id: a1.id, size: 2n }]);
+      expect(book.orders().map((x) => x.id)).toEqual([b2.id, a2.id]);
+    });
+
+    it("restore does not bring back an order that is now on the wrong side", () => {
+      const book = new OrderBook();
+      const ask = o("a", false, 100n);
+      const ra = place(book, ask, 1n, { band });
+      place(book, o("t", true, 100n), 1n, { band });
+      const r = book.restore(ask, ra.seq, 1n, { now: NOW, band: { lo: 110n, hi: 120n } });
+      expect(r).toEqual({ fills: [], expired: [], cancelled: [{ id: ask.id, size: 1n, reason: "price_band" }] });
+      expect(book.size).toBe(0);
+    });
+  });
+
+  describe("reduceOnlyMakersOnly (exchange paused)", () => {
+    it("trades only with reduce-only makers and stops at the first other one, cancelling the remainder", () => {
+      const book = new OrderBook();
+      const ro: BookOrder = { ...o("a", false, 100n), reduceOnly: true };
+      const normal = o("b", false, 101n);
+      const roBehind: BookOrder = { ...o("c", false, 102n), reduceOnly: true };
+      for (const x of [ro, normal, roBehind]) place(book, x, 1n);
+      const r = place(book, { ...o("t", true, 102n), reduceOnly: true }, 3n, { reduceOnlyMakersOnly: true });
+      expect(r.fills.map((f) => f.makerId)).toEqual([ro.id]);
+      expect(r).toMatchObject({ rested: 0n, cancelled: 2n, cancelReason: "halted" });
+      expect(book.get(normal.id)!.remaining).toBe(1n);
+    });
+  });
+
+  it("allowBelowMin lets the remainder of a partly filled order in", () => {
+    const book = new OrderBook(10n);
+    expect(book.place(o("a", true, 100n), 4n, { now: NOW })).toMatchObject({ accepted: false, reason: "below_min_size" });
+    expect(book.place(o("a", true, 100n), 4n, { now: NOW, allowBelowMin: true })).toMatchObject({ accepted: true, rested: 4n });
   });
 
   it("randomised: never crossed, never self-matched, sizes conserved", () => {
