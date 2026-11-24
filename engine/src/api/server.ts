@@ -1,7 +1,7 @@
 import cors from "@fastify/cors";
 import Fastify, { type FastifyInstance } from "fastify";
 import { EngineError, type Engine } from "../engine/engine.ts";
-import { jsonReplacer } from "../types.ts";
+import { errMessage, jsonReplacer, silentLogger, type Logger } from "../types.ts";
 import { RateLimiter } from "./rateLimit.ts";
 import { parseAddress, parseCancelBody, parseIntParam, parseMarketId, parseOrderHash, parseSubmitBody, ValidationError } from "./validation.ts";
 import { attachWebSocket } from "./ws.ts";
@@ -21,14 +21,23 @@ export interface ServerOptions {
    * array in it is merged into the response's `warnings`.
    */
   info?: Record<string, unknown> | (() => Record<string, unknown>);
-  logger?: boolean;
+  /** Unexpected errors (HTTP 500) are reported here. */
+  logger?: Logger;
 }
 
-const errorBody = (code: string, message: string) => ({ error: { code, message } });
+const errorBody = (code: string, message: string) => ({ error: { code, message, outcome: "not_applied" } });
 
 /** REST + WebSocket API over an Engine. Call `app.listen` to serve; `app.close` shuts everything down. */
 export async function buildServer(engine: Engine, opts: ServerOptions = {}): Promise<FastifyInstance> {
-  const app = Fastify({ logger: opts.logger ?? false, bodyLimit: 16 * 1024, trustProxy: opts.trustProxy ?? false });
+  const log = opts.logger ?? silentLogger;
+  const app = Fastify({
+    logger: false,
+    bodyLimit: 16 * 1024,
+    trustProxy: opts.trustProxy ?? false,
+    // On close: idle keep-alive connections are closed at once, busy ones after their response.
+    forceCloseConnections: "idle",
+    requestTimeout: 30_000,
+  });
   const limiter = new RateLimiter(opts.rateLimitPerMinute ?? 600);
 
   app.setReplySerializer((payload) => JSON.stringify(payload, jsonReplacer));
@@ -48,15 +57,24 @@ export async function buildServer(engine: Engine, opts: ServerOptions = {}): Pro
     }
   });
 
-  app.setErrorHandler((err: unknown, _req, reply) => {
-    if (err instanceof EngineError) return reply.code(err.httpStatus).send(errorBody(err.code, err.message));
-    if (err instanceof ValidationError) return reply.code(400).send(errorBody("BAD_REQUEST", err.message));
+  app.setErrorHandler((err: unknown, req, reply) => {
+    if (err instanceof EngineError) {
+      if (err.outcome === "unknown") log.error("request ended in an unknown state", { method: req.method, route: req.routeOptions?.url ?? req.url, code: err.code, error: err.message });
+      return reply.code(err.httpStatus).send({ error: { code: err.code, message: err.message, outcome: err.outcome } });
+    }
+    if (err instanceof ValidationError) return reply.code(400).send({ error: { code: "BAD_REQUEST", message: err.message, outcome: "not_applied" } });
     const e = err as { statusCode?: number; message?: string };
     if (typeof e.statusCode === "number" && e.statusCode >= 400 && e.statusCode < 500) {
-      return reply.code(e.statusCode).send(errorBody("BAD_REQUEST", e.message ?? "bad request"));
+      return reply.code(e.statusCode).send({ error: { code: "BAD_REQUEST", message: e.message ?? "bad request", outcome: "not_applied" } });
     }
-    app.log.error(err);
-    return reply.code(500).send(errorBody("INTERNAL", "internal error"));
+    // Anything else is a bug or a broken dependency: say so in the log, not to the client.
+    log.error("unhandled error in request", {
+      method: req.method,
+      route: req.routeOptions?.url ?? req.url,
+      error: errMessage(err),
+      stack: err instanceof Error ? err.stack?.split("\n").slice(0, 6).join(" | ") : undefined,
+    });
+    return reply.code(500).send({ error: { code: "INTERNAL", message: "internal error", outcome: "unknown" } });
   });
   app.setNotFoundHandler((_req, reply) => reply.code(404).send(errorBody("NOT_FOUND", "no such route")));
 
@@ -64,11 +82,16 @@ export async function buildServer(engine: Engine, opts: ServerOptions = {}): Pro
     const settlement = engine.settlementStatus();
     const { warnings: extra, ...info } = (typeof opts.info === "function" ? opts.info() : (opts.info ?? {})) as { warnings?: string[] };
     const warnings = [...(extra ?? [])];
+    if (settlement.recovering) warnings.push("recovering: reconciling stored state with the chain; not accepting orders yet");
     if (settlement.stalled) warnings.push(`settlement is stalled: ${settlement.lastError ?? "unknown error"}`);
+    if (settlement.insufficientFunds) warnings.push("operator cannot pay for the settlement transaction: fund the operator account");
+    if (settlement.feeCapReached) warnings.push("a settlement transaction is stuck at the fee cap (MAX_FEE_PER_GAS_GWEI)");
+    if (settlement.storeBroken) warnings.push("engine state cannot be written to the store; not accepting orders");
     const chain = engine.chainStatus();
     if (chain?.paused) warnings.push("exchange is paused");
-    for (const m of chain?.markets ?? []) if (m.indexPrice === null) warnings.push(`no index price for market ${m.marketId}: market halted`);
-    return { ok: !settlement.stalled, ...info, warnings, settlement, chain };
+    for (const m of chain?.markets ?? []) if (m.indexPrice === null && !settlement.recovering) warnings.push(`no index price for market ${m.marketId}: market halted`);
+    const ok = !settlement.stalled && !settlement.recovering && !settlement.storeBroken;
+    return { ok, recovering: settlement.recovering, ...info, warnings, settlement, chain };
   });
 
   // Prometheus text exposition format.
@@ -108,6 +131,11 @@ export async function buildServer(engine: Engine, opts: ServerOptions = {}): Pro
     trustProxy: opts.trustProxy ?? false,
     maxConnections: opts.wsMaxConnections ?? 1000,
     maxConnectionsPerIp: opts.wsMaxConnectionsPerIp ?? 10,
+  });
+  // WebSocket connections are upgraded sockets the HTTP server would wait on for ever:
+  // they are terminated before the server starts closing, not after.
+  app.addHook("preClose", async () => {
+    ws.close();
   });
   app.addHook("onClose", async () => {
     ws.close();

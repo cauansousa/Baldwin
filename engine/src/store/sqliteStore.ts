@@ -53,10 +53,18 @@ export class SqliteStore implements EngineStore {
   private readonly db: DatabaseSync;
   private readonly stmts = new Map<string, StatementSync>();
 
-  constructor(path: string) {
+  /**
+   * @param exclusive hold the file exclusively for the life of this connection, so
+   *   that a second engine process pointed at the same file fails at once instead of
+   *   corrupting the first one's view. The engine process sets this.
+   */
+  constructor(path: string, opts: { exclusive?: boolean } = {}) {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
-    this.db.exec("pragma journal_mode = wal; pragma synchronous = full; pragma busy_timeout = 5000;");
+    // A short busy timeout: the engine is the only writer, so waiting long is never right.
+    this.db.exec("pragma busy_timeout = 250;");
+    if (opts.exclusive) this.db.exec("pragma locking_mode = exclusive;");
+    this.db.exec("pragma journal_mode = wal; pragma synchronous = full;");
     this.db.exec(SCHEMA);
   }
 
@@ -120,7 +128,12 @@ export class SqliteStore implements EngineStore {
       trader: r.trader as Address,
       nonce: BigInt(r.nonce),
     }));
-    return { orders, matches, trades, minValidNonces };
+    const deadNonces = (this.stmt("select trader, nonce, expiry from dead_nonces").all() as { trader: string; nonce: string; expiry: number }[]).map((r) => ({
+      trader: r.trader as Address,
+      nonce: BigInt(r.nonce),
+      expiry: BigInt(r.expiry),
+    }));
+    return { orders, matches, trades, minValidNonces, deadNonces };
   }
 
   commit(c: Commit): void {
@@ -164,6 +177,10 @@ export class SqliteStore implements EngineStore {
       for (const t of c.trades) addTrade.run(t.marketId, JSON.stringify(t, jsonReplacer));
       const setMin = this.stmt("insert into min_nonces (trader, nonce) values (?, ?) on conflict (trader) do update set nonce = excluded.nonce");
       for (const m of c.minValidNonces) setMin.run(m.trader.toLowerCase(), m.nonce.toString());
+      const addDead = this.stmt(
+        "insert into dead_nonces (trader, nonce, expiry) values (?, ?, ?) on conflict (trader, nonce) do update set expiry = max(expiry, excluded.expiry)",
+      );
+      for (const d of c.deadNonces) addDead.run(d.trader.toLowerCase(), d.nonce.toString(), sqlInt(d.expiry));
       const setMeta = this.stmt("insert into meta (k, v) values (?, ?) on conflict (k) do update set v = excluded.v");
       for (const [k, v] of Object.entries(c.meta)) setMeta.run(k, v);
     });
@@ -193,20 +210,9 @@ export class SqliteStore implements EngineStore {
     this.stmt("insert into meta (k, v) values (?, ?) on conflict (k) do update set v = excluded.v").run(key, value);
   }
 
-  // -------------------------------------------------------------- dead nonces
-
-  has(trader: Address, nonce: bigint): boolean {
+  /** Whether a dead nonce is on disk (for tests and inspection; the engine keeps its own set). */
+  hasDeadNonce(trader: Address, nonce: bigint): boolean {
     return this.stmt("select 1 from dead_nonces where trader = ? and nonce = ?").get(trader.toLowerCase(), nonce.toString()) !== undefined;
-  }
-
-  add(trader: Address, nonce: bigint, expiry: bigint): void {
-    this.stmt(
-      "insert into dead_nonces (trader, nonce, expiry) values (?, ?, ?) on conflict (trader, nonce) do update set expiry = max(expiry, excluded.expiry)",
-    ).run(trader.toLowerCase(), nonce.toString(), sqlInt(expiry));
-  }
-
-  prune(now: bigint): void {
-    this.stmt("delete from dead_nonces where expiry <= ?").run(sqlInt(now));
   }
 
   close(): void {

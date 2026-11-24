@@ -1,4 +1,3 @@
-import type { DeadNonceStore } from "../engine/deadNonces.ts";
 import type { Address, Hex, Order } from "../types.ts";
 
 export interface StoredOrder {
@@ -51,6 +50,18 @@ export interface Snapshot {
   /** Oldest first. */
   trades: StoredTrade[];
   minValidNonces: { trader: Address; nonce: bigint }[];
+  deadNonces: DeadNonce[];
+}
+
+/**
+ * A (trader, nonce) pair whose order must never be accepted again: cancelled by the
+ * trader, closed by the engine (IOC / self-trade / band remainder), or rejected after
+ * an on-chain failure. Needed only until `expiry` (unix seconds) has passed.
+ */
+export interface DeadNonce {
+  trader: Address;
+  nonce: bigint;
+  expiry: bigint;
 }
 
 /** Everything one engine operation changed. Applied atomically. */
@@ -64,6 +75,8 @@ export interface Commit {
   removeMatches: string[];
   trades: StoredTrade[];
   minValidNonces: { trader: Address; nonce: bigint }[];
+  /** Written in the same transaction as the order rows they belong to. */
+  deadNonces: DeadNonce[];
   /** Small key/value facts (counters). */
   meta: Record<string, string>;
 }
@@ -76,10 +89,10 @@ export interface KeyValueStore {
 }
 
 /**
- * Durable engine state. `commit`, `setMeta` and `add` must be atomic and on stable
- * storage when they return; they throw if that cannot be guaranteed.
+ * Durable engine state. `commit` and `setMeta` must be atomic and on stable storage
+ * when they return; they throw if that cannot be guaranteed.
  */
-export interface EngineStore extends DeadNonceStore, KeyValueStore {
+export interface EngineStore extends KeyValueStore {
   load(): Snapshot;
   commit(c: Commit): void;
   /** Delete finished orders whose expiry is <= now, and trades beyond `keepTrades` per market. */

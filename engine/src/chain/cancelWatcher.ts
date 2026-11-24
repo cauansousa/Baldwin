@@ -46,6 +46,7 @@ export function cancelWatcher(opts: {
   startBlock?: bigint | undefined;
   maxRange?: bigint;
   overlap?: bigint;
+  headLag?: bigint;
   onError?: (e: unknown) => void;
 }): LogPoller<CancelEvent> {
   return new LogPoller<CancelEvent>({
@@ -61,6 +62,7 @@ export function cancelWatcher(opts: {
     startBlock: opts.startBlock,
     maxRange: opts.maxRange,
     overlap: opts.overlap,
+    headLag: opts.headLag,
     logger: opts.logger,
     onError: opts.onError,
   });

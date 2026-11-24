@@ -19,8 +19,20 @@ export interface LogPollerOptions<E> {
   maxRange?: bigint;
   /** The span is never reduced below this. Default 10. */
   minRange?: bigint;
-  /** Blocks before the cursor that are scanned again on each pass (shallow reorgs). Default 0. */
+  /**
+   * Blocks before the cursor that are scanned again on each pass. Covers shallow
+   * reorgs and a backend that answered a query before it had the newest blocks.
+   * Default 5.
+   */
   overlap?: bigint;
+  /**
+   * Only blocks up to `head - headLag` are scanned: an RPC backend that is a block or
+   * two behind the one that reported the head answers `eth_getLogs` for a range it
+   * has not fully seen with fewer logs and no error. Default 2.
+   */
+  headLag?: bigint;
+  /** At most this many ranges per `poll` (the rest follows on later passes). Default: no limit. */
+  maxRangesPerPoll?: number;
   /** Longest pause between attempts after errors, ms. Default 30000. */
   maxBackoffMs?: number;
   logger?: Logger;
@@ -34,6 +46,10 @@ export interface LogPollerOptions<E> {
  * response-size limits, rate limits), doubled again after successes; failed passes
  * are retried with exponential backoff. Because the cursor only advances after a
  * range was handled, a restart continues where it left off and misses nothing.
+ *
+ * `eth_getLogs` is not trusted right up to the head: scanning stops `headLag` blocks
+ * short of it and every pass re-reads the last `overlap` blocks, so the handler sees
+ * some events more than once and must be idempotent.
  */
 export class LogPoller<E> {
   private cursor: bigint | undefined;
@@ -41,6 +57,9 @@ export class LogPoller<E> {
   private readonly maxRange: bigint;
   private readonly minRange: bigint;
   private readonly overlap: bigint;
+  private readonly headLag: bigint;
+  private readonly maxRangesPerPoll: number;
+  private caughtUp = false;
   private readonly maxBackoffMs: number;
   private readonly log: Logger;
   private timer: NodeJS.Timeout | null = null;
@@ -52,7 +71,9 @@ export class LogPoller<E> {
     this.maxRange = opts.maxRange ?? 2000n;
     this.minRange = opts.minRange ?? 10n;
     this.range = this.maxRange;
-    this.overlap = opts.overlap ?? 0n;
+    this.overlap = opts.overlap ?? 5n;
+    this.headLag = opts.headLag ?? 2n;
+    this.maxRangesPerPoll = opts.maxRangesPerPoll ?? Number.MAX_SAFE_INTEGER;
     this.maxBackoffMs = opts.maxBackoffMs ?? 30_000;
     this.log = opts.logger ?? silentLogger;
     this.cursor = opts.loadCursor();
@@ -63,20 +84,37 @@ export class LogPoller<E> {
     return this.cursor;
   }
 
-  /** One pass up to the current head. Rejects (after shrinking the span) if a query or the handler fails. */
+  /** True once a pass has reached the scan target (head - headLag). */
+  get isCaughtUp(): boolean {
+    return this.caughtUp;
+  }
+
+  /**
+   * One pass up to `head - headLag` (or `maxRangesPerPoll` ranges). Rejects (after
+   * shrinking the span) if a query or the handler fails.
+   */
   async poll(): Promise<void> {
     if (this.running) return;
     this.running = true;
     try {
-      const head = await this.opts.head();
+      const tip = await this.opts.head();
+      const head = tip - this.headLag;
       if (this.cursor === undefined) {
-        this.cursor = this.opts.startBlock !== undefined ? this.opts.startBlock - 1n : head;
+        this.cursor = this.opts.startBlock !== undefined ? this.opts.startBlock - 1n : head < -1n ? -1n : head;
         this.opts.saveCursor(this.cursor);
       }
-      if (head <= this.cursor) return;
+      if (head <= this.cursor) {
+        this.caughtUp = true;
+        return;
+      }
       let from = this.cursor + 1n - this.overlap;
       if (from < 0n) from = 0n;
+      let ranges = 0;
       while (from <= head) {
+        if (ranges++ >= this.maxRangesPerPoll) {
+          this.caughtUp = false;
+          return;
+        }
         const to = from + this.range - 1n < head ? from + this.range - 1n : head;
         let events: E[];
         try {
@@ -93,6 +131,7 @@ export class LogPoller<E> {
         from = to + 1n;
         if (this.range < this.maxRange) this.range = this.range * 2n < this.maxRange ? this.range * 2n : this.maxRange;
       }
+      this.caughtUp = true;
     } finally {
       this.running = false;
     }

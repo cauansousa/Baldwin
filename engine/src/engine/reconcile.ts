@@ -28,6 +28,13 @@ export function isReducing(position: bigint, isBuy: boolean, size: bigint): bool
 export interface SideVerdict {
   atFault: boolean;
   reason?: string;
+  /**
+   * Set when the failure is the trader's own doing and says something about their
+   * other orders: "margin" (cannot fund position-increasing fills) or "reduce_only"
+   * (nothing left to reduce on that side). Unset for orders that were merely
+   * cancelled, filled or expired on-chain: those are removed without blame.
+   */
+  kind?: "margin" | "reduce_only";
 }
 
 export interface Verdict {
@@ -39,16 +46,18 @@ export interface Verdict {
    * at fault and makers get no strike.
    */
   global?: string;
+  /** With `global`: restore both sides and let them match again (FillTooSmall). */
+  rematch?: boolean;
 }
 
 export const UNATTRIBUTED: Verdict = { maker: { atFault: false }, taker: { atFault: false } };
 
 type ErrorName = Extract<(typeof exchangeAbi)[number], { type: "error" }>["name"];
 
-const TRADER_ERROR_TEXT: Partial<Record<ErrorName, string>> = {
-  InsufficientMargin: "insufficient margin",
-  NegativeAccountValue: "fill would leave the account with negative value",
-  ReduceOnlyViolated: "reduce-only order would not reduce the position",
+const TRADER_ERROR_TEXT: Partial<Record<ErrorName, [string, "margin" | "reduce_only"]>> = {
+  InsufficientMargin: ["insufficient margin", "margin"],
+  NegativeAccountValue: ["fill would leave the account with negative value", "margin"],
+  ReduceOnlyViolated: ["reduce-only order would not reduce the position", "reduce_only"],
 };
 
 const GLOBAL_ERROR_TEXT: Partial<Record<ErrorName, string>> = {
@@ -61,8 +70,6 @@ const GLOBAL_ERROR_TEXT: Partial<Record<ErrorName, string>> = {
   FeedStale: "oracle feed is stale",
   InvalidAnswer: "oracle feed returned an invalid answer",
   FeedNotSet: "oracle feed is not configured",
-  // Happens only when an earlier fill of the completing order failed; nobody's fault.
-  FillTooSmall: "fill below the minimum size",
 };
 
 /**
@@ -77,14 +84,18 @@ export function attributeFromRevert(match: Match, reason: Hex): Verdict | null {
   } catch {
     return null;
   }
+  // A sub-minimum fill only fails when an earlier fill of the order it was meant to
+  // complete has failed. Nobody's fault; matching the pair again uses the right size.
+  if (err.errorName === "FillTooSmall") return { ...UNATTRIBUTED, global: "fill below the minimum size", rematch: true };
   const global = GLOBAL_ERROR_TEXT[err.errorName];
   if (global) return { ...UNATTRIBUTED, global };
-  const text = TRADER_ERROR_TEXT[err.errorName];
+  const named = TRADER_ERROR_TEXT[err.errorName];
   const trader = err.args?.[0];
-  if (!text || typeof trader !== "string") return null;
+  if (!named || typeof trader !== "string") return null;
+  const at: SideVerdict = { atFault: true, reason: named[0], kind: named[1] };
   // The contract stops at the first failing check, so the other side is not implicated.
-  if (isAddressEqual(trader as Hex, match.maker.trader)) return { maker: { atFault: true, reason: text }, taker: { atFault: false } };
-  if (isAddressEqual(trader as Hex, match.taker.trader)) return { maker: { atFault: false }, taker: { atFault: true, reason: text } };
+  if (isAddressEqual(trader as Hex, match.maker.trader)) return { maker: at, taker: { atFault: false } };
+  if (isAddressEqual(trader as Hex, match.taker.trader)) return { maker: { atFault: false }, taker: at };
   return null;
 }
 
@@ -160,7 +171,7 @@ async function marginHeuristic(
 ): Promise<SideVerdict> {
   const position = await chain.positionSize(order.trader, order.marketId);
   if (isReducing(position, order.isBuy, fillSize)) return { atFault: false };
-  if (order.reduceOnly) return { atFault: true, reason: "reduce-only order would not reduce the position" };
+  if (order.reduceOnly) return { atFault: true, reason: "reduce-only order would not reduce the position", kind: "reduce_only" };
 
   const newPosition = position + (order.isBuy ? fillSize : -fillSize);
   const addedExposure = abs(newPosition) > abs(position) ? abs(newPosition) - abs(position) : 0n;
@@ -172,7 +183,7 @@ async function marginHeuristic(
     (notionalUsdc(fillSize, fillPrice) * feeBps) / BPS +
     notionalUsdc(fillSize, adversePrice);
   const free = await chain.freeCollateral(order.trader);
-  if (free < required) return { atFault: true, reason: "insufficient margin" };
+  if (free < required) return { atFault: true, reason: "insufficient margin", kind: "margin" };
   return { atFault: false };
 }
 

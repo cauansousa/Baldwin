@@ -57,7 +57,7 @@ const LEVELS: Record<LogLevel, number> = { info: 0, warn: 1, error: 2, silent: 3
 export function createLogger(minLevel: LogLevel = "info", component?: string): Logger {
   const write = (level: "info" | "warn" | "error") => (msg: string, ctx?: Record<string, unknown>) => {
     if (LEVELS[level] < LEVELS[minLevel]) return;
-    const line = JSON.stringify({ level, time: new Date().toISOString(), ...(component ? { component } : {}), msg, ...ctx }, jsonReplacer);
+    const line = redact(JSON.stringify({ level, time: new Date().toISOString(), ...(component ? { component } : {}), msg, ...ctx }, jsonReplacer));
     (level === "info" ? process.stdout : process.stderr).write(line + "\n");
   };
   return { info: write("info"), warn: write("warn"), error: write("error") };
@@ -65,7 +65,15 @@ export function createLogger(minLevel: LogLevel = "info", component?: string): L
 
 export const consoleLogger: Logger = createLogger("info");
 
+/**
+ * A short, log-safe description of an error. URLs are removed: RPC endpoints commonly
+ * carry an API key in their path, and viem puts the URL into its error messages.
+ */
 export function errMessage(e: unknown): string {
-  if (e instanceof Error) return (e as { shortMessage?: string }).shortMessage ?? e.message;
-  return String(e);
+  const raw = e instanceof Error ? ((e as { shortMessage?: string }).shortMessage ?? e.message) : String(e);
+  return redact(raw);
+}
+
+export function redact(text: string): string {
+  return text.replace(/\b(?:https?|wss?):\/\/[^\s"'<>)]+/gi, "[url]");
 }

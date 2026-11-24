@@ -55,6 +55,10 @@ export class ViemKeeperChain implements KeeperChain {
     return BigInt(m.initialMarginBps);
   }
 
+  isLiquidatableIn(trader: Address, marketId: number): Promise<boolean> {
+    return this.client.readContract({ address: this.exchange, abi: exchangeAbi, functionName: "isLiquidatableIn", args: [trader, marketId] });
+  }
+
   async liquidate(trader: Address, marketId: number, maxSize: bigint): Promise<void> {
     const { request } = await this.client.simulateContract({
       account: this.account,

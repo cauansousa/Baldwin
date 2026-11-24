@@ -11,6 +11,11 @@ export interface KeeperChain {
   /** Signed base size (WAD). */
   positionSize(trader: Address, marketId: number): Promise<bigint>;
   isLiquidatable(trader: Address): Promise<boolean>;
+  /**
+   * Whether `liquidate(trader, marketId, ...)` would be accepted: same valuation as the
+   * contract uses there. Rejects if this market's own price is unavailable.
+   */
+  isLiquidatableIn(trader: Address, marketId: number): Promise<boolean>;
   /** Liquidate up to `maxSize` (base WAD); resolves once mined, rejects if it would revert or reverted. */
   liquidate(trader: Address, marketId: number, maxSize: bigint): Promise<void>;
   /** The keeper account's own free collateral, USDC units. */
@@ -33,6 +38,12 @@ export interface KeeperOptions {
   startBlock?: bigint;
   /** Where the event cursor and the tracked accounts are kept across restarts. */
   state?: KeeperStateStore;
+  /** Log queries stop this many blocks short of the head (see LogPoller). Default 2. */
+  headLag?: bigint;
+  /** Blocks re-scanned on every pass. Default 5. */
+  overlap?: bigint;
+  /** A position is forgotten after this many consecutive ticks reading it as zero. Default 3. */
+  untrackAfterZeroReads?: number;
   /** Called on every failed chain query (metrics). */
   onRpcError?: (e: unknown) => void;
   /** Max block span per log query. Default 2000. */
@@ -53,13 +64,16 @@ export interface KeeperOptions {
  *  1. reads new Fill/Liquidation events (block-range polling with a stored cursor, see
  *     LogPoller) and records which accounts hold positions; cursor and accounts are
  *     saved together, so a restart continues without rescanning or forgetting anyone;
- *  2. for every tracked account, drops closed positions, and if `isLiquidatable`
- *     calls `liquidate` on its open positions until the account is healthy again.
+ *  2. for every tracked account, drops positions that read as closed on several
+ *     consecutive ticks, and if `isLiquidatable` (or, when that view reverts because
+ *     some other feed is down, `isLiquidatableIn` for the market) calls `liquidate`
+ *     on its open positions until the account is healthy again. Attempts that fail
+ *     (typically: the keeper cannot margin the position) are retried with backoff.
  *     The whole position is tried first. In the current Exchange the liquidator takes
  *     the position over and must margin it, so if that fails the keeper retries with
  *     the size its own free collateral supports;
  *  3. calls `updateFunding` for every market whose on-chain `lastFundingTime` is at
- *     least one funding interval old. The schedule lives on-chain: a restarted keeper
+ *     least one funding interval older than the latest block. The schedule lives on-chain: a restarted keeper
  *     neither skips nor repeats a round, and a failed call is retried on the next tick.
  */
 export class Keeper {
@@ -68,6 +82,10 @@ export class Keeper {
   private readonly poller: LogPoller<{ trader: Address; marketId: number }>;
   private readonly state: KeeperStateStore | undefined;
   private cursor: bigint | undefined;
+  private ticks = 0;
+  private readonly zeroReads = new Map<string, number>();
+  private readonly backoff = new Map<string, { fails: number; until: number }>();
+  private readonly untrackAfterZeroReads: number;
   private readonly chain: KeeperChain;
   private readonly marketIds: number[];
   private readonly maxRange: bigint;
@@ -84,6 +102,7 @@ export class Keeper {
     this.marketIds = opts.marketIds;
     this.maxRange = opts.maxBlockRange ?? 2000n;
     this.state = opts.state;
+    this.untrackAfterZeroReads = Math.max(1, opts.untrackAfterZeroReads ?? 3);
     const saved = this.state?.load();
     if (saved) {
       this.cursor = saved.cursor;
@@ -108,6 +127,11 @@ export class Keeper {
       },
       startBlock: opts.startBlock ?? 0n,
       maxRange: this.maxRange,
+      headLag: opts.headLag,
+      overlap: opts.overlap,
+      // A long history is read a few ranges per tick: accounts already known are
+      // checked for liquidation in between, not only once the whole scan is done.
+      maxRangesPerPoll: 10,
       logger: opts.logger,
       onError: opts.onRpcError,
     });
@@ -157,34 +181,63 @@ export class Keeper {
   }
 
   private async checkAll(): Promise<void> {
+    this.ticks++;
     for (const [key, entry] of this.tracked) {
       if (key === this.self) continue;
       try {
         const open: [number, bigint][] = [];
         for (const marketId of entry.markets) {
           const size = await this.chain.positionSize(entry.trader, marketId);
-          if (size === 0n) entry.markets.delete(marketId);
-          else open.push([marketId, size < 0n ? -size : size]);
+          const zk = `${key}:${marketId}`;
+          if (size !== 0n) {
+            this.zeroReads.delete(zk);
+            open.push([marketId, size < 0n ? -size : size]);
+            continue;
+          }
+          // One zero read proves nothing: the node that answered may be a block behind
+          // the one that served the Fill event. Forget the position only after several.
+          const zeros = (this.zeroReads.get(zk) ?? 0) + 1;
+          if (zeros >= this.untrackAfterZeroReads) {
+            entry.markets.delete(marketId);
+            this.zeroReads.delete(zk);
+          } else {
+            this.zeroReads.set(zk, zeros);
+          }
         }
-        if (open.length === 0) {
+        if (entry.markets.size === 0) {
           this.tracked.delete(key);
           continue;
         }
         for (const [marketId, size] of open) {
+          const bk = `${key}:${marketId}`;
+          const backoff = this.backoff.get(bk);
+          if (backoff && this.ticks < backoff.until) continue;
           let liquidatable: boolean;
           try {
             liquidatable = await this.chain.isLiquidatable(entry.trader);
+            if (!liquidatable) break;
           } catch (e) {
-            // The account views revert when the oracle fails for ANY market the account is
-            // in. The contract can still liquidate a market whose own price is fresh, so
-            // try exactly those; `liquidate` is simulated first and simply refuses if
-            // the account is healthy.
+            // The account-wide view reverts when the oracle fails for ANY market the
+            // account is in. `isLiquidatableIn` values the account the way `liquidate`
+            // does (other markets without a price at entry) and only needs this
+            // market's own price.
             this.onRpcError?.(e);
-            await this.liquidateBlind(entry.trader, marketId, size);
-            continue;
+            try {
+              liquidatable = await this.chain.isLiquidatableIn(entry.trader, marketId);
+            } catch {
+              continue; // this market's own price is unavailable: nothing can be done here now
+            }
+            if (!liquidatable) continue;
           }
-          if (!liquidatable) break;
-          await this.liquidate(entry.trader, marketId, size);
+          const done = await this.liquidate(entry.trader, marketId, size);
+          if (done) {
+            this.backoff.delete(bk);
+          } else {
+            // Could not (afford to) liquidate: do not hammer the node with the same
+            // doomed attempt every tick. 2, 4, 8, ... ticks, at most 64.
+            const fails = (backoff?.fails ?? 0) + 1;
+            this.backoff.set(bk, { fails, until: this.ticks + Math.min(64, 2 ** fails) });
+          }
         }
       } catch (e) {
         this.log.warn("liquidation check failed", { trader: entry.trader, error: errMessage(e) });
@@ -192,45 +245,27 @@ export class Keeper {
     }
   }
 
-  private async liquidate(trader: Address, marketId: number, size: bigint): Promise<void> {
+  /** Liquidate the whole position, or as much as the keeper can margin. True if anything was liquidated. */
+  private async liquidate(trader: Address, marketId: number, size: bigint): Promise<boolean> {
     this.log.info("liquidating", { trader, marketId, size });
     try {
       await this.chain.liquidate(trader, marketId, size);
-      return;
+      return true;
     } catch (e) {
       this.log.warn("full liquidation failed", { trader, marketId, error: errMessage(e) });
     }
     try {
       const affordable = await this.affordableSize(marketId);
-      if (affordable === 0n || affordable >= size) return;
+      if (affordable === 0n || affordable >= size) {
+        this.log.warn("cannot liquidate: the keeper has no free collateral to take the position over", { trader, marketId });
+        return false;
+      }
       this.log.info("liquidating partially", { trader, marketId, size: affordable });
       await this.chain.liquidate(trader, marketId, affordable);
+      return true;
     } catch (e) {
       this.log.warn("partial liquidation failed", { trader, marketId, error: errMessage(e) });
-    }
-  }
-
-  /** Liquidation attempt without knowing whether the account is liquidatable (views unavailable). */
-  private async liquidateBlind(trader: Address, marketId: number, size: bigint): Promise<void> {
-    try {
-      await this.chain.indexPrice(marketId);
-    } catch {
-      return; // this market's own price is unavailable: nothing can be done here
-    }
-    try {
-      await this.chain.liquidate(trader, marketId, size);
-      this.log.info("liquidated while account views were unavailable", { trader, marketId, size });
-      return;
-    } catch {
-      // not liquidatable, or the keeper cannot margin the whole position
-    }
-    try {
-      const affordable = await this.affordableSize(marketId);
-      if (affordable === 0n || affordable >= size) return;
-      await this.chain.liquidate(trader, marketId, affordable);
-      this.log.info("liquidated partially while account views were unavailable", { trader, marketId, size: affordable });
-    } catch {
-      // as above
+      return false;
     }
   }
 
@@ -247,11 +282,11 @@ export class Keeper {
   }
 
   private async updateFunding(): Promise<void> {
-    // The contract compares against block time; a new block cannot be older than
-    // either the latest block or (on a live chain) the wall clock.
-    const blockTime = await this.chain.blockTimestamp();
-    const wall = BigInt(this.now());
-    const now = blockTime > wall ? blockTime : wall;
+    // The contract compares against block.timestamp, and it accrues nothing (a no-op
+    // that still costs gas) before a full interval has passed. The latest block's
+    // timestamp is a lower bound for the next block's, so "due by the latest block"
+    // means the call will do something. The host clock is deliberately not used.
+    const now = await this.chain.blockTimestamp();
     for (const marketId of this.marketIds) {
       try {
         const last = await this.chain.lastFundingTime(marketId);

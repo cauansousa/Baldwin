@@ -26,6 +26,8 @@ export interface Batch {
  */
 export interface Settler {
   settle(batch: Batch): Promise<MatchResult[]>;
+  /** Conditions an operator must act on (optional). */
+  status?(): { insufficientFunds: boolean; feeCapReached: boolean };
 }
 
 /** The batch definitively did not settle (transaction reverted or would revert). */

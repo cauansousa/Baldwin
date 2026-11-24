@@ -29,8 +29,11 @@ export interface RpcReceipt {
 
 /** The few RPC calls the settler needs; narrow so the retry logic can be tested with a fake. */
 export interface SettlerRpc {
-  /** Transaction count of `address`: "pending" includes the mempool, "latest" only mined ones. */
-  getNonce(address: Address, tag: "pending" | "latest"): Promise<number>;
+  /**
+   * Transaction count of `address`: "pending" includes the mempool, "latest" only
+   * mined ones, a block number is the count as of that block.
+   */
+  getNonce(address: Address, at: "pending" | "latest" | bigint): Promise<number>;
   /** Must reject with BatchRevertedError if the call would revert. */
   estimateGas(tx: { from: Address; to: Address; data: Hex }): Promise<bigint>;
   /** eth_call with an explicit gas limit. Must reject with BatchRevertedError if it reverts. */
@@ -39,8 +42,8 @@ export interface SettlerRpc {
   sendRawTransaction(raw: Hex): Promise<void>;
   /** null while the transaction is not mined. */
   getReceipt(hash: Hex): Promise<RpcReceipt | null>;
-  /** `Exchange.filledSize(orderHash)` at the latest block. */
-  filledSize(orderHash: Hex): Promise<bigint>;
+  /** `Exchange.filledSize(orderHash)` at the latest block, or as of `block`. */
+  filledSize(orderHash: Hex, block?: bigint): Promise<bigint>;
   /** Latest block number. */
   blockNumber(): Promise<bigint>;
 }
@@ -90,6 +93,8 @@ export interface ViemSettlerOptions {
 }
 
 interface Attempt {
+  /** The node took it (or already had it). false: refused for lack of funds. */
+  accepted?: boolean;
   hash: Hex;
   raw: Hex;
   maxFeePerGas: bigint;
@@ -115,6 +120,9 @@ interface InFlight {
   minedHash?: Hex;
 }
 
+/** Broadcast errors that mean the operator cannot pay for this transaction at these fees. */
+const INSUFFICIENT_FUNDS = /insufficient funds|insufficient balance|exceeds balance|not enough funds/i;
+
 const STORE_KEY = "settler.inflight";
 
 function serialize(fl: InFlight): string {
@@ -138,9 +146,13 @@ function deserialize(raw: string): InFlight {
 /** Broadcast errors that mean the node has (or had) the transaction. */
 const ACCEPTED_SEND_ERROR = /already known|known transaction|already imported|nonce too low|nonce has already been used|replacement transaction underpriced/i;
 
-function isAcceptedSendError(e: unknown): boolean {
+function sendErrorText(e: unknown): string {
   const e2 = e as { message?: string; details?: string; shortMessage?: string };
-  return ACCEPTED_SEND_ERROR.test(`${e2?.message ?? ""} ${e2?.details ?? ""} ${e2?.shortMessage ?? ""} ${String(e)}`);
+  return `${e2?.message ?? ""} ${e2?.details ?? ""} ${e2?.shortMessage ?? ""} ${String(e)}`;
+}
+
+function isAcceptedSendError(e: unknown): boolean {
+  return ACCEPTED_SEND_ERROR.test(sendErrorText(e));
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -153,15 +165,19 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
  * ever be mined, and the outcome is looked up by the locally computed hashes. The
  * binding survives a failed `settle` call and is only released when
  *  (a) one of the batch's transactions is mined (success or revert), or
- *  (b) the nonce is gone on-chain, none of our transactions shows a receipt after
- *      several polls, AND `filledSize` of every order in the batch still equals the
- *      value read before the first broadcast - i.e. the chain itself shows that no
- *      match of the batch was applied. If any `filledSize` moved, the batch did land
- *      and the settler keeps waiting for its receipt instead of releasing.
+ *  (b) as of one pinned block that is `confirmations` deep, the nonce is consumed,
+ *      none of our transactions shows a receipt after several polls, AND `filledSize`
+ *      of every order in the batch (read at that same block) still equals the value
+ *      read before the first broadcast - i.e. the chain itself shows that no match
+ *      of the batch was applied. If any `filledSize` moved, the batch did land and
+ *      the settler keeps waiting for its receipt instead of releasing.
  *
  * Fees: a transaction that stays unmined for `bumpAfterRounds` rounds is replaced
  * (same nonce) with fees raised by 25%, up to `maxFeePerGasCap`. Broadcast errors do
- * not prevent that: with a shared nonce a replacement is always safe.
+ * not prevent that: with a shared nonce a replacement is always safe. If a node
+ * refuses a replacement because the operator cannot pay for it, bumping stops and
+ * the highest-fee transaction a node did accept keeps being re-broadcast; `status()`
+ * reports it until the batch is mined.
  *
  * Restarts: with a `store`, the binding (nonce, every signed transaction, the
  * `filledSize` baseline) is written durably before the first broadcast and after
@@ -197,6 +213,10 @@ export class ViemSettler implements Settler {
   private readonly confirmationTimeoutMs: number;
   private readonly store: KeyValueStore | undefined;
   private loaded = false;
+  /** The record in `inflight` came from the store (a previous process), not from this one. */
+  private restored = false;
+  private insufficientFunds = false;
+  private feeCapReached = false;
 
   private inflight: InFlight | null = null;
   private nextNonce = 0;
@@ -239,6 +259,7 @@ export class ViemSettler implements Settler {
       const raw = this.store?.getMeta(STORE_KEY);
       if (raw) {
         this.inflight = deserialize(raw);
+        this.restored = true;
         if (this.inflight.minedHash === undefined) {
           this.log.info("found a settlement batch that was in flight; resolving it from the chain", {
             batch: this.inflight.batchId,
@@ -254,9 +275,13 @@ export class ViemSettler implements Settler {
       if (this.inflight.minedHash === undefined) {
         throw new Error(`batch ${this.inflight.batchId} is still unresolved; refusing to submit ${batch.id}`);
       }
-      // The previous batch had its outcome and the caller has moved on.
-      this.nextNonce = Math.max(this.nextNonce, this.inflight.nonce + 1);
+      // The previous batch had its outcome and the caller has moved on. Within one
+      // process the local counter guards against a node that lags behind; a record
+      // inherited from an earlier process says nothing about now, so after a restart
+      // the next nonce comes from the chain alone.
+      if (!this.restored) this.nextNonce = Math.max(this.nextNonce, this.inflight.nonce + 1);
       this.inflight = null;
+      this.restored = false;
     }
     if (this.inflight && this.inflight.data !== encodeBatch(batch)) {
       throw new Error(`recorded in-flight batch ${batch.id} does not match the batch being settled; refusing to continue`);
@@ -273,17 +298,38 @@ export class ViemSettler implements Settler {
 
     let lastSendError: unknown;
     for (let round = 0; round < this.maxRounds; round++) {
-      if (fl.attempts.length === 0 || fl.unminedRounds >= this.bumpAfterRounds) await this.sign(fl);
+      // Replace with higher fees after `bumpAfterRounds` unmined rounds - unless the
+      // operator could not even pay for the last replacement.
+      if (fl.attempts.length === 0 || (fl.unminedRounds >= this.bumpAfterRounds && !this.insufficientFunds)) await this.sign(fl);
       // Durable before the broadcast: a restarted process must know this transaction exists.
       this.persist();
-      const attempt = fl.attempts[fl.attempts.length - 1]!;
+      const attempt = this.attemptToSend(fl);
       lastSendError = undefined;
       try {
         // Safe to repeat: the same raw transaction has the same hash.
         await this.rpc.sendRawTransaction(attempt.raw);
+        attempt.accepted = true;
       } catch (e) {
-        // The node may or may not have it. Never assume: look for a receipt first.
-        if (!isAcceptedSendError(e)) lastSendError = e;
+        if (isAcceptedSendError(e)) {
+          attempt.accepted = true;
+        } else if (INSUFFICIENT_FUNDS.test(sendErrorText(e))) {
+          // The node refused it: the operator cannot pay gas x fee. Bumping further only
+          // makes that worse. Stop bumping and go back to the best transaction a node took.
+          attempt.accepted = false;
+          if (!this.insufficientFunds) {
+            this.log.error("operator cannot pay for the settlement transaction; fee bumping stopped", {
+              batch: batch.id,
+              nonce: fl.nonce,
+              maxFeePerGas: attempt.maxFeePerGas,
+              gas: fl.gas,
+            });
+          }
+          this.insufficientFunds = true;
+          lastSendError = e;
+        } else {
+          // The node may or may not have it. Never assume: look for a receipt first.
+          lastSendError = e;
+        }
       }
       const seen = await this.waitForReceipt(fl, this.receiptTimeoutMs);
       const mined = seen && (await this.confirmed(seen));
@@ -293,22 +339,29 @@ export class ViemSettler implements Settler {
       fl.unminedRounds++;
 
       // Not mined. If the nonce is gone anyway, find out what happened before deciding.
-      const latest = await this.rpc.getNonce(this.account.address, "latest");
-      if (latest > fl.nonce) {
+      // Everything below is read as of one block, so that answers from backends at
+      // different heights cannot be combined into a wrong conclusion.
+      const pin = await this.rpc.blockNumber();
+      if ((await this.rpc.getNonce(this.account.address, pin)) > fl.nonce) {
+        await this.waitUntilBuried(pin);
         const lateSeen = await this.waitForReceipt(fl, this.pollIntervalMs * this.releasePolls);
         const late = lateSeen && (await this.confirmed(lateSeen));
         if (late) return this.finish(batch, fl, late.hash, late.receipt);
-        if (await this.batchLeftNoTrace(batch, fl)) {
-          this.inflight = null;
-          this.persist();
-          this.nextNonce = latest;
-          throw new BatchRevertedError(
-            `operator nonce ${fl.nonce} was consumed, no transaction of batch ${batch.id} has a receipt and no order of the batch was filled`,
-          );
+        // Still consumed as of that (now confirmed) block? A reorg may have undone it.
+        if ((await this.rpc.getNonce(this.account.address, pin)) > fl.nonce) {
+          if (await this.batchLeftNoTrace(fl, pin)) {
+            this.inflight = null;
+            this.restored = false;
+            this.persist();
+            this.nextNonce = Math.max(this.nextNonce, fl.nonce + 1);
+            throw new BatchRevertedError(
+              `operator nonce ${fl.nonce} was consumed as of block ${pin}, no transaction of batch ${batch.id} has a receipt and no order of the batch was filled`,
+            );
+          }
+          // Some order of the batch was filled: our transaction was mined, only its
+          // receipt is not being served. Keep the binding and keep looking.
+          throw new Error(`batch ${batch.id} (nonce ${fl.nonce}) appears mined but its receipt is not available yet`);
         }
-        // Some order of the batch was filled: our transaction was mined, only its
-        // receipt is not being served. Keep the binding and keep looking.
-        throw new Error(`batch ${batch.id} (nonce ${fl.nonce}) appears mined but its receipt is not available yet`);
       }
       this.log.warn("settlement transaction not mined yet", {
         batch: batch.id,
@@ -323,10 +376,40 @@ export class ViemSettler implements Settler {
     );
   }
 
-  /** True iff on-chain filledSize of every order in the batch is still at its pre-broadcast value. */
-  private async batchLeftNoTrace(batch: Batch, fl: InFlight): Promise<boolean> {
+  /**
+   * Which signed transaction to broadcast this round: normally the newest. Once a
+   * replacement was refused for lack of funds, the highest-fee one a node accepted
+   * (it is the one that can still be mined); if none was accepted yet, the cheapest.
+   */
+  private attemptToSend(fl: InFlight): Attempt {
+    const newest = fl.attempts[fl.attempts.length - 1]!;
+    if (!this.insufficientFunds) return newest;
+    for (let i = fl.attempts.length - 1; i >= 0; i--) if (fl.attempts[i]!.accepted) return fl.attempts[i]!;
+    return fl.attempts[0]!;
+  }
+
+  /** Wait until block `n` has `confirmations - 1` blocks on top of it. */
+  private async waitUntilBuried(n: bigint): Promise<void> {
+    if (this.confirmations <= 1) return;
+    const deadline = Date.now() + this.confirmationTimeoutMs;
+    while ((await this.rpc.blockNumber()) < n + BigInt(this.confirmations - 1)) {
+      if (Date.now() >= deadline) throw new Error(`block ${n} is not yet ${this.confirmations} blocks deep`);
+      await sleep(this.pollIntervalMs);
+    }
+  }
+
+  /** What an operator should know about the settler right now. */
+  status(): { insufficientFunds: boolean; feeCapReached: boolean } {
+    return { insufficientFunds: this.insufficientFunds, feeCapReached: this.feeCapReached };
+  }
+
+  /**
+   * True iff, as of block `pin`, on-chain filledSize of every order in the batch is
+   * still at its pre-broadcast value.
+   */
+  private async batchLeftNoTrace(fl: InFlight, pin: bigint): Promise<boolean> {
     for (const [hash, before] of fl.baseline) {
-      if ((await this.rpc.filledSize(hash)) !== before) return false;
+      if ((await this.rpc.filledSize(hash, pin)) !== before) return false;
     }
     return true;
   }
@@ -394,7 +477,8 @@ export class ViemSettler implements Settler {
       };
       if (cap !== undefined && fees.maxFeePerGas > cap) {
         // No room for a valid replacement: keep re-broadcasting the last attempt.
-        this.log.warn("fee cap reached; not replacing the settlement transaction", { nonce: fl.nonce, cap });
+        if (!this.feeCapReached) this.log.warn("fee cap reached; not replacing the settlement transaction", { nonce: fl.nonce, cap });
+        this.feeCapReached = true;
         fl.unminedRounds = 0;
         return;
       }
@@ -469,6 +553,9 @@ export class ViemSettler implements Settler {
   /** One of the batch's transactions was mined (and confirmed): the outcome is final. */
   private finish(batch: Batch, fl: InFlight, txHash: Hex, receipt: RpcReceipt): MatchResult[] {
     this.nextNonce = Math.max(this.nextNonce, fl.nonce + 1);
+    this.insufficientFunds = false;
+    this.feeCapReached = false;
+    this.restored = false;
     if (receipt.status !== "success") {
       // Nothing was applied; a retry gets a fresh nonce and a fresh transaction.
       this.inflight = null;
@@ -552,8 +639,9 @@ export function parseSettlementLogs(matches: Match[], logs: RpcLog[], exchange: 
 export function viemSettlerRpc(client: PublicClient, exchange: Address): SettlerRpc {
   return {
     blockNumber: () => client.getBlockNumber({ cacheTime: 0 }),
-    filledSize: (orderHash) => client.readContract({ address: exchange, abi: exchangeAbi, functionName: "filledSize", args: [orderHash] }),
-    getNonce: (address, tag) => client.getTransactionCount({ address, blockTag: tag }),
+    filledSize: (orderHash, block) =>
+      client.readContract({ address: exchange, abi: exchangeAbi, functionName: "filledSize", args: [orderHash], ...(block !== undefined ? { blockNumber: block } : {}) }),
+    getNonce: (address, at) => client.getTransactionCount(typeof at === "bigint" ? { address, blockNumber: at } : { address, blockTag: at }),
     async estimateGas({ from, to, data }) {
       try {
         return await client.estimateGas({ account: from, to, data });

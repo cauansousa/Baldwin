@@ -4,10 +4,9 @@ import type { ChainReader } from "../chain/types.ts";
 import { hashOrder, verifyCancelSignature, verifyOrderSignature, type Domain } from "../signing.ts";
 import { BatchRevertedError, type Batch, type MatchResult, type Settler } from "../settlement/types.ts";
 import { Metrics } from "../metrics.ts";
-import type { EngineStore, StoredMatch, StoredOrder } from "../store/types.ts";
+import type { Commit, DeadNonce, EngineStore, StoredMatch, StoredOrder } from "../store/types.ts";
 import { errMessage, silentLogger, type Address, type Hex, type Logger, type MarketConfig, type Match, type Order } from "../types.ts";
-import { MemoryDeadNonceStore, type DeadNonceStore } from "./deadNonces.ts";
-import { attributeFromRevert, classifyFailure, priceBand, requiredCollateral, UNATTRIBUTED, type MarginMarket, type OpenExposure, type Verdict } from "./reconcile.ts";
+import { attributeFromRevert, classifyFailure, priceBand, requiredCollateral, UNATTRIBUTED, type MarginMarket, type OpenExposure, type SideVerdict, type Verdict } from "./reconcile.ts";
 
 export type OrderStatus =
   /** Resting, nothing matched yet. */
@@ -53,7 +52,16 @@ export interface SubmitResult {
   status: OrderStatus;
   fills: PendingFill[];
   remaining: bigint;
+  /** Matched, awaiting on-chain confirmation. */
+  pending: bigint;
+  /** Confirmed on-chain. */
+  filled: bigint;
   reason?: string;
+  /**
+   * True when this exact signed order had been accepted before: nothing was done and
+   * the fields show its current state (`fills` is empty then).
+   */
+  duplicate?: boolean;
 }
 
 /** A fill confirmed on-chain. */
@@ -93,6 +101,10 @@ export type EngineErrorCode =
   | "POST_ONLY_WOULD_CROSS"
   | "CHAIN_UNAVAILABLE"
   | "STORE_UNAVAILABLE"
+  | "STATE_UNKNOWN"
+  | "RECOVERING"
+  | "RATE_LIMITED"
+  | "REDUCE_ONLY_EXCEEDS_POSITION"
   | "SHUTTING_DOWN"
   | "NOT_FOUND";
 
@@ -117,6 +129,10 @@ const HTTP_STATUS: Record<EngineErrorCode, number> = {
   POST_ONLY_WOULD_CROSS: 422,
   CHAIN_UNAVAILABLE: 503,
   STORE_UNAVAILABLE: 503,
+  STATE_UNKNOWN: 503,
+  RECOVERING: 503,
+  RATE_LIMITED: 429,
+  REDUCE_ONLY_EXCEEDS_POSITION: 422,
   SHUTTING_DOWN: 503,
   NOT_FOUND: 404,
 };
@@ -124,9 +140,16 @@ const HTTP_STATUS: Record<EngineErrorCode, number> = {
 export class EngineError extends Error {
   override readonly name = "EngineError";
   readonly httpStatus: number;
+  /**
+   * What the client may conclude about the request. "not_applied": nothing was changed,
+   * retrying is safe. "unknown" (only STATE_UNKNOWN): the request may or may not have
+   * taken effect; resubmit the identical signed order (idempotent) or query it.
+   */
+  readonly outcome: "not_applied" | "unknown";
   constructor(public readonly code: EngineErrorCode, message: string) {
     super(message);
     this.httpStatus = HTTP_STATUS[code];
+    this.outcome = code === "STATE_UNKNOWN" ? "unknown" : "not_applied";
   }
 }
 
@@ -154,8 +177,12 @@ export interface EngineOptions {
   minTimeToExpirySec?: number;
   /** Maximum time to expiry at intake; also bounds the dead-nonce set. Default 7 days. */
   maxTimeToExpirySec?: number;
-  /** Durable set of dead (trader, nonce) pairs. Default: `store` if given, else in memory only. */
-  deadNonces?: DeadNonceStore;
+  /** Longest a submission may spend waiting for its turn and for chain reads. Default 8000. */
+  intakeTimeoutMs?: number;
+  /** Accepted submissions per trader address per minute (0 = unlimited). Default 600. */
+  traderOrdersPerMinute?: number;
+  /** How long a trader's free collateral / positions are reused across submissions. Default 1000. */
+  preTradeCacheMs?: number;
   /**
    * Durable engine state. When given, the constructor rebuilds orders, books, unsettled
    * matches and trades from it; call `recover()` before taking orders.
@@ -238,6 +265,14 @@ export interface SettlementStatus {
   lastError: string | null;
   settled: number;
   failed: number;
+  /** The operator cannot pay for the settlement transaction at current fees. */
+  insufficientFunds: boolean;
+  /** The fee cap stops a stuck settlement transaction from being replaced. */
+  feeCapReached: boolean;
+  /** Engine state could not be written to the store. */
+  storeBroken: boolean;
+  /** Start-up recovery has not finished. */
+  recovering: boolean;
 }
 
 const nonceKey = (traderKey: string, nonce: bigint) => `${traderKey}:${nonce}`;
@@ -254,7 +289,14 @@ export class Engine extends EventEmitter<EngineEvents> {
   private readonly ordersByTrader = new Map<string, Set<Hex>>();
   /** trader:nonce -> hash of the order that uses it. */
   private readonly usedNonces = new Map<string, Hex>();
-  private readonly dead: DeadNonceStore;
+  /** trader:nonce -> expiry of the order that must never be accepted again. */
+  private readonly dead = new Map<string, bigint>();
+  private readonly intakeTimeoutMs: number;
+  private readonly traderOrdersPerMinute: number;
+  private readonly preTradeCacheMs: number;
+  private readonly traderWindows = new Map<string, { start: number; count: number }>();
+  private readonly chainCache = new Map<string, Map<string, { at: number; value: bigint }>>();
+  private recovering = false;
   private readonly store: EngineStore | undefined;
   readonly metrics: Metrics;
   /** trader -> nonce below which every order is cancelled on-chain (cancelAllOrders). */
@@ -325,10 +367,17 @@ export class Engine extends EventEmitter<EngineEvents> {
     this.minTimeToExpiry = minTtl > this.expiryBuffer ? minTtl : this.expiryBuffer;
     this.maxTimeToExpiry = BigInt(opts.maxTimeToExpirySec ?? 7 * 24 * 3600);
     this.store = opts.store;
-    this.dead = opts.deadNonces ?? opts.store ?? new MemoryDeadNonceStore();
+    this.intakeTimeoutMs = opts.intakeTimeoutMs ?? 8000;
+    this.traderOrdersPerMinute = opts.traderOrdersPerMinute ?? 600;
+    this.preTradeCacheMs = opts.preTradeCacheMs ?? 1000;
     this.metrics = opts.metrics ?? new Metrics();
     this.metrics.counter("orders_accepted_total", "Orders accepted into the engine");
     this.metrics.counter("orders_rejected_total", "Orders refused at intake, by error code");
+    this.metrics.counter("orders_duplicate_total", "Resubmissions of an order that was already accepted");
+    this.metrics.gauge("settler_insufficient_funds", "1 while the operator cannot pay for the settlement transaction", () => (this.settler.status?.().insufficientFunds ? 1 : 0));
+    this.metrics.gauge("settler_fee_cap_reached", "1 while the fee cap prevents replacing a stuck settlement transaction", () => (this.settler.status?.().feeCapReached ? 1 : 0));
+    this.metrics.gauge("store_broken", "1 while engine state cannot be persisted", () => (this.storeBroken ? 1 : 0));
+    this.metrics.gauge("recovering", "1 until start-up recovery has finished", () => (this.recovering ? 1 : 0));
     this.metrics.counter("orders_cancelled_total", "Cancels processed (signed Cancel or on-chain)");
     this.metrics.counter("matches_settled_total", "Matches confirmed on-chain");
     this.metrics.counter("matches_failed_total", "Matches that failed on-chain");
@@ -363,6 +412,8 @@ export class Engine extends EventEmitter<EngineEvents> {
   /** Rebuild in-memory state from the store: same orders, same time priority, same unsettled matches. */
   private loadFromStore(store: EngineStore): void {
     const snap = store.load();
+    for (const d of snap.deadNonces) this.dead.set(nonceKey(d.trader.toLowerCase(), d.nonce), d.expiry);
+    for (const { trader, nonce } of snap.minValidNonces) this.minValidNonce.set(trader.toLowerCase(), nonce);
     for (const o of snap.orders) {
       const market = this.markets.get(o.order.marketId);
       if (!market) {
@@ -371,6 +422,19 @@ export class Engine extends EventEmitter<EngineEvents> {
       }
       const traderKey = o.order.trader.toLowerCase();
       const rec: OrderRecord = { ...o, traderKey, reduceOnly: o.order.reduceOnly };
+      // Second line of defence: a resting order whose nonce is dead (or that carries a
+      // cancel) must not come back, whatever sequence of writes led to this state.
+      if (!rec.closed && rec.remaining > 0n) {
+        const cancelled =
+          rec.userCancelled || this.dead.has(nonceKey(traderKey, rec.order.nonce)) || rec.order.nonce < (this.minValidNonce.get(traderKey) ?? 0n);
+        if (cancelled) {
+          this.log.warn("stored order is resting although its nonce is dead; closing it", { orderHash: rec.hash });
+          rec.remaining = 0n;
+          rec.userCancelled = true;
+          rec.closed = { status: "cancelled", reason: "cancelled by trader" };
+          this.dirty.add(rec);
+        }
+      }
       this.orders.set(rec.hash, rec);
       this.usedNonces.set(nonceKey(traderKey, rec.order.nonce), rec.hash);
       let set = this.ordersByTrader.get(traderKey);
@@ -407,12 +471,13 @@ export class Engine extends EventEmitter<EngineEvents> {
       if (list.length > this.tradeHistory) list.shift();
       this.lastPrice.set(t.marketId, t.price);
     }
-    for (const { trader, nonce } of snap.minValidNonces) this.minValidNonce.set(trader.toLowerCase(), nonce);
     const counters = JSON.parse(store.getMeta("engine.counters") ?? "{}") as { matchSeq?: number; batchSeq?: number; tradeSeq?: number };
     this.matchSeq = counters.matchSeq ?? 0;
     this.batchSeq = counters.batchSeq ?? 0;
     this.tradeSeq = counters.tradeSeq ?? 0;
     this.persistedCounters = this.countersJson();
+    // Until recover() has reconciled this state with the chain, no orders are taken.
+    this.recovering = snap.orders.length > 0 || snap.matches.length > 0;
     if (snap.orders.length > 0) {
       this.log.info("state restored from store", {
         orders: snap.orders.length,
@@ -425,48 +490,62 @@ export class Engine extends EventEmitter<EngineEvents> {
 
   /**
    * Bring restored state in line with the chain. Call once after construction and
-   * before taking orders:
-   *  1. the batch that was in flight when the process died, and every match that was
+   * before taking orders (submissions are refused with RECOVERING until it resolves):
+   *  1. cancels first: every resting order is checked against `isCancelled` (covers
+   *     `cancelOrder` and `cancelAllOrders`), `replayCancels` replays the cancel
+   *     events since the stored cursor, and expired orders are dropped - so nothing
+   *     that was cancelled while the engine was down can be matched or re-crossed;
+   *  2. the batch that was in flight when the process died, and every match that was
    *     queued, is driven to its real on-chain outcome through the settler (which
    *     looks its own transactions up by hash - nothing is assumed, nothing is sent twice);
-   *  2. every resting order is checked against `filledSize` and `isCancelled`
-   *     (which covers `cancelAllOrders`) and expiry, and corrected to what the chain says.
+   *  3. every resting order's fill state is corrected to on-chain `filledSize`.
    * Rejects if the chain cannot be read; the caller should not start serving then.
+   * It does not time out by itself while the settler cannot reach the chain: the
+   * caller bounds it.
    */
-  async recover(): Promise<void> {
+  async recover(opts: { replayCancels?: () => Promise<void> } = {}): Promise<void> {
+    this.recovering = true;
     await this.refreshChainState();
+    const chain = this.chain;
+    const resting = () => [...this.orders.values()].filter((r) => !r.closed && r.remaining > 0n);
+    const inChunks = async (fn: (r: OrderRecord) => Promise<void>) => {
+      const list = resting();
+      for (let i = 0; i < list.length; i += 20) await Promise.all(list.slice(i, i + 20).map(fn));
+    };
+    if (chain) {
+      await inChunks(async (rec) => {
+        if (await chain.isCancelled(rec.order.trader, rec.order.nonce)) this.cancelNonce(rec.order.trader, rec.order.nonce, "cancelled on-chain");
+      });
+    }
+    await opts.replayCancels?.();
+    this.sweepExpired();
+
     if (this.current || this.queue.length > 0) {
       this.kick();
       await this.idle();
     }
-    const chain = this.chain;
+
     if (chain) {
-      const resting = [...this.orders.values()].filter((r) => !r.closed && r.remaining > 0n);
-      for (let i = 0; i < resting.length; i += 20) {
-        const chunk = resting.slice(i, i + 20);
-        const facts = await Promise.all(
-          chunk.map(async (r) => ({ filled: await chain.filledSize(r.hash), cancelled: await chain.isCancelled(r.order.trader, r.order.nonce) })),
-        );
-        chunk.forEach((rec, k) => {
-          const { filled, cancelled } = facts[k]!;
-          if (rec.closed || rec.remaining === 0n) return;
-          if (cancelled) {
-            this.cancelNonce(rec.order.trader, rec.order.nonce, "cancelled on-chain");
-            return;
-          }
-          if (filled === rec.filled) return;
-          this.log.warn("order fill state differs from the chain; using the chain's", { orderHash: rec.hash, engine: rec.filled, chain: filled });
-          const remaining = rec.order.size - filled - rec.pending;
-          rec.filled = filled;
-          rec.remaining = remaining > 0n ? remaining : 0n;
-          this.books.get(rec.order.marketId)!.setRemaining(rec.hash, rec.remaining);
-          this.touch(rec);
-        });
-      }
+      await inChunks(async (rec) => {
+        const filled = await chain.filledSize(rec.hash);
+        if (rec.closed || rec.remaining === 0n || filled === rec.filled) return;
+        this.log.warn("order fill state differs from the chain; using the chain's", { orderHash: rec.hash, engine: rec.filled, chain: filled });
+        const remaining = rec.order.size - filled - rec.pending;
+        rec.filled = filled;
+        rec.remaining = remaining > 0n ? remaining : 0n;
+        this.books.get(rec.order.marketId)!.setRemaining(rec.hash, rec.remaining);
+        this.touch(rec);
+      });
     }
     this.sweepExpired();
-    this.flush();
+    if (!this.flush()) throw new Error("could not persist the recovered state");
+    this.recovering = false;
     for (const marketId of this.books.keys()) this.emit("book", marketId);
+  }
+
+  /** True until `recover()` has finished (only after a start from a non-empty store). */
+  isRecovering(): boolean {
+    return this.recovering;
   }
 
   private touch(rec: OrderRecord): void {
@@ -487,7 +566,7 @@ export class Engine extends EventEmitter<EngineEvents> {
     if (!store) return true;
     const w = this.pendingWrite;
     const counters = this.countersJson();
-    if (this.dirty.size === 0 && w.addMatches.length === 0 && w.removeMatches.length === 0 && w.trades.length === 0 && w.minValidNonces.length === 0 && !w.batched && counters === this.persistedCounters) {
+    if (this.dirty.size === 0 && w.addMatches.length === 0 && w.removeMatches.length === 0 && w.trades.length === 0 && w.minValidNonces.length === 0 && w.dead.length === 0 && !w.batched && counters === this.persistedCounters) {
       return !this.storeBroken;
     }
     try {
@@ -498,6 +577,7 @@ export class Engine extends EventEmitter<EngineEvents> {
         removeMatches: w.removeMatches,
         trades: w.trades,
         minValidNonces: w.minValidNonces,
+        deadNonces: w.dead,
         meta: { "engine.counters": counters },
       });
     } catch (e) {
@@ -510,6 +590,24 @@ export class Engine extends EventEmitter<EngineEvents> {
     this.persistedCounters = counters;
     this.storeBroken = false;
     return true;
+  }
+
+  /**
+   * Make a change durable BEFORE it is applied in memory. Used where the client is
+   * told "done" (cancels): if the store refuses, nothing has changed anywhere.
+   */
+  private commitFirst(c: Partial<Commit>): void {
+    const store = this.store;
+    if (!store) return;
+    // Earlier changes must be on disk first, or this commit would describe a state the store never had.
+    if (!this.flush()) throw new EngineError("STORE_UNAVAILABLE", "engine state cannot be persisted; nothing was changed");
+    try {
+      store.commit({ orders: [], addMatches: [], batched: null, removeMatches: [], trades: [], minValidNonces: [], deadNonces: [], meta: {}, ...c });
+    } catch (e) {
+      this.storeBroken = true;
+      this.log.error("could not persist a cancel; nothing was changed", { error: errMessage(e) });
+      throw new EngineError("STORE_UNAVAILABLE", "engine state cannot be persisted; nothing was changed");
+    }
   }
 
   // ------------------------------------------------------------------ lifecycle
@@ -693,20 +791,71 @@ export class Engine extends EventEmitter<EngineEvents> {
       lastError: this.lastError,
       settled: this.settledCount,
       failed: this.failedCount,
+      insufficientFunds: this.settler.status?.().insufficientFunds ?? false,
+      feeCapReached: this.settler.status?.().feeCapReached ?? false,
+      storeBroken: this.storeBroken,
+      recovering: this.recovering,
     };
   }
 
   // --------------------------------------------------------------------- intake
 
+  /**
+   * Accept a signed order. Idempotent by order hash: submitting the identical signed
+   * order again returns its current state (`duplicate: true`) and changes nothing, so
+   * a client may simply retry after a timeout or a STATE_UNKNOWN answer.
+   */
   async submit(req: SubmitRequest): Promise<SubmitResult> {
     try {
       const res = await this.submitInner(req);
-      this.metrics.inc("orders_accepted_total");
+      this.metrics.inc(res.duplicate ? "orders_duplicate_total" : "orders_accepted_total");
       return res;
     } catch (e) {
       this.metrics.inc("orders_rejected_total", { code: e instanceof EngineError ? e.code : "INTERNAL" });
       throw e;
     }
+  }
+
+  private existing(rec: OrderRecord): SubmitResult {
+    return {
+      orderHash: rec.hash,
+      status: this.status(rec),
+      fills: [],
+      remaining: rec.remaining,
+      pending: rec.pending,
+      filled: rec.filled,
+      ...(rec.closed ? { reason: rec.closed.reason } : {}),
+      duplicate: true,
+    };
+  }
+
+  /** Reject with CHAIN_UNAVAILABLE if `p` is not done by `deadline` (its late result is discarded). */
+  private async within<T>(p: Promise<T>, deadline: number): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new EngineError("CHAIN_UNAVAILABLE", "chain checks took too long; the order was not accepted")),
+        Math.max(0, deadline - Date.now()),
+      );
+    });
+    p.catch(() => {}); // a late rejection is nobody's business
+    try {
+      return await Promise.race([p, timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private takeTraderSlot(traderKey: string): boolean {
+    if (this.traderOrdersPerMinute <= 0) return true;
+    const now = Date.now();
+    const w = this.traderWindows.get(traderKey);
+    if (!w || now - w.start >= 60_000) {
+      this.traderWindows.set(traderKey, { start: now, count: 1 });
+      if (this.traderWindows.size > 50_000) for (const [k, v] of this.traderWindows) if (now - v.start >= 60_000) this.traderWindows.delete(k);
+      return true;
+    }
+    return ++w.count <= this.traderOrdersPerMinute;
   }
 
   private async submitInner(req: SubmitRequest): Promise<SubmitResult> {
@@ -718,6 +867,7 @@ export class Engine extends EventEmitter<EngineEvents> {
     if (!market) throw new EngineError("UNKNOWN_MARKET", `unknown market ${order.marketId}`);
     if (!market.active) throw new EngineError("MARKET_INACTIVE", `market ${order.marketId} is not active`);
     if (this.draining) throw new EngineError("SHUTTING_DOWN", "engine is shutting down; not accepting orders");
+    if (this.recovering) throw new EngineError("RECOVERING", "engine is reconciling its state with the chain after a restart; try again shortly");
     if (this.storeBroken) throw new EngineError("STORE_UNAVAILABLE", "engine state cannot be persisted; not accepting orders");
     if (this.stalled) {
       // Do not pile up matches while their settlement outcome cannot be determined.
@@ -746,6 +896,15 @@ export class Engine extends EventEmitter<EngineEvents> {
 
     const hash = hashOrder(this.domain, order);
     const traderKey = order.trader.toLowerCase();
+    const known = this.orders.get(hash);
+    if (known) {
+      // Same signed order again: answer with its state. The signature is still checked,
+      // so that only someone holding the signed order gets this answer.
+      if (!(await verifyOrderSignature(this.domain, order, req.signature))) {
+        throw new EngineError("BAD_SIGNATURE", "signature is not a canonical EIP-712 signature by order.trader");
+      }
+      return this.existing(known);
+    }
     this.checkNotSeen(hash, order);
     if (this.isSuspended(traderKey)) {
       throw new EngineError("TRADER_SUSPENDED", "too many of this trader's orders failed on-chain recently; try again later");
@@ -759,10 +918,14 @@ export class Engine extends EventEmitter<EngineEvents> {
       if (!(await verifyOrderSignature(this.domain, order, req.signature))) {
         throw new EngineError("BAD_SIGNATURE", "signature is not a canonical EIP-712 signature by order.trader");
       }
+      // Counted per trader only once the signature is known to be theirs.
+      if (!this.takeTraderSlot(traderKey)) throw new EngineError("RATE_LIMITED", "too many orders from this trader; slow down");
+      const deadline = Date.now() + this.intakeTimeoutMs;
       // One submission per trader at a time, so that the aggregate margin check sees
       // every earlier order of the trader.
       return await this.withTraderLock(traderKey, async () => {
-        await this.ensureChainState();
+        if (Date.now() >= deadline) throw new EngineError("CHAIN_UNAVAILABLE", "timed out waiting for the trader's earlier submissions; the order was not accepted");
+        await this.within(this.ensureChainState(), deadline);
         const state = this.marketState.get(order.marketId)!;
         if (this.chain && state.index === null) {
           throw new EngineError("MARKET_HALTED", "no fresh index price for this market; not accepting orders");
@@ -770,7 +933,10 @@ export class Engine extends EventEmitter<EngineEvents> {
         if (this.exchangePaused && !order.reduceOnly) {
           throw new EngineError("EXCHANGE_PAUSED", "exchange is paused: only reduce-only orders are accepted");
         }
-        const priorFilled = this.preTradeChecks ? await this.preTradeCheck(order, hash) : 0n;
+        const priorFilled = this.preTradeChecks ? await this.within(this.preTradeCheck(order, hash), deadline) : 0n;
+        // The identical order may have been accepted while this one waited (a client retry).
+        const twin = this.orders.get(hash);
+        if (twin) return this.existing(twin);
         return this.insert(req, hash, priorFilled);
       });
     } finally {
@@ -787,7 +953,9 @@ export class Engine extends EventEmitter<EngineEvents> {
     try {
       const res = this.insertInner(req, hash, priorFilled);
       ok = true;
-      if (!this.flush()) throw new EngineError("STORE_UNAVAILABLE", "the order could not be persisted; its state is unknown, query it before retrying");
+      if (!this.flush()) {
+        throw new EngineError("STATE_UNKNOWN", "the order was processed but could not be persisted; resubmit the identical order or query it to learn its state");
+      }
       return res;
     } finally {
       if (!ok) this.flush();
@@ -856,7 +1024,7 @@ export class Engine extends EventEmitter<EngineEvents> {
     if (!set) this.ordersByTrader.set(traderKey, (set = new Set()));
     set.add(hash);
     // An IOC order must never come back as a resting order, whatever happens to it.
-    if (ioc) this.markDead(order);
+    if (ioc) this.markDead(order.trader, order.nonce, order.expiry);
 
     this.applyBookEffects(order.marketId, { fills: res.fills, expired: res.expired });
     if (res.cancelled > 0n) {
@@ -877,6 +1045,8 @@ export class Engine extends EventEmitter<EngineEvents> {
         status: "pending" as const,
       })),
       remaining: rec.remaining,
+      pending: rec.pending,
+      filled: rec.filled,
       ...(rec.closed ? { reason: rec.closed.reason } : {}),
     };
   }
@@ -914,50 +1084,69 @@ export class Engine extends EventEmitter<EngineEvents> {
   /**
    * Mark (trader, nonce) as cancelled: the order using it (if any) leaves the book and
    * later orders with that nonce are rejected. Also called for on-chain OrderCancelled.
-   * Matches already handed to settlement are not recalled. Throws if the cancel cannot
-   * be made durable (nothing is changed then).
+   * Matches already handed to settlement are not recalled.
+   *
+   * The dead nonce and the order's new state are written in ONE store transaction
+   * before anything changes in memory. If that fails this throws STORE_UNAVAILABLE and
+   * the order is exactly as it was, in memory and on disk.
    */
   cancelNonce(trader: Address, nonce: bigint, reason: string, expiry?: bigint): void {
     const traderKey = trader.toLowerCase();
-    const hash = this.usedNonces.get(nonceKey(traderKey, nonce));
-    const rec = hash && this.orders.get(hash);
-    // Without a known expiry keep the entry for as long as any acceptable order could live.
-    const until = expiry ?? rec?.order.expiry ?? BigInt(this.clock()) + this.maxTimeToExpiry + 1n;
-    const known = this.dead.has(trader, nonce);
-    this.dead.add(trader, nonce, until);
+    const key = nonceKey(traderKey, nonce);
+    const hash = this.usedNonces.get(key);
+    const rec = hash ? this.orders.get(hash) : undefined;
+    // Without a known order, keep the entry for as long as any acceptable order could live, plus a day.
+    const until = expiry ?? rec?.order.expiry ?? BigInt(this.clock()) + this.maxTimeToExpiry + 86_400n;
+    const known = (this.dead.get(key) ?? 0n) >= until;
+    const target = rec && !rec.userCancelled ? rec : undefined;
+    if (known && !target) return;
+    const closes = target !== undefined && !target.closed && target.remaining > 0n;
+    const after = target && this.cancelledState(target, closes, reason);
+    this.commitFirst({ orders: after ? [after] : [], deadNonces: [{ trader, nonce, expiry: until }] });
+    // Durable. Now the same change in memory.
+    this.dead.set(key, until);
     if (!known) this.metrics.inc("orders_cancelled_total");
-    if (!rec || rec.userCancelled) return;
-    this.cancelRecord(rec, reason);
-    this.flush();
+    if (target) this.applyCancel(target, closes, reason);
   }
 
   /**
    * On-chain `cancelAllOrders`: every order of the trader with nonce < `minValid` is
-   * dead. Resting ones leave the book now; later submissions are refused.
+   * dead. Resting ones leave the book now; later submissions are refused. Durable
+   * before it takes effect, like `cancelNonce`.
    */
   cancelBelow(trader: Address, minValid: bigint, reason = "cancelled on-chain (cancelAllOrders)"): void {
     const traderKey = trader.toLowerCase();
     if ((this.minValidNonce.get(traderKey) ?? 0n) >= minValid) return;
-    this.minValidNonce.set(traderKey, minValid);
-    this.pendingWrite.minValidNonces.push({ trader, nonce: minValid });
-    this.metrics.inc("orders_cancelled_total");
+    const targets: [OrderRecord, boolean][] = [];
     for (const hash of this.ordersByTrader.get(traderKey) ?? []) {
       const rec = this.orders.get(hash)!;
-      if (rec.order.nonce < minValid && !rec.userCancelled) this.cancelRecord(rec, reason);
+      if (rec.order.nonce < minValid && !rec.userCancelled) targets.push([rec, !rec.closed && rec.remaining > 0n]);
     }
-    this.flush();
+    this.commitFirst({
+      orders: targets.map(([rec, closes]) => this.cancelledState(rec, closes, reason)),
+      minValidNonces: [{ trader, nonce: minValid }],
+    });
+    this.minValidNonce.set(traderKey, minValid);
+    this.metrics.inc("orders_cancelled_total");
+    for (const [rec, closes] of targets) this.applyCancel(rec, closes, reason);
   }
 
-  private cancelRecord(rec: OrderRecord, reason: string): void {
+  /** The stored form of `rec` once it is cancelled. */
+  private cancelledState(rec: OrderRecord, closes: boolean, reason: string): StoredOrder {
+    return {
+      ...toStored(rec),
+      userCancelled: true,
+      ...(closes ? { remaining: 0n, closed: { status: "cancelled" as const, reason } } : {}),
+    };
+  }
+
+  private applyCancel(rec: OrderRecord, closes: boolean, reason: string): void {
     rec.userCancelled = true;
-    this.touch(rec);
-    if (rec.closed) return;
-    if (rec.remaining > 0n) {
-      this.books.get(rec.order.marketId)!.cancel(rec.hash);
-      rec.remaining = 0n;
-      this.close(rec, "cancelled", reason);
-      this.emit("book", rec.order.marketId);
-    }
+    if (!closes) return;
+    this.books.get(rec.order.marketId)!.cancel(rec.hash);
+    rec.remaining = 0n;
+    rec.closed = { status: "cancelled", reason };
+    this.emit("book", rec.order.marketId);
   }
 
   /** Drop expired resting orders from every book. */
@@ -985,8 +1174,9 @@ export class Engine extends EventEmitter<EngineEvents> {
       this.usedNonces.delete(nonceKey(rec.traderKey, rec.order.nonce));
       this.ordersByTrader.get(rec.traderKey)?.delete(hash);
     }
+    for (const [key, expiry] of this.dead) if (expiry <= now) this.dead.delete(key);
+    for (const cache of [this.chainCache]) if (cache.size > 10_000) cache.clear();
     try {
-      this.dead.prune(now);
       this.store?.pruneFinished(now, this.tradeHistory);
     } catch (e) {
       this.log.warn("store pruning failed", { error: errMessage(e) });
@@ -1006,7 +1196,7 @@ export class Engine extends EventEmitter<EngineEvents> {
     if (order.nonce < (this.minValidNonce.get(order.trader.toLowerCase()) ?? 0n)) {
       throw new EngineError("NONCE_CANCELLED", "nonce is below the trader's on-chain minValidNonce (cancelAllOrders)");
     }
-    if (this.dead.has(order.trader, order.nonce)) {
+    if (this.dead.has(nonceKey(order.trader.toLowerCase(), order.nonce))) {
       throw new EngineError("NONCE_CANCELLED", "this nonce was cancelled or its order was closed; sign a new order");
     }
     if (this.usedNonces.has(nonceKey(order.trader.toLowerCase(), order.nonce))) {
@@ -1043,13 +1233,12 @@ export class Engine extends EventEmitter<EngineEvents> {
     return list.length >= this.faultThreshold;
   }
 
-  private markDead(order: Order): void {
-    try {
-      this.dead.add(order.trader, order.nonce, order.expiry);
-    } catch (e) {
-      // The in-memory set already holds it; only durability across a restart is lost.
-      this.log.error("could not persist dead nonce", { trader: order.trader, nonce: order.nonce, error: errMessage(e) });
-    }
+  /** Record a dead nonce; it is written with the next commit, together with the order it belongs to. */
+  private markDead(trader: Address, nonce: bigint, expiry: bigint): void {
+    const key = nonceKey(trader.toLowerCase(), nonce);
+    if ((this.dead.get(key) ?? 0n) >= expiry) return;
+    this.dead.set(key, expiry);
+    if (this.store) this.pendingWrite.dead.push({ trader, nonce, expiry });
   }
 
   /** Close an order for good. Everything but plain expiry also kills its nonce. */
@@ -1057,7 +1246,7 @@ export class Engine extends EventEmitter<EngineEvents> {
     if (rec.closed) return;
     rec.closed = { status, reason };
     this.touch(rec);
-    if (status !== "expired") this.markDead(rec.order);
+    if (status !== "expired") this.markDead(rec.order.trader, rec.order.nonce, rec.order.expiry);
   }
 
   /**
@@ -1072,16 +1261,25 @@ export class Engine extends EventEmitter<EngineEvents> {
     try {
       const [cancelled, filled] = await Promise.all([chain.isCancelled(order.trader, order.nonce), chain.filledSize(hash)]);
       if (cancelled) {
-        this.markDead(order);
+        this.markDead(order.trader, order.nonce, order.expiry);
         throw new EngineError("NONCE_CANCELLED", "nonce has been cancelled on-chain");
       }
       if (filled >= order.size) throw new EngineError("ALREADY_FILLED", "order is already fully filled on-chain");
 
       if (order.reduceOnly) {
-        // Enforced per fill by the contract; here only the obvious dead-on-arrival case.
-        const position = await chain.positionSize(order.trader, order.marketId);
+        // Enforced per fill by the contract. Here: there must be a position to reduce, and
+        // all of the trader's reduce-only orders on this side together must fit into it -
+        // every one beyond that could only ever fail on-chain, at a taker's expense.
+        const position = await this.cachedRead(traderKey, `pos:${order.marketId}`, () => chain.positionSize(order.trader, order.marketId));
         const opposite = position !== 0n && (order.isBuy ? position < 0n : position > 0n);
         if (!opposite) throw new EngineError("REDUCE_ONLY_NO_POSITION", "reduce-only order has no opposite position to reduce");
+        let open = order.size - filled;
+        for (const r of this.liveOrders(traderKey)) {
+          if (r.reduceOnly && r.order.marketId === order.marketId && r.order.isBuy === order.isBuy) open += r.remaining + r.pending;
+        }
+        if (open > (position < 0n ? -position : position)) {
+          throw new EngineError("REDUCE_ONLY_EXCEEDS_POSITION", "the trader's reduce-only orders on this side would exceed the position they reduce");
+        }
         return filled;
       }
 
@@ -1091,8 +1289,8 @@ export class Engine extends EventEmitter<EngineEvents> {
       exposures.push({ marketId: order.marketId, isBuy: order.isBuy, size: order.size - filled, limitPrice: order.limitPrice });
       const marketIds = [...new Set(exposures.map((e) => e.marketId))];
       const [free, ...positions] = await Promise.all([
-        chain.freeCollateral(order.trader),
-        ...marketIds.map((id) => chain.positionSize(order.trader, id)),
+        this.cachedRead(traderKey, "free", () => chain.freeCollateral(order.trader)),
+        ...marketIds.map((id) => this.cachedRead(traderKey, `pos:${id}`, () => chain.positionSize(order.trader, id))),
       ]);
       const marginMarkets = new Map<number, MarginMarket>();
       marketIds.forEach((id, i) => {
@@ -1117,10 +1315,29 @@ export class Engine extends EventEmitter<EngineEvents> {
     }
   }
 
+  /**
+   * A per-trader chain read, reused for `preTradeCacheMs`: a burst of orders from one
+   * trader costs a handful of RPC calls, not a handful per order. Dropped as soon as a
+   * match of the trader reaches an outcome.
+   */
+  private async cachedRead(traderKey: string, key: string, read: () => Promise<bigint>): Promise<bigint> {
+    if (this.preTradeCacheMs <= 0) return read();
+    let cache = this.chainCache.get(traderKey);
+    const hit = cache?.get(key);
+    if (hit && Date.now() - hit.at < this.preTradeCacheMs) return hit.value;
+    const value = await read();
+    if (!cache) this.chainCache.set(traderKey, (cache = new Map()));
+    cache.set(key, { at: Date.now(), value });
+    return value;
+  }
+
   private status(rec: OrderRecord): OrderStatus {
     if (rec.closed) return rec.closed.status;
     if (rec.remaining > 0n) return rec.pending + rec.filled > 0n ? "partially_filled" : "open";
-    return rec.pending > 0n ? "pending_settlement" : "filled";
+    if (rec.pending > 0n) return "pending_settlement";
+    // Nothing resting, nothing pending, yet not completely filled: part of it was dropped
+    // after a match could not settle through nobody's fault.
+    return rec.filled >= rec.order.size ? "filled" : "cancelled";
   }
 
   private view(rec: OrderRecord): OrderView {
@@ -1319,6 +1536,7 @@ export class Engine extends EventEmitter<EngineEvents> {
       rec.filled += m.fillSize;
       rec.strikes = 0;
       this.touch(rec);
+      this.chainCache.delete(rec.traderKey);
     }
     this.settledCount++;
     this.metrics.inc("matches_settled_total");
@@ -1345,15 +1563,23 @@ export class Engine extends EventEmitter<EngineEvents> {
 
   /**
    * A match failed on-chain: neither order was filled by it.
-   *  - A side at fault is removed from the book for good ("rejected") and the failure
-   *    is counted against its trader.
+   *  - A side at fault is removed from the book for good ("rejected"). If the cause is
+   *    the trader's own doing (margin, reduce-only) it counts against the trader, and
+   *    the trader's other resting orders that would fail the same way are pulled; a
+   *    trader who reaches the suspension threshold loses all resting orders. An order
+   *    that was merely cancelled, filled or expired on-chain is removed without blame.
    *  - An innocent side gets the size back: a resting order at its original time
    *    priority, an IOC order by being matched again against the remaining book.
-   *  - Global condition (pause, stale oracle, price band, OI cap): nobody is at fault.
-   *    The taker is cancelled, the maker gets its size back, no strike.
+   *  - Global condition (pause, stale oracle, price band, OI cap): nobody is at fault
+   *    and no strike is given. Only the failed fill is undone. If the taker no longer
+   *    rests (fully matched, or IOC) the maker gets the size back. If the taker still
+   *    rests, re-posting the slice would re-match the same pair immediately, so the
+   *    slice is dropped on both sides and both keep whatever else they have resting.
+   *  - FillTooSmall (an earlier fill of the same dust order failed): both sides get
+   *    the size back and are matched again, now for the maker's whole remainder; the
+   *    maker gets a strike so that this cannot repeat forever.
    *  - Cause unknown: the taker is dropped and the maker gets its size back plus a
    *    strike; `maxOrderStrikes` consecutive strikes remove it.
-   * In every case the pair cannot be re-matched, so nothing retries forever.
    */
   private applyFailed(m: Match, verdict: Verdict, reason: Hex): void {
     this.failedCount++;
@@ -1363,6 +1589,8 @@ export class Engine extends EventEmitter<EngineEvents> {
     taker.pending -= m.fillSize;
     this.touch(maker);
     this.touch(taker);
+    this.chainCache.delete(maker.traderKey);
+    this.chainCache.delete(taker.traderKey);
     this.metrics.inc("matches_failed_total");
     this.log.warn("match failed on-chain", {
       match: m.id,
@@ -1374,18 +1602,34 @@ export class Engine extends EventEmitter<EngineEvents> {
       global: verdict.global ?? null,
     });
 
+    if (verdict.global && verdict.rematch) {
+      if (++maker.strikes >= this.maxOrderStrikes) this.remove(maker, "rejected", "matches failed on-chain repeatedly");
+      else this.giveBack(maker, m.fillSize);
+      this.giveBack(taker, m.fillSize);
+      return;
+    }
     if (verdict.global) {
-      this.remove(taker, "cancelled", `match could not settle on-chain: ${verdict.global}`);
-      this.giveBack(maker, m.fillSize);
+      const why = `match could not settle on-chain: ${verdict.global}`;
+      if (taker.ioc) this.remove(taker, "cancelled", why);
+      const takerRests = !taker.closed && taker.remaining > 0n;
+      if (takerRests) {
+        // The taker still rests at a price that crosses this maker: giving the slice back
+        // would re-match the very same pair at once and fail again. The pair is kept
+        // apart by dropping the failed slice on both sides; everything else they have stays.
+        if (!maker.closed && maker.remaining === 0n && maker.pending === 0n) this.close(maker, "cancelled", why);
+      } else {
+        if (!taker.closed && taker.pending === 0n) this.close(taker, "cancelled", why);
+        this.giveBack(maker, m.fillSize);
+      }
       return;
     }
     const unattributed = !verdict.maker.atFault && !verdict.taker.atFault;
 
-    if (verdict.taker.atFault) this.rejectAtFault(taker, verdict.taker.reason);
+    if (verdict.taker.atFault) this.rejectAtFault(taker, verdict.taker);
     else if (unattributed) this.remove(taker, "rejected", "match failed on-chain (cause not attributable); taker order dropped");
 
     if (verdict.maker.atFault) {
-      this.rejectAtFault(maker, verdict.maker.reason);
+      this.rejectAtFault(maker, verdict.maker);
     } else if (unattributed && ++maker.strikes >= this.maxOrderStrikes) {
       this.remove(maker, "rejected", "matches failed on-chain repeatedly");
     } else {
@@ -1396,11 +1640,26 @@ export class Engine extends EventEmitter<EngineEvents> {
     if (!verdict.taker.atFault && !unattributed) this.giveBack(taker, m.fillSize);
   }
 
-  private rejectAtFault(rec: OrderRecord, why: string | undefined): void {
+  private rejectAtFault(rec: OrderRecord, side: SideVerdict): void {
+    const why = side.reason ?? "order at fault";
+    this.remove(rec, "rejected", `match failed on-chain: ${why}`);
+    if (!side.kind) return; // cancelled / filled / expired on-chain: not something to hold against the trader
     let list = this.faults.get(rec.traderKey);
     if (!list) this.faults.set(rec.traderKey, (list = []));
     list.push(this.clock());
-    this.remove(rec, "rejected", `match failed on-chain: ${why ?? "order at fault"}`);
+    // Orders of the same trader that would fail for the same reason must not stay in
+    // the book waiting to cost the next taker a failed round.
+    const suspended = this.isSuspended(rec.traderKey);
+    for (const other of this.liveOrders(rec.traderKey)) {
+      if (other === rec || other.closed || other.remaining === 0n) continue;
+      const same =
+        side.kind === "margin"
+          ? !other.reduceOnly
+          : other.reduceOnly && other.order.marketId === rec.order.marketId && other.order.isBuy === rec.order.isBuy;
+      if (!suspended && !same) continue;
+      this.remove(other, "cancelled", suspended ? "trader suspended after repeated on-chain failures" : `another order of this trader failed on-chain: ${why}`);
+      this.emit("book", other.order.marketId);
+    }
   }
 
   /** Take an order out of the book for good. */
@@ -1456,6 +1715,7 @@ function emptyWrite() {
     removeMatches: [] as string[],
     trades: [] as Trade[],
     minValidNonces: [] as { trader: Address; nonce: bigint }[],
+    dead: [] as DeadNonce[],
     batched: null as { batchId: string; ids: string[] } | null,
   };
 }
