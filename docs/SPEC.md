@@ -29,6 +29,10 @@ The source of truth for the on-chain interface is
   strictly reduced its position without flipping, kept a non-negative account value and
   did not lower its health (`accountValue − maintenance requirement`).
 - Withdrawals must leave initial margin satisfied.
+- Orders must carry a non-zero expiry at most `maxOrderLifetime()` (30 days) ahead; the
+  engine accepts at most 7 days. Nonces must increase over time per trader (clients use a
+  millisecond timestamp in the high bits), so `cancelAllOrders(minValidNonce)` cancels
+  everything signed before a point in time. Only on-chain cancels bind the contract.
 - Fees: maker/taker bps of notional, charged in USDC, paid to the fee recipient.
 - Funding: hourly; rate = clamp((mark − index) / index, ±cap), longs pay shorts when
   positive. Mark = last fill price. Accrued through a cumulative index, settled into

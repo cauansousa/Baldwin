@@ -23,7 +23,7 @@ interface IExchange {
         uint256 size; // total base size, WAD
         uint256 limitPrice; // worst acceptable price, WAD
         uint256 nonce; // unique per trader; identifies the order for cancellation
-        uint64 expiry; // unix seconds; 0 = no expiry
+        uint64 expiry; // unix seconds; must be non-zero and at most maxOrderLifetime() ahead
     }
 
     /// @dev One fill between a resting (maker) and an incoming (taker) order.
@@ -73,6 +73,7 @@ interface IExchange {
     );
     event MatchFailed(uint256 indexed index, bytes32 makerOrderHash, bytes32 takerOrderHash, bytes reason);
     event OrderCancelled(address indexed trader, uint256 nonce);
+    event OrdersCancelledBelow(address indexed trader, uint256 minValidNonce);
     event FundingUpdated(uint32 indexed marketId, int256 fundingRateBps, int256 cumulativeFunding, uint256 timestamp);
     event Liquidation(
         uint32 indexed marketId,
@@ -91,6 +92,9 @@ interface IExchange {
     function withdraw(uint256 amount) external;
     /// @notice On-chain cancel; works even if the operator is offline.
     function cancelOrder(uint256 nonce) external;
+    /// @notice Bulk on-chain cancel: every order of the caller with nonce < newMinValidNonce
+    ///         becomes invalid. Must be strictly greater than the current value.
+    function cancelAllOrders(uint256 newMinValidNonce) external;
 
     // ------------------------------------------------------------- operator
     /// @notice Settle a batch. A failing match must NOT revert the batch: it emits
@@ -125,6 +129,10 @@ interface IExchange {
     function insuranceFund() external view returns (uint256);
     function hashOrder(Order calldata order) external view returns (bytes32);
     function filledSize(bytes32 orderHash) external view returns (uint256);
+    /// @notice True if the nonce was cancelled individually or is below minValidNonce.
     function isCancelled(address trader, uint256 nonce) external view returns (bool);
+    function minValidNonce(address trader) external view returns (uint256);
+    /// @notice Orders whose expiry is 0 or further than this many seconds ahead are rejected.
+    function maxOrderLifetime() external view returns (uint256);
     function isOperator(address account) external view returns (bool);
 }

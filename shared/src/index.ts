@@ -53,6 +53,7 @@ export const EXCHANGE_ABI = [
   "event Fill(uint32 indexed marketId, address indexed maker, address indexed taker, bytes32 makerOrderHash, bytes32 takerOrderHash, bool takerIsBuy, uint256 size, uint256 price, uint256 makerFee, uint256 takerFee)",
   "event MatchFailed(uint256 indexed index, bytes32 makerOrderHash, bytes32 takerOrderHash, bytes reason)",
   "event OrderCancelled(address indexed trader, uint256 nonce)",
+  "event OrdersCancelledBelow(address indexed trader, uint256 minValidNonce)",
   "event FundingUpdated(uint32 indexed marketId, int256 fundingRateBps, int256 cumulativeFunding, uint256 timestamp)",
   "event Liquidation(uint32 indexed marketId, address indexed trader, address indexed liquidator, int256 size, uint256 price, uint256 penalty, uint256 badDebt)",
   "event OperatorUpdated(address indexed operator, bool allowed)",
@@ -60,6 +61,7 @@ export const EXCHANGE_ABI = [
   "function deposit(uint256 amount)",
   "function withdraw(uint256 amount)",
   "function cancelOrder(uint256 nonce)",
+  "function cancelAllOrders(uint256 newMinValidNonce)",
   "function settleMatches(Match[] matches)",
   "function liquidate(address trader, uint32 marketId, uint256 maxSize)",
   "function updateFunding(uint32 marketId)",
@@ -80,6 +82,8 @@ export const EXCHANGE_ABI = [
   "function hashOrder(Order order) view returns (bytes32)",
   "function filledSize(bytes32 orderHash) view returns (uint256)",
   "function isCancelled(address trader, uint256 nonce) view returns (bool)",
+  "function minValidNonce(address trader) view returns (uint256)",
+  "function maxOrderLifetime() view returns (uint256)",
   "function isOperator(address account) view returns (bool)",
   // Implementation details of Exchange.sol that off-chain code relies on (not in IExchange).
   "function paused() view returns (bool)",
@@ -95,6 +99,9 @@ export const EXCHANGE_ABI = [
   "error OpenInterestCapExceeded()",
   "error FillTooSmall()",
   "error InsufficientGas()",
+  "error InvalidExpiry()",
+  "error OrderIsCancelled()",
+  "error OrderExpired()",
 ] as const;
 
 export const ERC20_ABI = [
