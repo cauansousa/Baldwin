@@ -30,8 +30,8 @@ async function request(baseUrl: string, path: string, init?: RequestInit): Promi
     body = undefined;
   }
   if (!res.ok) {
-    const { message, code } = parseEngineError(res.status, body, text);
-    throw new EngineError(res.status, message, code);
+    const { message, code, outcome } = parseEngineError(res.status, body, text);
+    throw new EngineError(res.status, message, code, outcome);
   }
   return body;
 }
@@ -133,10 +133,10 @@ export function createHttpEngine(baseUrl: string): EngineApi {
     async getOpenOrders(trader) {
       return normalizeOpenOrders(await request(baseUrl, `/orders?trader=${trader}`));
     },
-    async postOrder(req) {
-      return normalizePostOrderResult(
-        await request(baseUrl, "/orders", { method: "POST", body: JSON.stringify(req) }),
-      );
+    async postOrder({ order, signature, postOnly, ioc }) {
+      // Only the documented fields go on the wire.
+      const body = { order, signature, ...(postOnly ? { postOnly: true } : {}), ...(ioc ? { ioc: true } : {}) };
+      return normalizePostOrderResult(await request(baseUrl, "/orders", { method: "POST", body: JSON.stringify(body) }));
     },
     async cancelOrder(orderHash, signature) {
       await request(baseUrl, `/orders/${orderHash}`, { method: "DELETE", body: JSON.stringify({ signature }) });

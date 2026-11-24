@@ -1,25 +1,31 @@
 import type { Order } from "@shared";
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
-import { useSignTypedData } from "wagmi";
+import { hashTypedData } from "viem";
+import { useSignTypedData, useWriteContract } from "wagmi";
 import { readContract } from "wagmi/actions";
 import { engine } from "../api";
-import type { EngineHealth, MarketInfo } from "../api/types";
+import type { EngineHealth, MarketInfo, PostOrderResult } from "../api/types";
 import { config } from "../config";
-import type { ChainAccount, ChainMarket, ExchangeStatus } from "../hooks/useChain";
+import { readChainTime, type ChainAccount, type ChainMarket, type ExchangeStatus } from "../hooks/useChain";
+import { useTxFlow } from "../hooks/useTx";
 import { queryKeys } from "../hooks/useEngine";
-import { describeError, describeOrderReason } from "../lib/errors";
+import { describeError, describeOrderReason, EngineError } from "../lib/errors";
 import {
+  cancelTypedData,
   DEFAULT_EXPIRY_SECONDS,
   defaultExpiry,
-  knownNonceFloor,
   nextNonce,
+  nonceUpperBound,
   normalizeSignature,
   orderToJson,
   orderTypedData,
 } from "../lib/order";
 import { classifyLimitPrice, estimateOrder, priceBand } from "../lib/risk";
+import { submitUntilKnown } from "../lib/submit";
+import { nonceStore } from "../nonces";
 import { exchangeAbi, wagmiConfig } from "../wagmi";
+import { TxStatus } from "./TxStatus";
 import { formatBps, formatPrice, formatSize, formatUsdc, parseWad } from "../lib/units";
 
 export interface OrderPrefill {
@@ -35,8 +41,27 @@ type Submit =
   | { status: "idle" }
   | { status: "signing" }
   | { status: "sending" }
+  /** Resubmitting the same signed order because the engine's answer was lost. */
+  | { status: "confirming"; attempt: number }
+  /** Retries exhausted: the order may or may not be live. `detail` is the last error. */
+  | { status: "unresolved"; detail: string }
+  | { status: "discarding" }
+  | { status: "discard_failed"; detail: string }
   | { status: "success"; message: string; warn: boolean }
   | { status: "error"; message: string };
+
+/**
+ * An order the wallet has signed and whose fate at the engine is not known
+ * yet. Kept in memory until the engine accepts or refuses it, or the user
+ * discards it; while it exists no other order is signed.
+ */
+interface SignedOrder {
+  order: Order;
+  signature: `0x${string}`;
+  orderHash: `0x${string}`;
+  postOnly: boolean;
+  ioc: boolean;
+}
 
 interface Props {
   market: MarketInfo | undefined;
@@ -75,6 +100,9 @@ export function OrderForm({ market, chainMarket, account, exchangeStatus, engine
   const [submit, setSubmit] = useState<Submit>({ status: "idle" });
   // Lets the user abandon a wallet prompt that never answers without leaving the form stuck.
   const attempt = useRef(0);
+  const [pending, setPending] = useState<SignedOrder>();
+  const { writeContractAsync } = useWriteContract();
+  const cancelTx = useTxFlow();
 
   useEffect(() => {
     if (!prefill) return;
@@ -135,7 +163,8 @@ export function OrderForm({ market, chainMarket, account, exchangeStatus, engine
       : undefined);
   const bandPosition = band && parsed.price !== undefined ? classifyLimitPrice(isBuy, parsed.price, band) : undefined;
 
-  const busy = submit.status === "signing" || submit.status === "sending";
+  const busy =
+    submit.status === "signing" || submit.status === "sending" || submit.status === "confirming" || submit.status === "discarding";
   const blocker = !market
     ? "Nenhum mercado disponível"
     : !config.exchange
@@ -147,7 +176,57 @@ export function OrderForm({ market, chainMarket, account, exchangeStatus, engine
           : engineMarket && engineMarket.indexPrice === null
             ? "Mercado suspenso (sem preço índice)"
             : undefined;
-  const canSubmit = !blocker && !busy && parsed.price !== undefined && parsed.size !== undefined;
+  // One intent at a time: nothing new is signed while an earlier order is unresolved.
+  const canSubmit = !blocker && !busy && !pending && parsed.price !== undefined && parsed.size !== undefined;
+
+  const refreshAfterOrder = () => {
+    void queryClient.invalidateQueries({ queryKey: queryKeys.openOrders(trader) });
+    void queryClient.invalidateQueries({ queryKey: queryKeys.chain });
+  };
+
+  function describeAccepted(result: PostOrderResult | undefined): Submit {
+    if (!result) return { status: "success", message: "Ordem confirmada: o motor já a tinha registrado.", warn: false };
+    const status = STATUS_LABELS[result.status] ?? result.status;
+    const fills = result.fills.length > 0 ? ` · ${result.fills.length} execução(ões) aguardando liquidação` : "";
+    const reason = result.reason ? ` Motivo: ${describeOrderReason(result.reason)}.` : "";
+    return {
+      status: "success",
+      message: `Ordem enviada${status ? `: ${status}` : ""}${fills}.${reason}`,
+      warn: CLOSED_STATUSES.has(result.status) && result.fills.length === 0,
+    };
+  }
+
+  /**
+   * Sends a signed order and keeps resubmitting the SAME signed order (the
+   * engine is idempotent by order hash) while the answer is a timeout, a
+   * network error or a "state unknown" 5xx. Never signs anything.
+   */
+  async function sendSigned(signed: SignedOrder) {
+    setSubmit({ status: "sending" });
+    const outcome = await submitUntilKnown(
+      () =>
+        engine.postOrder({
+          order: orderToJson(signed.order),
+          signature: signed.signature,
+          orderHash: signed.orderHash,
+          ...(signed.postOnly ? { postOnly: true } : {}),
+          ...(signed.ioc ? { ioc: true } : {}),
+        }),
+      { onRetry: (n) => setSubmit({ status: "confirming", attempt: n }) },
+    );
+    if (outcome.kind === "accepted") {
+      setPending(undefined);
+      setSubmit(describeAccepted(outcome.value));
+      setSize("");
+    } else if (outcome.kind === "not_accepted") {
+      // Definitely not registered: the signed order is dropped and a new one may be signed.
+      setPending(undefined);
+      setSubmit({ status: "error", message: describeError(outcome.error) });
+    } else {
+      setSubmit({ status: "unresolved", detail: describeError(outcome.error) });
+    }
+    refreshAfterOrder();
+  }
 
   async function onSubmit(event: FormEvent) {
     event.preventDefault();
@@ -155,24 +234,27 @@ export function OrderForm({ market, chainMarket, account, exchangeStatus, engine
     if (parsed.price === undefined || parsed.size === undefined) return;
     const id = ++attempt.current;
     const current = () => attempt.current === id;
+    let signed: SignedOrder;
     try {
       setSubmit({ status: "signing" });
       // Nonces below the on-chain minimum (raised by a bulk cancel) are dead: stay above it.
       let minValidNonce = account?.minValidNonce ?? 0n;
-      const floor = knownNonceFloor(trader);
+      const floor = nonceStore.floor(trader);
       if (floor > minValidNonce) minValidNonce = floor;
-      try {
-        const onChain = await readContract(wagmiConfig, {
+      // The contract's clock bounds nonces; fall back to the device clock if the read fails.
+      let chainTime = BigInt(Math.floor(Date.now() / 1000));
+      const [onChainMin, onChainTime] = await Promise.allSettled([
+        readContract(wagmiConfig, {
           abi: exchangeAbi,
           address: config.exchange,
           chainId: config.chainId,
           functionName: "minValidNonce",
           args: [trader],
-        });
-        if (onChain > minValidNonce) minValidNonce = onChain;
-      } catch {
-        // RPC hiccup: fall back to the last value we know.
-      }
+        }),
+        readChainTime(),
+      ]);
+      if (onChainMin.status === "fulfilled" && onChainMin.value > minValidNonce) minValidNonce = onChainMin.value;
+      if (onChainTime.status === "fulfilled") chainTime = onChainTime.value;
       if (!current()) return;
       const order: Order = {
         trader,
@@ -181,35 +263,68 @@ export function OrderForm({ market, chainMarket, account, exchangeStatus, engine
         reduceOnly,
         size: parsed.size,
         limitPrice: parsed.price,
-        nonce: nextNonce(minValidNonce),
+        nonce: nextNonce(minValidNonce, nonceUpperBound(chainTime)), // throws if no acceptable nonce exists
         expiry: defaultExpiry(),
       };
-      const signature = normalizeSignature(
-        await signTypedDataAsync(orderTypedData(config.chainId, config.exchange, order)),
-      );
+      const typedData = orderTypedData(config.chainId, config.exchange, order);
+      // Recorded before the wallet is asked: the signature may exist even if we never get it back.
+      nonceStore.recordSigned(trader, order.nonce);
+      const signature = normalizeSignature(await signTypedDataAsync(typedData));
       if (!current()) return;
-      setSubmit({ status: "sending" });
-      const result = await engine.postOrder({
-        order: orderToJson(order),
-        signature,
-        ...(postOnly ? { postOnly: true } : {}),
-        ...(ioc ? { ioc: true } : {}),
-      });
-      const status = STATUS_LABELS[result.status] ?? result.status;
-      const fills = result.fills.length > 0 ? ` · ${result.fills.length} execução(ões) aguardando liquidação` : "";
-      const reason = result.reason ? ` Motivo: ${describeOrderReason(result.reason)}.` : "";
-      if (!current()) return;
-      setSubmit({
-        status: "success",
-        message: `Ordem enviada${status ? `: ${status}` : ""}${fills}.${reason}`,
-        warn: CLOSED_STATUSES.has(result.status) && result.fills.length === 0,
-      });
-      setSize("");
+      signed = { order, signature, orderHash: hashTypedData(typedData), postOnly, ioc };
     } catch (err) {
       if (current()) setSubmit({ status: "error", message: describeError(err) });
-    } finally {
-      void queryClient.invalidateQueries({ queryKey: queryKeys.openOrders(trader) });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.chain });
+      return;
+    }
+    setPending(signed);
+    await sendSigned(signed);
+  }
+
+  /**
+   * Gives up on an unresolved order. The nonce is cancelled at the engine
+   * first; the order is only forgotten once the engine confirms the cancel or
+   * says it never had the order.
+   */
+  async function discardPending() {
+    if (!pending || !trader || !config.exchange) return;
+    setSubmit({ status: "discarding" });
+    try {
+      const signature = normalizeSignature(
+        await signTypedDataAsync(cancelTypedData(config.chainId, config.exchange, trader, pending.order.nonce)),
+      );
+      await engine.cancelOrder(pending.orderHash, signature);
+      setPending(undefined);
+      setSubmit({ status: "success", message: "Ordem descartada: o motor confirmou o cancelamento.", warn: false });
+    } catch (err) {
+      if (err instanceof EngineError && err.status === 404) {
+        setPending(undefined);
+        setSubmit({ status: "success", message: "Ordem descartada: o motor confirmou que ela não chegou a ser registrada.", warn: false });
+      } else {
+        setSubmit({ status: "discard_failed", detail: describeError(err) });
+      }
+    }
+    refreshAfterOrder();
+  }
+
+  /** Last resort for an unresolved order: kill its nonce in the contract. */
+  async function cancelPendingOnChain() {
+    const exchange = config.exchange;
+    if (!pending || !exchange) return;
+    const nonce = pending.order.nonce;
+    const ok = await cancelTx.run(
+      () => [
+        {
+          label: "Cancelamento on-chain",
+          send: () =>
+            writeContractAsync({ abi: exchangeAbi, address: exchange, chainId: config.chainId, functionName: "cancelOrder", args: [nonce] }),
+        },
+      ],
+      "Ordem cancelada on-chain: o contrato não a aceitará mais.",
+    );
+    if (ok) {
+      setPending(undefined);
+      setSubmit({ status: "success", message: "Ordem cancelada on-chain: o contrato não a aceitará mais.", warn: false });
+      refreshAfterOrder();
     }
   }
 
@@ -350,7 +465,11 @@ export function OrderForm({ market, chainMarket, account, exchangeStatus, engine
               ? "Assine na carteira…"
               : submit.status === "sending"
                 ? "Enviando…"
-                : `${isBuy ? "Comprar" : "Vender"} ${base}`)}
+                : submit.status === "confirming"
+                  ? "Confirmando com o motor…"
+                  : pending
+                    ? "Resolva a ordem pendente abaixo"
+                    : `${isBuy ? "Comprar" : "Vender"} ${base}`)}
         </button>
 
         {submit.status === "signing" && (
@@ -368,6 +487,42 @@ export function OrderForm({ market, chainMarket, account, exchangeStatus, engine
             </button>
           </p>
         )}
+        {submit.status === "confirming" && (
+          <p className="note" role="status">
+            Confirmando com o motor… (tentativa {submit.attempt + 1}). A resposta anterior se perdeu; a mesma ordem
+            assinada está sendo reenviada, sem criar outra.
+          </p>
+        )}
+        {pending && (submit.status === "unresolved" || submit.status === "discard_failed" || submit.status === "discarding") && (
+          <div className="note note-warn" role="alert">
+            {submit.status === "discard_failed" ? (
+              <p>
+                Não foi possível confirmar o cancelamento ({submit.detail}) <strong>A ordem pode estar ativa.</strong> Tente
+                de novo ou cancele on-chain, que vale mesmo sem o motor.
+              </p>
+            ) : (
+              <p>
+                Não foi possível confirmar com o motor se a ordem foi aceita{submit.status === "unresolved" ? ` (${submit.detail})` : ""}{" "}
+                <strong>Ela pode estar ativa.</strong> Nenhuma outra ordem será assinada até isto se resolver.
+              </p>
+            )}
+            <p className="num muted">
+              {pending.order.isBuy ? "Compra" : "Venda"} {formatSize(pending.order.size)} {base} a {formatPrice(pending.order.limitPrice)}
+            </p>
+            <div className="note-buttons">
+              <button type="button" className="btn btn-small" disabled={busy || cancelTx.busy} onClick={() => void sendSigned(pending)}>
+                Reenviar a mesma ordem
+              </button>
+              <button type="button" className="btn btn-small" disabled={busy || cancelTx.busy} onClick={() => void discardPending()}>
+                {submit.status === "discarding" ? "Cancelando…" : "Descartar (cancelar no motor)"}
+              </button>
+              <button type="button" className="btn btn-small" disabled={busy || cancelTx.busy} onClick={() => void cancelPendingOnChain()}>
+                Cancelar on-chain
+              </button>
+            </div>
+          </div>
+        )}
+        {pending && <TxStatus state={cancelTx.state} onDismiss={cancelTx.dismiss} />}
         {submit.status === "success" && (
           <p className={`note ${submit.warn ? "note-warn" : "note-ok"}`} role="status">
             {submit.message}

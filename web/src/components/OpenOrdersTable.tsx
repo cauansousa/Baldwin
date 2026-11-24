@@ -7,10 +7,12 @@ import { isCancellable } from "../api/normalize";
 import type { MarketInfo, OpenOrder } from "../api/types";
 import { config } from "../config";
 import { queryKeys, useOpenOrders } from "../hooks/useEngine";
+import { readChainTime } from "../hooks/useChain";
 import { useTxFlow } from "../hooks/useTx";
 import { describeError } from "../lib/errors";
-import { bulkCancelNonce, cancelTypedData, normalizeSignature, rememberNonceFloor } from "../lib/order";
+import { cancelTypedData, nonceUpperBound, normalizeSignature, planBulkCancel } from "../lib/order";
 import { formatPrice, formatSize } from "../lib/units";
+import { nonceStore } from "../nonces";
 import { exchangeAbi, wagmiConfig } from "../wagmi";
 import { TxStatus } from "./TxStatus";
 
@@ -86,34 +88,66 @@ export function OpenOrdersTable({ markets, viewer, trader }: Props) {
     if (ok) refreshOrders();
   }
 
+  // What the last bulk cancel actually achieved, checked against the contract.
+  const [bulkReport, setBulkReport] = useState<{ ok: boolean; text: string }>();
+
   async function cancelAllOnChain() {
     if (!trader || !exchange) return;
     setError(undefined);
-    let newMin: bigint | undefined;
+    setBulkReport(undefined);
+    const listed = orders.map((o) => o.order.nonce);
+    let plan: ReturnType<typeof planBulkCancel> | undefined;
     const ok = await tx.run(async () => {
-      // Read the current minimum first: the new one must be strictly greater.
-      const currentMin = await readContract(wagmiConfig, {
-        abi: exchangeAbi,
-        address: exchange,
-        chainId,
-        functionName: "minValidNonce",
-        args: [trader],
-      });
-      const value = bulkCancelNonce(currentMin);
-      newMin = value;
+      // The new minimum must exceed the current one and stay within the contract's
+      // bound, which follows the chain's clock (not this device's).
+      const [currentMin, chainTime] = await Promise.all([
+        readContract(wagmiConfig, { abi: exchangeAbi, address: exchange, chainId, functionName: "minValidNonce", args: [trader] }),
+        readChainTime(),
+      ]);
+      let highestSigned = nonceStore.highestSigned(trader);
+      for (const nonce of listed) if (nonce > highestSigned) highestSigned = nonce;
+      const planned = planBulkCancel({ currentMinValidNonce: currentMin, highestSignedNonce: highestSigned, upperBound: nonceUpperBound(chainTime) });
+      plan = planned;
       return [
         {
-          label: "Cancelamento de todas as ordens on-chain",
+          label: "Cancelamento em massa on-chain",
           send: () =>
-            writeContractAsync({ abi: exchangeAbi, address: exchange, chainId, functionName: "cancelAllOrders", args: [value] }),
+            writeContractAsync({ abi: exchangeAbi, address: exchange, chainId, functionName: "cancelAllOrders", args: [planned.value] }),
         },
       ];
-    }, "Todas as ordens assinadas até agora foram canceladas on-chain.");
-    if (ok && newMin !== undefined) {
-      // New orders must use nonces at or above the new minimum.
-      rememberNonceFloor(trader, newMin);
-      refreshOrders();
+    }, "Novo mínimo de nonce gravado no contrato.");
+    if (!ok || !plan) return;
+    // New orders must use nonces at or above the new minimum.
+    nonceStore.recordFloor(trader, plan.value);
+    refreshOrders();
+
+    // Do not take coverage for granted: ask the contract about every order that was listed.
+    const checks = await Promise.allSettled(
+      listed.map((nonce) =>
+        readContract(wagmiConfig, { abi: exchangeAbi, address: exchange, chainId, functionName: "isCancelled", args: [trader, nonce] }),
+      ),
+    );
+    const alive = checks.filter((c) => c.status === "fulfilled" && !c.value).length;
+    const unverified = checks.filter((c) => c.status === "rejected").length;
+    const problems: string[] = [];
+    if (alive > 0) problems.push(`${alive} ordem(ns) listada(s) NÃO ficaram canceladas no contrato: cancele-as uma a uma com “On-chain”.`);
+    if (unverified > 0) problems.push(`Não foi possível verificar ${unverified} ordem(ns) no contrato; confira de novo em instantes.`);
+    if (!plan.coversAllSigned) {
+      problems.push(
+        "O limite do contrato (horário da rede + 1 dia) ficou abaixo de nonces que este dispositivo pode ter assinado; ordens assinadas com o relógio adiantado podem continuar válidas.",
+      );
     }
+    setBulkReport(
+      problems.length > 0
+        ? { ok: false, text: problems.join(" ") }
+        : {
+            ok: true,
+            text:
+              listed.length > 0
+                ? `Verificado no contrato: as ${listed.length} ordem(ns) listada(s) estão canceladas, assim como qualquer outra assinada neste dispositivo até agora.`
+                : "Todas as ordens assinadas neste dispositivo até agora estão canceladas no contrato.",
+          },
+    );
   }
 
   const canTransact = !!trader && !!exchange && !tx.busy;
@@ -142,6 +176,11 @@ export function OpenOrdersTable({ markets, viewer, trader }: Props) {
         </p>
       )}
       <TxStatus state={tx.state} onDismiss={tx.dismiss} />
+      {bulkReport && (
+        <p className={`note ${bulkReport.ok ? "note-ok" : "note-warn"}`} role={bulkReport.ok ? "status" : "alert"}>
+          {bulkReport.text}
+        </p>
+      )}
       {error && <p className="note note-error" role="alert">{error}</p>}
       {orders.length === 0 ? (
         <div className="empty">

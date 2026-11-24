@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { hashTypedData } from "viem";
 import { describeError, describeOrderReason, EngineError, engineErrorMessage, parseEngineError, TxTimeoutError } from "./errors";
+import { createNonceStore } from "./nonceStore";
+import { classifySubmitFailure, submitUntilKnown } from "./submit";
 import {
-  bulkCancelNonce,
-  knownNonceFloor,
   nextNonce,
-  rememberNonceFloor,
+  NonceRangeError,
+  nonceUpperBound,
+  planBulkCancel,
   cancelTypedData,
   DEFAULT_EXPIRY_SECONDS,
   defaultExpiry,
@@ -72,43 +74,232 @@ describe("order helpers", () => {
   });
 });
 
-describe("on-chain bulk cancel nonces", () => {
-  const now = 1_800_000_000_000;
+describe("nonce bounds and on-chain bulk cancel", () => {
+  const now = 1_800_000_000_000; // device clock, ms
+  const chainTime = 1_800_000_000n; // latest block, s (in sync with the device)
+  const bound = nonceUpperBound(chainTime);
   const MAX_RANDOM = 2n ** 64n - 1n;
 
-  it("the new minimum is strictly above every nonce signed up to now", () => {
-    const min = bulkCancelNonce(0n, now);
-    expect(min).toBeGreaterThan(generateNonce(now, MAX_RANDOM));
-    expect(min).toBeGreaterThan(generateNonce(now - 86_400_000, MAX_RANDOM));
-    expect(min).toBe((BigInt(now) + 1n) << 64n);
+  it("the upper bound is ((chain time + 1 day) in ms) << 64", () => {
+    expect(bound).toBe((1_800_000_000_000n + 86_400_000n) << 64n);
   });
 
-  it("is strictly greater than the current on-chain minimum, even if that is ahead of the clock", () => {
-    const ahead = (BigInt(now) + 10_000n) << 64n;
-    expect(bulkCancelNonce(ahead, now)).toBe(ahead + 1n);
-    const same = bulkCancelNonce(0n, now);
-    expect(bulkCancelNonce(same, now)).toBe(same + 1n);
-    expect(bulkCancelNonce(same - 1n, now)).toBe(same);
+  it("the plan is strictly above the current minimum and every nonce signed up to now", () => {
+    const plan = planBulkCancel({ currentMinValidNonce: 0n, highestSignedNonce: 0n, upperBound: bound, nowMs: now });
+    expect(plan).toEqual({ value: (BigInt(now) + 1n) << 64n, coversAllSigned: true });
+    expect(plan.value).toBeGreaterThan(generateNonce(now, MAX_RANDOM));
+    expect(plan.value).toBeLessThanOrEqual(bound);
+  });
+
+  it("device clock behind the on-chain minimum: still covers nonces this client signed above that minimum", () => {
+    // An earlier bulk cancel (from a device with a later clock) left the minimum 1 h ahead of this device.
+    const currentMin = (BigInt(now) + 3_600_000n) << 64n;
+    // Orders signed here since then were bumped above the minimum by nextNonce.
+    const signedA = nextNonce(currentMin, bound, now, 5n);
+    const signedB = nextNonce(currentMin, bound, now + 10, MAX_RANDOM);
+    expect(signedA).toBeGreaterThanOrEqual(currentMin);
+    const highest = signedA > signedB ? signedA : signedB;
+    const plan = planBulkCancel({ currentMinValidNonce: currentMin, highestSignedNonce: highest, upperBound: bound, nowMs: now + 20 });
+    expect(plan.coversAllSigned).toBe(true);
+    expect(plan.value).toBeGreaterThan(currentMin);
+    expect(plan.value).toBeGreaterThan(signedA);
+    expect(plan.value).toBeGreaterThan(signedB);
+    // The old rule (currentMin + 1) would have left both orders alive.
+    expect(currentMin + 1n).toBeLessThanOrEqual(signedA);
+  });
+
+  it("is capped at the contract bound and says so when that leaves signed nonces uncovered", () => {
+    // Device clock two days ahead of the chain.
+    const skewed = now + 2 * 86_400_000;
+    const signed = generateNonce(skewed, 1n);
+    const plan = planBulkCancel({ currentMinValidNonce: 0n, highestSignedNonce: signed, upperBound: bound, nowMs: skewed });
+    expect(plan).toEqual({ value: bound, coversAllSigned: false });
+    expect(plan.value).toBeLessThan(signed);
+  });
+
+  it("refuses when the minimum is already at the bound (cancelAllOrders would revert)", () => {
+    for (const currentMin of [bound, bound + 1n]) {
+      expect(() => planBulkCancel({ currentMinValidNonce: currentMin, highestSignedNonce: 0n, upperBound: bound, nowMs: now })).toThrow(
+        NonceRangeError,
+      );
+    }
+    // One below the bound still works, exactly at the bound.
+    expect(planBulkCancel({ currentMinValidNonce: bound - 1n, highestSignedNonce: 0n, upperBound: bound, nowMs: now }).value).toBe(bound);
   });
 
   it("orders signed after a bulk cancel get nonces at or above the new minimum", () => {
-    const min = bulkCancelNonce(0n, now);
+    const min = planBulkCancel({ currentMinValidNonce: 0n, highestSignedNonce: 0n, upperBound: bound, nowMs: now }).value;
     // Same millisecond as the cancel, one later, and a device whose clock is far behind.
     for (const t of [now, now + 1, now - 3_600_000]) {
-      for (const r of [0n, 12345n, MAX_RANDOM]) expect(nextNonce(min, t, r)).toBeGreaterThanOrEqual(min);
+      for (const r of [0n, 12345n, MAX_RANDOM]) {
+        const nonce = nextNonce(min, bound, t, r);
+        expect(nonce).toBeGreaterThanOrEqual(min);
+        expect(nonce >> 64n).toBeLessThanOrEqual(bound >> 64n);
+      }
     }
     // Normally the nonce is just the time-based one.
-    expect(nextNonce(0n, now, 7n)).toBe(generateNonce(now, 7n));
-    expect(nextNonce(min, now + 5, 7n)).toBe(generateNonce(now + 5, 7n));
+    expect(nextNonce(0n, bound, now, 7n)).toBe(generateNonce(now, 7n));
+    expect(nextNonce(min, bound, now + 5, 7n)).toBe(generateNonce(now + 5, 7n));
     // Still unique within a millisecond when bumped above the minimum.
-    expect(nextNonce(min + 5n, now, 1n)).not.toBe(nextNonce(min + 5n, now, 2n));
+    expect(nextNonce(min + 5n, bound, now, 1n)).not.toBe(nextNonce(min + 5n, bound, now, 2n));
+    // A minimum with non-zero low bits is never undercut.
+    expect(nextNonce(min + 5n, bound, now - 1000, 2n)).toBeGreaterThanOrEqual(min + 5n);
   });
 
-  it("remembers the highest floor per trader, case-insensitively", () => {
-    expect(knownNonceFloor(trader)).toBe(0n);
-    rememberNonceFloor(trader, 10n);
-    rememberNonceFloor(trader.toLowerCase(), 5n);
-    expect(knownNonceFloor(trader.toUpperCase().replace("0X", "0x"))).toBe(10n);
+  it("nextNonce throws a clear error instead of returning a nonce beyond the bound", () => {
+    // Device clock more than a day ahead of the chain.
+    expect(() => nextNonce(0n, bound, now + 2 * 86_400_000, 1n)).toThrow(/relógio/);
+    // Minimum pushed beyond the bound's millisecond.
+    expect(() => nextNonce(bound + (1n << 64n), bound, now, 1n)).toThrow(NonceRangeError);
+    // Exactly at the bound is still usable.
+    expect(nextNonce(bound, bound, now, 9n)).toBe(bound | 9n);
+    expect(describeError(new NonceRangeError("mensagem clara"))).toBe("mensagem clara");
+  });
+});
+
+describe("nonce store", () => {
+  const memoryStorage = () => {
+    const data = new Map<string, string>();
+    return { getItem: (k: string) => data.get(k) ?? null, setItem: (k: string, v: string) => void data.set(k, v), data };
+  };
+
+  it("persists the highest signed nonce per account and deployment", () => {
+    const storage = memoryStorage();
+    const store = createNonceStore("421614:0xExchange", storage);
+    expect(store.highestSigned(trader)).toBe(0n);
+    store.recordSigned(trader, 10n);
+    store.recordSigned(trader.toLowerCase(), 5n); // lower: ignored
+    expect(store.highestSigned(trader)).toBe(10n);
+    // A new session (new store, same storage) still knows it; other accounts and deployments do not.
+    expect(createNonceStore("421614:0xExchange", storage).highestSigned(trader.toUpperCase().replace("0X", "0x"))).toBe(10n);
+    expect(createNonceStore("421614:0xExchange", storage).highestSigned(exchange)).toBe(0n);
+    expect(createNonceStore("31337:0xExchange", storage).highestSigned(trader)).toBe(0n);
+  });
+
+  it("works without storage, with broken storage and with garbage in it", () => {
+    const none = createNonceStore("s", undefined);
+    none.recordSigned(trader, 7n);
+    expect(none.highestSigned(trader)).toBe(7n);
+    const broken = createNonceStore("s", {
+      getItem: () => {
+        throw new Error("blocked");
+      },
+      setItem: () => {
+        throw new Error("quota");
+      },
+    });
+    broken.recordSigned(trader, 8n);
+    expect(broken.highestSigned(trader)).toBe(8n);
+    const storage = memoryStorage();
+    storage.data.set(`baldwin.maxnonce:s:${trader.toLowerCase()}`, "not-a-number");
+    expect(createNonceStore("s", storage).highestSigned(trader)).toBe(0n);
+  });
+
+  it("remembers the highest floor per trader", () => {
+    const store = createNonceStore("s", undefined);
+    expect(store.floor(trader)).toBe(0n);
+    store.recordFloor(trader, 10n);
+    store.recordFloor(trader.toLowerCase(), 5n);
+    expect(store.floor(trader)).toBe(10n);
+  });
+});
+
+describe("submitting an order whose outcome may be unknown", () => {
+  const timeout = () => new DOMException("The operation timed out.", "TimeoutError");
+  const noSleep = async () => {};
+
+  it("classifies failures", () => {
+    expect(classifySubmitFailure(new EngineError(400, "x", "INVALID_ORDER"))).toBe("not_accepted");
+    expect(classifySubmitFailure(new EngineError(422, "x", "INSUFFICIENT_MARGIN"))).toBe("not_accepted");
+    expect(classifySubmitFailure(new EngineError(429, "x", "RATE_LIMITED"))).toBe("not_accepted");
+    for (const code of ["SHUTTING_DOWN", "EXCHANGE_PAUSED", "MARKET_HALTED", "RECOVERING"]) {
+      expect(classifySubmitFailure(new EngineError(503, "x", code)), code).toBe("not_accepted");
+    }
+    expect(classifySubmitFailure(new EngineError(503, "x", "STATE_UNKNOWN"))).toBe("unknown");
+    expect(classifySubmitFailure(new EngineError(503, "x", "STORE_UNAVAILABLE"))).toBe("unknown");
+    // An explicit verdict from the engine wins over the code tables.
+    expect(classifySubmitFailure(new EngineError(503, "x", "STORE_UNAVAILABLE", "not_applied"))).toBe("not_accepted");
+    expect(classifySubmitFailure(new EngineError(503, "x", "SHUTTING_DOWN", "unknown"))).toBe("unknown");
+    expect(parseEngineError(503, { error: { code: "STATE_UNKNOWN", message: "m", outcome: "unknown" } }, "").outcome).toBe("unknown");
+    expect(parseEngineError(503, { error: { code: "X", message: "m" } }, "").outcome).toBeUndefined();
+    expect(classifySubmitFailure(new EngineError(503, "x", "SOME_FUTURE_CODE"))).toBe("unknown");
+    expect(classifySubmitFailure(new EngineError(500, "x"))).toBe("unknown");
+    expect(classifySubmitFailure(new EngineError(502, "x"))).toBe("unknown");
+    expect(classifySubmitFailure(timeout())).toBe("unknown");
+    expect(classifySubmitFailure(new TypeError("Failed to fetch"))).toBe("unknown");
+  });
+
+  it("resubmits the identical request after a timeout and a state-unknown 503 until the engine answers", async () => {
+    const answers: (() => string)[] = [
+      () => {
+        throw timeout();
+      },
+      () => {
+        throw new EngineError(503, "x", "STATE_UNKNOWN");
+      },
+      () => "open",
+    ];
+    const sent: number[] = [];
+    const retries: number[] = [];
+    const delays: number[] = [];
+    const outcome = await submitUntilKnown(
+      async () => {
+        sent.push(sent.length);
+        return answers[sent.length - 1]!();
+      },
+      { delays: [10, 20, 30], sleep: async (ms) => void delays.push(ms), onRetry: (n) => retries.push(n) },
+    );
+    expect(outcome).toEqual({ kind: "accepted", value: "open" });
+    expect(sent).toHaveLength(3);
+    expect(retries).toEqual([1, 2]);
+    expect(delays).toEqual([10, 20]); // backoff
+  });
+
+  it("stops at once when the engine definitely refused", async () => {
+    let calls = 0;
+    const refused = new EngineError(503, "x", "SHUTTING_DOWN");
+    const outcome = await submitUntilKnown(
+      async () => {
+        calls++;
+        throw refused;
+      },
+      { sleep: noSleep },
+    );
+    expect(outcome).toEqual({ kind: "not_accepted", error: refused });
+    expect(calls).toBe(1);
+  });
+
+  it("a duplicate answer on a resubmission means the first attempt arrived", async () => {
+    let calls = 0;
+    const outcome = await submitUntilKnown<string>(
+      async () => {
+        if (calls++ === 0) throw timeout();
+        throw new EngineError(409, "x", "DUPLICATE_ORDER");
+      },
+      { sleep: noSleep },
+    );
+    expect(outcome).toEqual({ kind: "accepted", value: undefined });
+    // ... but on the first attempt a duplicate is an ordinary refusal.
+    const first = await submitUntilKnown(
+      async () => {
+        throw new EngineError(409, "x", "DUPLICATE_ORDER");
+      },
+      { sleep: noSleep },
+    );
+    expect(first.kind).toBe("not_accepted");
+  });
+
+  it("gives up as unknown, never as refused, when every attempt is inconclusive", async () => {
+    let calls = 0;
+    const outcome = await submitUntilKnown(
+      async () => {
+        calls++;
+        throw timeout();
+      },
+      { delays: [1, 1], sleep: noSleep },
+    );
+    expect(outcome.kind).toBe("unknown");
+    expect(calls).toBe(3);
   });
 });
 
@@ -125,6 +316,11 @@ describe("error messages", () => {
     expect(engineErrorMessage(503, body("EXCHANGE_PAUSED"), "")).toMatch(/pausada/);
     expect(engineErrorMessage(503, body("MARKET_HALTED"), "")).toMatch(/Mercado suspenso/);
     expect(engineErrorMessage(503, body("CHAIN_UNAVAILABLE"), "")).toMatch(/blockchain/);
+    expect(engineErrorMessage(503, body("SHUTTING_DOWN"), "")).toMatch(/não aceitou a ordem/);
+    expect(engineErrorMessage(503, body("STATE_UNKNOWN"), "")).toMatch(/não se sabe se ela foi aceita/);
+    expect(engineErrorMessage(503, body("STORE_UNAVAILABLE"), "")).toMatch(/falha para gravar/);
+    expect(engineErrorMessage(503, body("RECOVERING"), "")).toMatch(/sincronizando/);
+    expect(engineErrorMessage(422, body("REDUCE_ONLY_EXCEEDS_POSITION"), "")).toMatch(/maior que a posição/);
     expect(engineErrorMessage(422, body("INSUFFICIENT_MARGIN"), "")).toBe("Margem insuficiente para esta ordem.");
     for (const code of [
       "UNKNOWN_MARKET", "MARKET_INACTIVE", "BELOW_MIN_SIZE", "EXPIRED", "DUPLICATE_ORDER", "NONCE_CANCELLED", "NONCE_REUSED",
@@ -143,6 +339,17 @@ describe("error messages", () => {
     expect(describeOrderReason("price outside the oracle price band")).toMatch(/fora da banda/);
     expect(describeOrderReason("IOC order: match failed on-chain, size not re-posted")).toMatch(/IOC/);
     expect(describeOrderReason("something else")).toBe("something else");
+  });
+
+  it("translates the contract's nonce errors and an engine request timeout", () => {
+    const revert = (errorName: string) =>
+      Object.assign(new Error("outer"), {
+        cause: Object.assign(new Error("reverted"), { name: "ContractFunctionRevertedError", shortMessage: "raw", data: { errorName } }),
+      });
+    expect(describeError(revert("NonceTooHigh"))).toMatch(/alto demais/);
+    expect(describeError(revert("NonceNotIncreased"))).toMatch(/maior que o atual/);
+    expect(describeError(revert("SomethingElse"))).toBe("Transação revertida: raw");
+    expect(describeError(new DOMException("The operation timed out.", "TimeoutError"))).toBe("O motor de ordens não respondeu a tempo.");
   });
 
   it("a confirmation timeout says the transaction may still confirm", () => {

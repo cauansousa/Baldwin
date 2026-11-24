@@ -564,6 +564,14 @@ a {
   font-size: 12px;
   overflow-wrap: anywhere;
 }
+.note p {
+  margin: 0 0 6px;
+}
+.note-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
 .note-ok {
   background: var(--green-bg);
   color: #8fe0be;

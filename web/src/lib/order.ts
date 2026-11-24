@@ -1,7 +1,10 @@
 import { CANCEL_TYPES, EIP712_DOMAIN_NAME, EIP712_DOMAIN_VERSION, ORDER_TYPES, type Order } from "@shared";
 
 export const DEFAULT_EXPIRY_SECONDS = 24 * 60 * 60;
-/** The contract rejects orders without an expiry or expiring more than 7 days ahead. */
+/**
+ * Longest expiry the engine accepts at intake (7 days). The contract itself
+ * allows up to maxOrderLifetime() = 30 days; both reject an expiry of 0.
+ */
 export const MAX_EXPIRY_SECONDS = 7 * 24 * 60 * 60;
 
 /**
@@ -28,38 +31,89 @@ export function generateNonce(nowMs: number = Date.now(), random: bigint = rando
   return (BigInt(Math.trunc(nowMs)) << 64n) | (random & UINT64_MASK);
 }
 
-/**
- * Nonce for a new order that the contract will accept: like generateNonce, but
- * never below `minValidNonce` (raised by `cancelAllOrders`; nonces below it are
- * dead). Matters right after a bulk cancel, or if this device's clock is behind.
- */
-export function nextNonce(minValidNonce: bigint, nowMs: number = Date.now(), random: bigint = randomUint64()): bigint {
-  const nonce = generateNonce(nowMs, random);
-  if (nonce >= minValidNonce) return nonce;
-  return (((minValidNonce >> 64n) + 1n) << 64n) | (random & UINT64_MASK);
-}
+const DAY_MS = 86_400_000n;
 
 /**
- * Value for `cancelAllOrders`: strictly above every nonce this app could have
- * produced up to `nowMs` (those are below (nowMs + 1) << 64) and strictly above
- * the current on-chain minimum, which the contract requires.
+ * Highest value the contract accepts in `cancelAllOrders` (it reverts with
+ * NonceTooHigh above it): ((chain time + 1 day) in ms) << 64. Order nonces are
+ * kept within the same range so a later bulk cancel can always cover them.
  */
-export function bulkCancelNonce(currentMinValidNonce: bigint, nowMs: number = Date.now()): bigint {
-  const aboveAllSigned = (BigInt(Math.trunc(nowMs)) + 1n) << 64n;
-  return aboveAllSigned > currentMinValidNonce ? aboveAllSigned : currentMinValidNonce + 1n;
+export function nonceUpperBound(chainTimeSec: bigint): bigint {
+  return (chainTimeSec * 1000n + DAY_MS) << 64n;
 }
 
-// Highest minimum this tab has set on-chain, per trader. Covers the moment
-// between a confirmed bulk cancel and the next successful chain read.
-const localNonceFloor = new Map<string, bigint>();
-
-export function rememberNonceFloor(trader: string, minValidNonce: bigint): void {
-  const key = trader.toLowerCase();
-  if (minValidNonce > (localNonceFloor.get(key) ?? 0n)) localNonceFloor.set(key, minValidNonce);
+/** A usable nonce cannot be produced or cancelled within the contract's bounds; message is user-facing. */
+export class NonceRangeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "NonceRangeError";
+  }
 }
 
-export function knownNonceFloor(trader: string): bigint {
-  return localNonceFloor.get(trader.toLowerCase()) ?? 0n;
+/**
+ * Nonce for a new order: time-based like generateNonce, but never below
+ * `minValidNonce` (raised by `cancelAllOrders`; nonces below it are dead) and
+ * never beyond `upperBound`'s millisecond. Throws NonceRangeError instead of
+ * returning a nonce that would be refused.
+ */
+export function nextNonce(
+  minValidNonce: bigint,
+  upperBound: bigint,
+  nowMs: number = Date.now(),
+  random: bigint = randomUint64(),
+): bigint {
+  const low = random & UINT64_MASK;
+  let nonce = generateNonce(nowMs, low);
+  if (nonce < minValidNonce) {
+    // Clock behind the on-chain minimum (or right after a bulk cancel): move up to it.
+    nonce = ((minValidNonce >> 64n) << 64n) | low;
+    if (nonce < minValidNonce) nonce = (((minValidNonce >> 64n) + 1n) << 64n) | low;
+  }
+  if (nonce >> 64n > upperBound >> 64n) {
+    throw new NonceRangeError(
+      BigInt(Math.trunc(nowMs)) > upperBound >> 64n
+        ? "O relógio deste dispositivo está mais de um dia adiantado em relação à rede. Acerte a data e a hora para enviar ordens."
+        : "O mínimo de nonce desta conta já está no limite aceito pelo contrato. Novas ordens só serão possíveis mais tarde.",
+    );
+  }
+  return nonce;
+}
+
+export interface BulkCancelPlan {
+  /** Argument for `cancelAllOrders`. */
+  value: bigint;
+  /**
+   * False when the contract's bound forced a value that does not exceed every
+   * nonce this client may have signed (device clock far ahead of the chain).
+   */
+  coversAllSigned: boolean;
+}
+
+/**
+ * Value for `cancelAllOrders`. Every nonce below it dies, so it must be
+ * strictly above (a) the current on-chain minimum, which the contract
+ * requires, (b) the highest nonce this client is known to have signed, and
+ * (c) anything it could have signed up to `nowMs`. It is capped at
+ * `upperBound`; if even `currentMin + 1` exceeds the cap nothing can be done
+ * and NonceRangeError is thrown.
+ */
+export function planBulkCancel(p: {
+  currentMinValidNonce: bigint;
+  highestSignedNonce: bigint;
+  upperBound: bigint;
+  nowMs?: number;
+}): BulkCancelPlan {
+  const nowMs = p.nowMs ?? Date.now();
+  let wanted = (BigInt(Math.trunc(nowMs)) + 1n) << 64n;
+  if (p.highestSignedNonce + 1n > wanted) wanted = p.highestSignedNonce + 1n;
+  if (p.currentMinValidNonce + 1n > wanted) wanted = p.currentMinValidNonce + 1n;
+  if (wanted <= p.upperBound) return { value: wanted, coversAllSigned: true };
+  if (p.upperBound <= p.currentMinValidNonce) {
+    throw new NonceRangeError(
+      "O mínimo de nonce desta conta já está no limite aceito pelo contrato; não é possível subi-lo agora. Cancele as ordens uma a uma on-chain.",
+    );
+  }
+  return { value: p.upperBound, coversAllSigned: false };
 }
 
 function randomUint64(): bigint {

@@ -46,6 +46,8 @@ export interface OpenOrder {
 export interface PostOrderRequest {
   order: OrderJson;
   signature: `0x${string}`;
+  /** EIP-712 hash of `order`, computed locally. Not sent to the engine (it derives it); used by the mock. */
+  orderHash?: `0x${string}`;
   /** Engine-side execution flags; not part of the signed order. */
   postOnly?: boolean;
   ioc?: boolean;

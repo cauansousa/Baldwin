@@ -1,11 +1,16 @@
 import { useQuery } from "@tanstack/react-query";
-import { readContract } from "wagmi/actions";
+import { getBlock, readContract } from "wagmi/actions";
 import type { MarketInfo } from "../api/types";
 import { config } from "../config";
 import { CHAIN_POLL_MS, erc20Abi, exchangeAbi, wagmiConfig } from "../wagmi";
 import { queryKeys } from "./useEngine";
 
 const POLL_MS = CHAIN_POLL_MS;
+
+/** Timestamp (unix seconds) of the latest block: the clock the contract uses. */
+export async function readChainTime(): Promise<bigint> {
+  return (await getBlock(wagmiConfig, { chainId: config.chainId, blockTag: "latest" })).timestamp;
+}
 
 export interface MarketParams {
   active: boolean;

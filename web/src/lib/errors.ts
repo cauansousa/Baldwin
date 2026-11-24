@@ -5,6 +5,8 @@ export class EngineError extends Error {
     message: string,
     /** Engine error code, e.g. "INSUFFICIENT_MARGIN", when the body carried one. */
     readonly code?: string,
+    /** The engine's own verdict on whether the request took effect, when the body carries one. */
+    readonly outcome?: "not_applied" | "unknown",
   ) {
     super(message);
     this.name = "EngineError";
@@ -32,6 +34,11 @@ const ENGINE_CODE_MESSAGES: Record<string, string> = {
   REDUCE_ONLY_NO_POSITION: "Ordem somente-redução sem posição para reduzir.",
   INSUFFICIENT_MARGIN: "Margem insuficiente para esta ordem.",
   POST_ONLY_WOULD_CROSS: "Ordem post-only executaria de imediato; ajuste o preço.",
+  SHUTTING_DOWN: "O motor está reiniciando e não aceitou a ordem. Tente de novo em instantes.",
+  STORE_UNAVAILABLE: "O motor está com falha para gravar seu estado e não está aceitando ordens.",
+  STATE_UNKNOWN: "O motor processou a ordem mas não conseguiu gravá-la; não se sabe se ela foi aceita.",
+  RECOVERING: "O motor está se sincronizando com a blockchain após reiniciar e não aceitou a ordem. Tente de novo em instantes.",
+  REDUCE_ONLY_EXCEEDS_POSITION: "Ordem somente-redução maior que a posição (somada às outras ordens de redução abertas).",
   CHAIN_UNAVAILABLE: "O motor não consegue falar com a blockchain no momento. Tente de novo em instantes.",
   RATE_LIMITED: "Muitas requisições. Tente novamente em instantes.",
   NOT_FOUND: "Ordem não encontrada no motor.",
@@ -44,10 +51,25 @@ const CODES_WITH_DETAIL = new Set(["BAD_REQUEST", "INVALID_ORDER"]);
 export interface EngineErrorInfo {
   message: string;
   code?: string;
+  outcome?: "not_applied" | "unknown";
 }
 
 /** Turns an engine error body of unknown shape into a user-facing message (and code, if any). */
 export function parseEngineError(status: number, body: unknown, rawText: string): EngineErrorInfo {
+  const info = describeEngineError(status, body, rawText);
+  const outcome = readOutcome(body);
+  return outcome ? { ...info, outcome } : info;
+}
+
+function readOutcome(body: unknown): "not_applied" | "unknown" | undefined {
+  if (!body || typeof body !== "object") return undefined;
+  const b = body as Record<string, unknown>;
+  const inner = b.error && typeof b.error === "object" ? (b.error as Record<string, unknown>).outcome : undefined;
+  const value = inner ?? b.outcome;
+  return value === "not_applied" || value === "unknown" ? value : undefined;
+}
+
+function describeEngineError(status: number, body: unknown, rawText: string): EngineErrorInfo {
   let detail: string | undefined;
   let code: string | undefined;
   if (body && typeof body === "object") {
@@ -99,7 +121,20 @@ export class TxTimeoutError extends Error {
   }
 }
 
+/** Portuguese text for the contract's custom errors a trader can run into. */
+const CONTRACT_ERROR_MESSAGES: Record<string, string> = {
+  NonceTooHigh: "O contrato recusou o novo mínimo de nonce por estar alto demais (limite: horário da rede + 1 dia).",
+  NonceNotIncreased: "O novo mínimo de nonce precisa ser maior que o atual. Atualize a página e tente de novo.",
+  InsufficientMargin: "Margem insuficiente para esta operação.",
+  NegativeAccountValue: "O valor da conta ficaria negativo.",
+  OnlyReducingAllowed: "A exchange está pausada: só operações que reduzem posição são permitidas.",
+  StalePrice: "O preço do oráculo está desatualizado; tente de novo em instantes.",
+  OrderIsCancelled: "Esta ordem já está cancelada.",
+  OrderExpired: "Esta ordem já expirou.",
+};
+
 interface ErrorLike {
+  data?: unknown;
   name?: unknown;
   code?: unknown;
   message?: unknown;
@@ -127,6 +162,18 @@ export function isUserRejection(err: unknown): boolean {
 export function describeError(err: unknown): string {
   if (isUserRejection(err)) return "Solicitação rejeitada na carteira.";
   if (err instanceof EngineError || err instanceof TxTimeoutError) return err.message;
+  for (const e of causeChain(err)) {
+    // fetch() aborted by AbortSignal.timeout while talking to the engine.
+    if ((e.name === "TimeoutError" || e.name === "AbortError") && typeof DOMException !== "undefined" && e instanceof DOMException) {
+      return "O motor de ordens não respondeu a tempo.";
+    }
+  }
+  for (const e of causeChain(err)) {
+    if (e.name === "NonceRangeError" && typeof e.message === "string") return e.message;
+    const errorName = e.data && typeof e.data === "object" ? (e.data as { errorName?: unknown }).errorName : undefined;
+    const known = typeof errorName === "string" ? CONTRACT_ERROR_MESSAGES[errorName] : undefined;
+    if (known) return known;
+  }
   for (const e of causeChain(err)) {
     if (e.name === "ContractFunctionRevertedError" && typeof e.shortMessage === "string") {
       return `Transação revertida: ${e.shortMessage}`;

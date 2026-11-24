@@ -13,6 +13,8 @@ const erc20Abi = parseAbi(ERC20_ABI);
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const sameAddress = (a?: string, b?: string) => !!a && !!b && a.toLowerCase() === b.toLowerCase();
 const startedAt = Date.now();
+/** The clock of the mock chain simply follows the device clock. */
+const chainTimeSec = () => Math.floor(Date.now() / 1000);
 const blockNumber = () => Math.floor((Date.now() - startedAt) / 1000) + 1;
 
 class RpcError extends Error {
@@ -71,6 +73,12 @@ function callExchange(data: Hex): Hex {
       const { initial, maintenance } = state.marginRequirement();
       return encodeFunctionResult({ abi: exchangeAbi, functionName, result: [initial, maintenance] });
     }
+    case "isCancelled":
+      return encodeFunctionResult({
+        abi: exchangeAbi,
+        functionName,
+        result: args[1] < state.account.minValidNonce || state.account.cancelledNonces.has(args[1]),
+      });
     case "minValidNonce":
       return encodeFunctionResult({ abi: exchangeAbi, functionName, result: state.account.minValidNonce });
     case "maxOrderLifetime":
@@ -127,7 +135,8 @@ function sendTransaction(to: string | undefined, data: Hex) {
       a.cancelledNonces.add(call.args[0]);
       state.dropDeadOrders();
     } else if (call.functionName === "cancelAllOrders") {
-      if (call.args[0] <= a.minValidNonce) throw new RpcError(3, "execution reverted: nonce not increasing");
+      if (call.args[0] <= a.minValidNonce) throw new RpcError(3, "execution reverted: NonceNotIncreased()");
+      if (call.args[0] > (BigInt(chainTimeSec() + 86_400) * 1000n) << 64n) throw new RpcError(3, "execution reverted: NonceTooHigh()");
       a.minValidNonce = call.args[0];
       state.dropDeadOrders();
     } else throw new RpcError(-32601, `mock: exchange.${call.functionName} not implemented`);
@@ -159,6 +168,24 @@ async function request({ method, params }: { method: string; params?: unknown })
       return null;
     case "eth_blockNumber":
       return numberToHex(blockNumber());
+    case "eth_getBlockByNumber":
+      return {
+        number: numberToHex(blockNumber()),
+        hash: zeroHash,
+        parentHash: zeroHash,
+        timestamp: numberToHex(chainTimeSec()),
+        nonce: "0x0000000000000000",
+        difficulty: "0x0",
+        gasLimit: "0x1c9c380",
+        gasUsed: "0x0",
+        baseFeePerGas: "0x3b9aca00",
+        miner: state.MOCK_ACCOUNT,
+        extraData: "0x",
+        logsBloom: `0x${"0".repeat(512)}`,
+        size: "0x0",
+        transactions: [],
+        uncles: [],
+      };
     case "eth_getBalance":
       return numberToHex(10n ** 19n);
     case "eth_gasPrice":
