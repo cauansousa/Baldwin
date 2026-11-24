@@ -21,7 +21,8 @@ export function useEngineHealth() {
 }
 
 export function useMarkets() {
-  return useQuery({ queryKey: queryKeys.markets, queryFn: () => engine.getMarkets(), refetchInterval: 30_000 });
+  // Polled often: the entries also carry prices and funding figures mirrored from the contract.
+  return useQuery({ queryKey: queryKeys.markets, queryFn: () => engine.getMarkets(), refetchInterval: 5000 });
 }
 
 /**

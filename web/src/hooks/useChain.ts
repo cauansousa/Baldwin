@@ -1,9 +1,10 @@
 import { useQuery } from "@tanstack/react-query";
-import { parseAbi } from "viem";
+import { useMemo, useRef } from "react";
 import { getBlock, readContract } from "wagmi/actions";
 import type { MarketInfo } from "../api/types";
 import { config } from "../config";
 import { CHAIN_POLL_MS, erc20Abi, exchangeAbi, wagmiConfig } from "../wagmi";
+import { mergeMarketFigures, missingReads, type ChainMarketReads, type MarketFigures, type MarketRead } from "../lib/marketData";
 import { queryKeys } from "./useEngine";
 
 const POLL_MS = CHAIN_POLL_MS;
@@ -22,19 +23,17 @@ export interface MarketParams {
   minOrderSize: bigint;
 }
 
-export interface ChainMarket {
+/** Per-market data for the UI: engine-mirrored figures where present, contract reads otherwise. */
+export interface ChainMarket extends MarketFigures {
   params?: MarketParams;
-  indexPrice?: bigint; // WAD; undefined when the oracle read fails (e.g. stale)
-  markPrice?: bigint; // WAD, last fill; undefined before the first fill
-  /** Time-weighted average fill price of the current funding period (the index if it did not trade), WAD. */
-  markTwap?: bigint;
-  /** Rate the current period would apply if accrued now: WAD per hour, positive = longs pay shorts. */
-  fundingRate?: bigint;
-  /** Unix seconds of the last funding accrual. */
-  lastFundingTime?: bigint;
   /** Cumulative funding index, USD-WAD per unit of base. */
   cumulativeFunding?: bigint;
-  openInterest?: { longs: bigint; shorts: bigint }; // base, WAD
+}
+
+/** What one poll reads from the contract for a market. */
+interface MarketChainData extends ChainMarketReads {
+  params?: MarketParams;
+  cumulativeFunding?: bigint;
 }
 
 export interface ChainPosition {
@@ -75,43 +74,79 @@ async function readAll<T extends readonly Promise<unknown>[]>(
 
 const chainId = config.chainId;
 
-async function fetchMarket(exchange: `0x${string}`, marketId: number): Promise<ChainMarket> {
+// Market parameters change only through governance; re-read them once a minute.
+const PARAMS_TTL_MS = 60_000;
+const paramsCache = new Map<string, { at: number; params: MarketParams }>();
+
+async function readParams(exchange: `0x${string}`, marketId: number): Promise<MarketParams> {
+  const key = `${exchange}:${marketId}`;
+  const cached = paramsCache.get(key);
+  if (cached && Date.now() - cached.at < PARAMS_TTL_MS) return cached.params;
+  const params = await readContract(wagmiConfig, { abi: exchangeAbi, address: exchange, chainId, functionName: "getMarket", args: [marketId] });
+  paramsCache.set(key, { at: Date.now(), params });
+  return params;
+}
+
+/** Reads from the contract only the views in `reads` (those the engine did not supply), plus params and the funding index. */
+async function fetchMarket(exchange: `0x${string}`, marketId: number, reads: readonly MarketRead[]): Promise<MarketChainData> {
   const base = { abi: exchangeAbi, address: exchange, chainId, args: [marketId] } as const;
-  const [params, indexPrice, markPrice, markTwap, fundingRate, lastFundingTime, cumulativeFunding, openInterest] = await readAll([
-    readContract(wagmiConfig, { ...base, functionName: "getMarket" }),
-    readContract(wagmiConfig, { ...base, functionName: "indexPrice" }),
-    readContract(wagmiConfig, { ...base, functionName: "markPrice" }),
-    readContract(wagmiConfig, { ...base, functionName: "markTwap" }),
-    readContract(wagmiConfig, { ...base, functionName: "currentFundingRate" }),
-    readContract(wagmiConfig, { ...base, functionName: "lastFundingTime" }),
+  const want = (r: MarketRead) => reads.includes(r);
+  const skip = Promise.resolve(undefined);
+  const [params, cumulativeFunding, indexPrice, markPrice, markTwap, fundingRate, lastFundingTime, openInterest] = await readAll([
+    readParams(exchange, marketId),
     readContract(wagmiConfig, { ...base, functionName: "cumulativeFunding" }),
-    readContract(wagmiConfig, { ...base, functionName: "openInterest" }),
+    want("indexPrice") ? readContract(wagmiConfig, { ...base, functionName: "indexPrice" }) : skip,
+    want("markPrice") ? readContract(wagmiConfig, { ...base, functionName: "markPrice" }) : skip,
+    want("markTwap") ? readContract(wagmiConfig, { ...base, functionName: "markTwap" }) : skip,
+    want("currentFundingRate") ? readContract(wagmiConfig, { ...base, functionName: "currentFundingRate" }) : skip,
+    want("lastFundingTime") ? readContract(wagmiConfig, { ...base, functionName: "lastFundingTime" }) : skip,
+    want("openInterest") ? readContract(wagmiConfig, { ...base, functionName: "openInterest" }) : skip,
   ] as const);
   return {
     params,
-    indexPrice: indexPrice && indexPrice > 0n ? indexPrice : undefined,
-    markPrice: markPrice && markPrice > 0n ? markPrice : undefined,
-    markTwap: markTwap && markTwap > 0n ? markTwap : undefined,
-    fundingRate,
-    lastFundingTime: lastFundingTime && lastFundingTime > 0n ? lastFundingTime : undefined,
     cumulativeFunding,
+    indexPrice,
+    markPrice,
+    markTwap,
+    fundingRate,
+    lastFundingTime,
     openInterest: openInterest ? { longs: openInterest[0], shorts: openInterest[1] } : undefined,
   };
 }
 
-/** On-chain parameters and prices for every market, keyed by marketId. */
+/**
+ * Parameters, prices, funding and open interest of every market, keyed by
+ * marketId. Figures the engine already mirrors on GET /markets are taken from
+ * there; the contract is read only for what is missing (and always for the
+ * parameters and the funding index).
+ */
 export function useChainMarkets(markets: MarketInfo[]) {
   const ids = markets.map((m) => m.marketId);
   const exchange = config.exchange;
-  return useQuery({
+  // The query function must see the latest engine data without it being part of the key.
+  const latest = useRef(markets);
+  latest.current = markets;
+  const query = useQuery({
     queryKey: [...queryKeys.chain, "markets", exchange, ids],
     enabled: !!exchange && ids.length > 0,
     refetchInterval: POLL_MS,
     queryFn: async () => {
-      const entries = await readAll(ids.map((id) => fetchMarket(exchange!, id)));
-      return new Map(ids.map((id, i) => [id, entries[i] ?? {}] as const));
+      const entries = await readAll(
+        latest.current.map((m) => fetchMarket(exchange!, m.marketId, missingReads(m.stats))),
+      );
+      return new Map(latest.current.map((m, i) => [m.marketId, entries[i] ?? {}] as const));
     },
   });
+  const data = useMemo(() => {
+    if (!query.data && markets.every((m) => !m.stats || Object.keys(m.stats).length === 0)) return undefined;
+    return new Map<number, ChainMarket>(
+      markets.map((m) => {
+        const chain = query.data?.get(m.marketId);
+        return [m.marketId, { ...mergeMarketFigures(m.stats, chain), params: chain?.params, cumulativeFunding: chain?.cumulativeFunding }];
+      }),
+    );
+  }, [markets, query.data]);
+  return { data, isLoading: query.isLoading, isError: query.isError, error: query.error, isFetching: query.isFetching, refetch: query.refetch };
 }
 
 export interface ExchangeStatus {
@@ -124,24 +159,28 @@ export interface ExchangeStatus {
   oracle?: `0x${string}`;
 }
 
-// `oracle` is a public variable of Exchange.sol that the shared ABI does not list.
-const oracleGetterAbi = parseAbi(["function oracle() view returns (address)"]);
 
-/** Exchange-wide flags: pause state and the fill-price band around the index. */
-export function useExchangeStatus() {
+/**
+ * Exchange-wide state: pause flag, fill-price band, oracle address and, unless
+ * the engine already reports them (`engineHasFigures`), insurance fund and bad debt.
+ */
+export function useExchangeStatus(engineHasFigures: boolean) {
   const exchange = config.exchange;
+  const skipFigures = useRef(engineHasFigures);
+  skipFigures.current = engineHasFigures;
   return useQuery({
     queryKey: [...queryKeys.chain, "status", exchange],
     enabled: !!exchange,
     refetchInterval: Math.max(10_000, POLL_MS),
     queryFn: async (): Promise<ExchangeStatus> => {
       const ex = { abi: exchangeAbi, address: exchange!, chainId } as const;
-      const [paused, maxPriceDeviationBps, insuranceFund, totalBadDebt, oracle] = await readAll([
+      const skip = Promise.resolve(undefined);
+      const [paused, maxPriceDeviationBps, oracle, insuranceFund, totalBadDebt] = await readAll([
         readContract(wagmiConfig, { ...ex, functionName: "paused" }),
         readContract(wagmiConfig, { ...ex, functionName: "maxPriceDeviationBps" }),
-        readContract(wagmiConfig, { ...ex, functionName: "insuranceFund" }),
-        readContract(wagmiConfig, { ...ex, functionName: "totalBadDebt" }),
-        readContract(wagmiConfig, { abi: oracleGetterAbi, address: exchange!, chainId, functionName: "oracle" }),
+        readContract(wagmiConfig, { ...ex, functionName: "oracle" }),
+        skipFigures.current ? skip : readContract(wagmiConfig, { ...ex, functionName: "insuranceFund" }),
+        skipFigures.current ? skip : readContract(wagmiConfig, { ...ex, functionName: "totalBadDebt" }),
       ] as const);
       return { paused, maxPriceDeviationBps, insuranceFund, totalBadDebt, oracle: oracle ?? config.oracle };
     },

@@ -34,13 +34,15 @@ function requireMarket(marketId: number) {
   return m;
 }
 
-// keccak256("oracle()")[:4] — the public getter the app reads outside the shared ABI.
-const ORACLE_SELECTOR = "0x7dc0d1d0";
 const MOCK_ORACLE = "0x00000000000000000000000000000000ba1d0003";
 
+/** Contract views called so far, by name: shows how many RPC reads a page load costs. */
+export const callCounts: Record<string, number> = {};
+(globalThis as { __mockCallCounts?: Record<string, number> }).__mockCallCounts = callCounts;
+
 function callExchange(data: Hex): Hex {
-  if (data.toLowerCase() === ORACLE_SELECTOR) return `0x${MOCK_ORACLE.slice(2).padStart(64, "0")}`;
   const { functionName, args } = decodeFunctionData({ abi: exchangeAbi, data });
+  callCounts[functionName] = (callCounts[functionName] ?? 0) + 1;
   switch (functionName) {
     case "getMarket": {
       const m = requireMarket(args[0]);
@@ -81,6 +83,8 @@ function callExchange(data: Hex): Hex {
       const oi = BigInt(Math.round(requireMarket(args[0]).openInterest * 1000)) * 10n ** 15n;
       return encodeFunctionResult({ abi: exchangeAbi, functionName, result: [oi, oi] });
     }
+    case "oracle":
+      return encodeFunctionResult({ abi: exchangeAbi, functionName, result: MOCK_ORACLE });
     case "insuranceFund":
       return encodeFunctionResult({ abi: exchangeAbi, functionName, result: state.protocol.insuranceFund });
     case "totalBadDebt":

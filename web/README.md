@@ -72,7 +72,8 @@ book, trades, open orders) and a fake EIP-1193 provider that answers contract re
 approve/deposit/withdraw/mint/cancel instantly and returns dummy signatures. Engine failures can be
 injected from the URL: `?mockSubmit=timeout,unknown` (order registered, answer lost, then idempotent
 success), `?mockSubmit=lost`, `?mockSubmit=refused`, `?mockCancel=fail`, `?mockCancel=notfound`;
-`?mockBadDebt=1` shows the bad-debt warning. It exists to develop
+`?mockBadDebt=1` shows the bad-debt warning; `?mockEngineStats=0` makes the mock engine report no
+mirrored figures, so everything is read from the mock chain. It exists to develop
 and screenshot the UI without a backend. It only works under the dev server and is not included in
 production bundles. `VITE_MOCK=1 VITE_CHAIN_ID=421614 npx vite` shows the testnet variant of the UI.
 
@@ -90,19 +91,22 @@ Protocol constants, ABIs and EIP-712 types come from `../shared/src/index.ts` (a
 
 ## Notes
 
-- Market parameters, prices, funding, open interest, balances, positions and protocol figures are
-  read from the contract; the engine supplies the market list, book, trades and open orders (and,
-  as a fallback while a contract read is missing, the insurance fund / bad debt it reports on
-  `/health`).
+- Data sources: the engine supplies the market list, book, trades and open orders. `GET /markets`
+  also mirrors contract figures (index price, mark TWAP, funding rate, last/next funding time, open
+  interest, last fill) and `GET /health` the insurance fund and bad debt; these are used when
+  present, and each one that is `null` or missing is read from the contract instead, so a page
+  load needs few RPC calls. Market parameters (re-read once a minute), the funding index, pause
+  state, the price band, the oracle address, balances and positions always come from the contract.
 - Funding: the market bar shows the hourly rate the current period would apply
-  (`currentFundingRate`, positive = longs pay shorts), the countdown to `lastFundingTime` + 1 h,
+  (`currentFundingRate`, positive = longs pay shorts; a market with no fills in the current period
+  pays none), the countdown to the engine's `nextFundingTime` (or `lastFundingTime` + 1 h from the
+  contract),
   the last fill and the period's mark TWAP. "Funding pendente" in the account panel is exact for
   what is already in the cumulative index (`size × (cumulativeFunding − snapshot)`); "Próx.
   funding" per position is an estimate (`notional at index × rate`). There is no funding or
   realized-PnL history: it is not available without an indexer and nothing is made up.
 - "Estado do protocolo": insurance fund, recorded bad debt (shown with a warning only when
-  non-zero), pause state and the exchange / oracle / USDC addresses. The oracle address is read
-  through the contract's public `oracle()` getter, which the shared ABI does not list.
+  non-zero), pause state and the exchange / oracle / USDC addresses.
 - A 4xx answer without `outcome` (e.g. from a proxy in front of the engine) is treated as "not
   accepted": the request was refused before reaching the matching logic. Only 5xx, timeouts and
   network errors without `outcome` count as "unknown".

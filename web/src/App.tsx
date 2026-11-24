@@ -46,21 +46,22 @@ export function App() {
 
   const chainMarkets = useChainMarkets(markets);
   const account = useChainAccount(address, markets);
-  const exchangeStatus = useExchangeStatus();
   const health = useEngineHealth();
+  const engineHasFigures = health.data?.insuranceFund !== undefined && health.data.totalBadDebt !== undefined;
+  const exchangeStatus = useExchangeStatus(engineHasFigures);
   const engineMarket = market ? health.data?.markets.find((m) => m.marketId === market.marketId) : undefined;
   // The contract is the authority; the engine's view is the fallback while the chain read is unavailable.
   const paused = exchangeStatus.data?.paused ?? health.data?.paused ?? false;
   // While recovering the engine has not read prices yet; that is not a halted market.
   const halted = engineMarket !== undefined && engineMarket.indexPrice === null && !health.data?.recovering;
 
-  // Contract reads first; the engine's last view of the same figures fills in while a read is missing.
+  // The engine mirrors these two figures; the contract is read only when it does not.
   const protocolStatus =
     exchangeStatus.data || health.data
       ? {
           ...exchangeStatus.data,
-          insuranceFund: exchangeStatus.data?.insuranceFund ?? health.data?.insuranceFund,
-          totalBadDebt: exchangeStatus.data?.totalBadDebt ?? health.data?.totalBadDebt,
+          insuranceFund: health.data?.insuranceFund ?? exchangeStatus.data?.insuranceFund,
+          totalBadDebt: health.data?.totalBadDebt ?? exchangeStatus.data?.totalBadDebt,
         }
       : undefined;
 

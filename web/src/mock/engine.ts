@@ -1,6 +1,6 @@
 import type { EngineApi, OrderBook } from "../api/types";
 import { EngineError } from "../lib/errors";
-import { account, buildBook, getMarket, makeTrade, markets, newOrderHash, openOrders } from "./state";
+import { account, buildBook, fundingRate, getMarket, indexPrice, lastFundingTime, markPrice, protocol, makeTrade, markets, newOrderHash, openOrders } from "./state";
 
 /**
  * Failure injection for POST /orders, from the page URL, consumed one per call:
@@ -27,10 +27,29 @@ function requireMarket(marketId: number) {
 /** Fake engine: same interface as the HTTP client, backed by mock/state.ts. */
 export const mockEngine: EngineApi = {
   async getHealth() {
-    return { ok: true, recovering: false, stalled: false, paused: false, markets: [] }; // figures come from the mock chain
+    const figures = params.get("mockEngineStats") === "0" ? {} : { insuranceFund: protocol.insuranceFund, totalBadDebt: protocol.totalBadDebt };
+    return { ok: true, recovering: false, stalled: false, paused: false, markets: [], ...figures };
   },
   async getMarkets() {
-    return markets.map(({ marketId, symbol }) => ({ marketId, symbol }));
+    // ?mockEngineStats=0: the engine reports no figures, so everything is read from the (mock) chain.
+    if (params.get("mockEngineStats") === "0") return markets.map(({ marketId, symbol }) => ({ marketId, symbol, stats: {} }));
+    return markets.map((m) => {
+      const openInterest = BigInt(Math.round(m.openInterest * 1000)) * 10n ** 15n;
+      return {
+        marketId: m.marketId,
+        symbol: m.symbol,
+        stats: {
+          indexPrice: indexPrice(m),
+          lastPrice: markPrice(m),
+          markTwap: (indexPrice(m) + markPrice(m)) / 2n,
+          currentFundingRate: fundingRate(m),
+          lastFundingTime: lastFundingTime(),
+          nextFundingTime: lastFundingTime() + 3600n,
+          openInterestLong: openInterest,
+          openInterestShort: openInterest,
+        },
+      };
+    });
   },
   async getOrderBook(marketId, depth): Promise<OrderBook> {
     return buildBook(requireMarket(marketId), depth);

@@ -1,7 +1,7 @@
 import type { MarketInfo } from "../api/types";
 import type { ChainMarket } from "../hooks/useChain";
 import { useNowSeconds } from "../hooks/useNow";
-import { formatCountdown, formatFundingRate, fundingDirection, nextFundingTime } from "../lib/funding";
+import { formatCountdown, formatFundingRate, fundingDirection } from "../lib/funding";
 import { formatPrice, formatSize } from "../lib/units";
 
 interface Props {
@@ -38,7 +38,7 @@ export function MarketBar({ markets, market, onSelectMarket, chainMarket: cm, lo
   const price = (v: bigint | undefined) => (v !== undefined ? formatPrice(v) : blank);
 
   const rate = cm?.fundingRate;
-  const countdown = cm?.lastFundingTime !== undefined ? formatCountdown(nextFundingTime(cm.lastFundingTime), now) : undefined;
+  const countdown = cm?.nextFundingTime !== undefined ? formatCountdown(cm.nextFundingTime, now) : undefined;
   const oi = cm?.openInterest;
 
   return (
@@ -68,7 +68,7 @@ export function MarketBar({ markets, market, onSelectMarket, chainMarket: cm, lo
         </Stat>
         <Stat
           label="Funding (por hora)"
-          title="Taxa que o período atual aplicaria se fosse apurado agora. Positiva: comprados pagam vendidos."
+          title="Taxa que o período atual aplicaria se fosse apurado agora. Positiva: comprados pagam vendidos. Um mercado sem negócios no período atual não paga funding."
           hint={rate !== undefined ? DIRECTION_TEXT[fundingDirection(rate)] : undefined}
         >
           {rate !== undefined ? formatFundingRate(rate) : blank}

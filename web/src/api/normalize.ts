@@ -1,6 +1,7 @@
 // Tolerant decoding of engine JSON into the UI types. All bigints arrive as
 // decimal strings (docs/SPEC.md).
 
+import type { EngineMarketStats } from "../lib/marketData";
 import { bigintFromJson } from "../lib/units";
 import type { BookLevel, CancelResult, EngineHealth, MarketInfo, OpenOrder, OrderBook, PostOrderResult, Trade } from "./types";
 
@@ -47,12 +48,34 @@ export function normalizeHealth(value: unknown): EngineHealth {
   };
 }
 
+const STAT_FIELDS = [
+  "indexPrice",
+  "lastPrice",
+  "markTwap",
+  "currentFundingRate",
+  "lastFundingTime",
+  "nextFundingTime",
+  "openInterestLong",
+  "openInterestShort",
+] as const;
+
+/** Reads the figures the engine mirrors from the contract; null, missing or malformed fields are left out. */
+function normalizeMarketStats(m: Json): EngineMarketStats {
+  const stats: EngineMarketStats = {};
+  for (const field of STAT_FIELDS) {
+    const value = optionalBigint(m[field]);
+    if (value !== undefined) stats[field] = value;
+  }
+  return stats;
+}
+
 export function normalizeMarkets(value: unknown): MarketInfo[] {
   return unwrapList(value, ["markets", "data"])
     .filter(isObject)
     .map((m) => ({
       marketId: Number(m.marketId ?? m.id),
       symbol: String(m.symbol ?? `#${String(m.marketId ?? m.id)}`),
+      stats: normalizeMarketStats(m),
     }))
     .filter((m) => Number.isInteger(m.marketId) && m.marketId >= 0)
     .sort((a, b) => a.marketId - b.marketId);

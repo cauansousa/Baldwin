@@ -3,11 +3,14 @@
 // spellings and maps them onto these types.
 
 import type { Order } from "@shared";
+import type { EngineMarketStats } from "../lib/marketData";
 import type { OrderJson } from "../lib/order";
 
 export interface MarketInfo {
   marketId: number;
   symbol: string;
+  /** Contract figures mirrored by the engine (refreshed every ~10 s); absent fields are read from the chain. */
+  stats?: EngineMarketStats;
 }
 
 export interface BookLevel {

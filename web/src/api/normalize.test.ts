@@ -122,10 +122,40 @@ describe("engine payload normalization", () => {
     expect(normalizeCancelResult({ orderHash: "0x1", status: "cancelled", remaining: "0" })).toEqual({ status: "cancelled", known: true });
   });
 
-  it("normalizes markets", () => {
-    expect(normalizeMarkets([{ marketId: 1, symbol: "ETH-USD" }, { marketId: 0, symbol: "BTC-USD", indexPrice: "1" }])).toEqual([
-      { marketId: 0, symbol: "BTC-USD" },
-      { marketId: 1, symbol: "ETH-USD" },
+it("normalizes markets and the contract figures the engine mirrors", () => {
+    const markets = normalizeMarkets([
+      { marketId: 1, symbol: "ETH-USD", indexPrice: null, markTwap: null, currentFundingRate: null, lastPrice: null },
+      {
+        marketId: 0,
+        symbol: "BTC-USD",
+        indexPrice: "100",
+        markTwap: "101",
+        currentFundingRate: "-5",
+        lastFundingTime: "1800000000",
+        nextFundingTime: "1800003600",
+        openInterestLong: "7",
+        openInterestShort: "7",
+        lastPrice: "102",
+        bestBid: "99",
+        initialMarginBps: 1000,
+      },
     ]);
+    expect(markets.map((m) => [m.marketId, m.symbol])).toEqual([
+      [0, "BTC-USD"],
+      [1, "ETH-USD"],
+    ]);
+    expect(markets[0]?.stats).toEqual({
+      indexPrice: 100n,
+      markTwap: 101n,
+      currentFundingRate: -5n,
+      lastFundingTime: 1_800_000_000n,
+      nextFundingTime: 1_800_003_600n,
+      openInterestLong: 7n,
+      openInterestShort: 7n,
+      lastPrice: 102n,
+    });
+    // null (view unreadable / index unavailable) means "not reported": the chain is read instead.
+    expect(markets[1]?.stats).toEqual({});
+    expect(normalizeMarkets([{ marketId: 2, symbol: "X", indexPrice: "garbage" }])[0]?.stats).toEqual({});
   });
 });
