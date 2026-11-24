@@ -79,10 +79,12 @@ contract Exchange is IExchange, Ownable2Step, ReentrancyGuard, EIP712 {
     ///      expensive cases found, with both accounts holding a position in every market,
     ///      cold storage, pending funding to settle and a funding accrual due in every
     ///      market:
-    ///        - both sides flip:   380k gas with 2 markets, 787k with 8 (~68k per market);
-    ///        - both sides reduce: 421k gas with 2 markets, 951k with 8 (~88k per market;
-    ///          a reducing side is valued twice).
-    ///      The floor is 800k for 2 markets (1.9x the measurement), 2.0M for 8 (2.1x) and
+    ///        - both sides flip:   up to 405k gas with 2 markets, 808k with 8;
+    ///        - both sides reduce: up to 446k gas with 2 markets, 971k with 8 (~88k per
+    ///          market; a reducing side is valued twice).
+    ///      (Figures include the mark TWAP bookkeeping; the 2-market maximum is with no
+    ///      fill in the period being closed, the 8-market one with a fill in every market.)
+    ///      The floor is 800k for 2 markets (1.8x the measurement), 2.0M for 8 (2.1x) and
     ///      3.6M at MAX_MARKETS. The headroom is for real Chainlink feeds, which sit
     ///      behind a proxy and cost more per read than the mock aggregators, and for the
     ///      1/64 of gas withheld from the inner call. Re-measure on a fork before mainnet.

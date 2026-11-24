@@ -272,6 +272,115 @@ describe("scripts/deploy-testnet.ts", () => {
     expect(await exchange.balanceOf(user.address)).to.equal(usdc(1_000));
   });
 
+  it("with TIMELOCK_DELAY_SECONDS: ownership goes to a timelock that the multisig drives", async () => {
+    const { env, deployer, multisig, operator, user } = await loadFixture(externals);
+    const DELAY = 172_800; // 2 days
+    const nonce = await ethers.provider.getTransactionCount(deployer.address);
+    const lines: string[] = [];
+    const result = await deployTestnet(loadConfig({ ...env, TIMELOCK_DELAY_SECONDS: String(DELAY) }), (l) => lines.push(l));
+    const output = lines.join("\n");
+    const { exchange, oracle } = result;
+    const exchangeAddress = await exchange.getAddress();
+    const oracleAddress = await oracle.getAddress();
+
+    // the timelock: third contract, recorded as the optional extra field
+    expect(result.timelock).to.equal(ethers.getCreateAddress({ from: deployer.address, nonce: nonce + 2 }));
+    const written = JSON.parse(fs.readFileSync(result.file, "utf8"));
+    expect(written.timelock).to.equal(result.timelock);
+    expect(Object.keys(written).slice(0, 5)).to.deep.equal(["chainId", "exchange", "usdc", "oracle", "markets"]);
+    const timelock = await ethers.getContractAt("TimelockController", result.timelock!);
+    expect(await timelock.getMinDelay()).to.equal(DELAY);
+    const PROPOSER = await timelock.PROPOSER_ROLE();
+    const EXECUTOR = await timelock.EXECUTOR_ROLE();
+    const CANCELLER = await timelock.CANCELLER_ROLE();
+    const ADMIN = await timelock.DEFAULT_ADMIN_ROLE();
+    expect(await timelock.hasRole(PROPOSER, multisig.address)).to.equal(true);
+    expect(await timelock.hasRole(EXECUTOR, multisig.address)).to.equal(true);
+    expect(await timelock.hasRole(CANCELLER, multisig.address)).to.equal(true);
+    // nobody else has a role; the timelock administers itself only
+    for (const who of [deployer.address, ethers.ZeroAddress, operator.address]) {
+      for (const role of [PROPOSER, EXECUTOR, CANCELLER, ADMIN]) expect(await timelock.hasRole(role, who)).to.equal(false);
+    }
+    expect(await timelock.hasRole(ADMIN, multisig.address)).to.equal(false);
+    expect(await timelock.hasRole(ADMIN, result.timelock!)).to.equal(true);
+
+    // state right after the script: transfer started towards the TIMELOCK, guardian = multisig
+    for (const c of [exchange, oracle]) {
+      expect(await c.owner()).to.equal(deployer.address);
+      expect(await c.pendingOwner()).to.equal(result.timelock);
+    }
+    expect(await exchange.guardian()).to.equal(multisig.address);
+    expect(output).to.contain("OWNERSHIP IS NOT TRANSFERRED YET");
+    expect(output).to.contain("NOTHING");
+    const accept = exchange.interface.encodeFunctionData("acceptOwnership");
+    expect(output).to.contain(`schedule(target=${exchangeAddress}, value=0, data=${accept}, predecessor=${ethers.ZeroHash}, salt=${ethers.ZeroHash}, delay=${DELAY})`);
+    expect(output).to.contain(`schedule(target=${oracleAddress}, value=0, data=${accept}, predecessor=${ethers.ZeroHash}, salt=${ethers.ZeroHash}, delay=${DELAY})`);
+    expect(output).to.contain(`execute(target=${exchangeAddress}, value=0, payload=${accept}, predecessor=${ethers.ZeroHash}, salt=${ethers.ZeroHash})`);
+    expect(output).to.contain(`execute(target=${oracleAddress}, value=0, payload=${accept}, predecessor=${ethers.ZeroHash}, salt=${ethers.ZeroHash})`);
+    expect(output).to.contain(`--constructor-args <that file> ${result.timelock}`);
+
+    // the multisig cannot accept directly, and is not the owner
+    await expect(exchange.connect(multisig).acceptOwnership()).to.be.revertedWithCustomError(exchange, "OwnableUnauthorizedAccount");
+    await expect(exchange.connect(multisig).setOperator(user.address, true)).to.be.revertedWithCustomError(exchange, "OwnableUnauthorizedAccount");
+    // but as guardian it can pause at once (only pause)
+    await exchange.connect(multisig).setPaused(true);
+    await expect(exchange.connect(multisig).setPaused(false)).to.be.revertedWithCustomError(exchange, "OwnableUnauthorizedAccount");
+
+    // the printed calls, exactly: schedule both, wait, execute both
+    const tl = timelock.connect(multisig);
+    await expect(timelock.connect(user).schedule(exchangeAddress, 0, accept, ethers.ZeroHash, ethers.ZeroHash, DELAY)).to.be.revertedWithCustomError(timelock, "AccessControlUnauthorizedAccount");
+    await expect(tl.schedule(exchangeAddress, 0, accept, ethers.ZeroHash, ethers.ZeroHash, DELAY - 1)).to.be.revertedWithCustomError(timelock, "TimelockInsufficientDelay");
+    await tl.schedule(exchangeAddress, 0, accept, ethers.ZeroHash, ethers.ZeroHash, DELAY);
+    await tl.schedule(oracleAddress, 0, accept, ethers.ZeroHash, ethers.ZeroHash, DELAY);
+    await expect(tl.execute(exchangeAddress, 0, accept, ethers.ZeroHash, ethers.ZeroHash)).to.be.revertedWithCustomError(timelock, "TimelockUnexpectedOperationState");
+    await time.increase(DELAY + 1);
+    await tl.execute(exchangeAddress, 0, accept, ethers.ZeroHash, ethers.ZeroHash);
+    await tl.execute(oracleAddress, 0, accept, ethers.ZeroHash, ethers.ZeroHash);
+    for (const c of [exchange, oracle]) {
+      expect(await c.owner()).to.equal(result.timelock);
+      expect(await c.pendingOwner()).to.equal(ethers.ZeroAddress);
+    }
+    // the deployer key is out
+    await expect(exchange.setOperator(user.address, true)).to.be.revertedWithCustomError(exchange, "OwnableUnauthorizedAccount");
+    await expect(oracle.setSequencerUptimeFeed(ethers.ZeroAddress, 0)).to.be.revertedWithCustomError(oracle, "OwnableUnauthorizedAccount");
+
+    // owner actions now go through the timelock: unpause, and add an operator
+    const unpause = exchange.interface.encodeFunctionData("setPaused", [false]);
+    const addOperator = exchange.interface.encodeFunctionData("setOperator", [user.address, true]);
+    await tl.scheduleBatch([exchangeAddress, exchangeAddress], [0, 0], [unpause, addOperator], ethers.ZeroHash, ethers.ZeroHash, DELAY);
+    await time.increase(DELAY + 1);
+    expect(await exchange.paused()).to.equal(true);
+    await tl.executeBatch([exchangeAddress, exchangeAddress], [0, 0], [unpause, addOperator], ethers.ZeroHash, ethers.ZeroHash);
+    expect(await exchange.paused()).to.equal(false);
+    expect(await exchange.isOperator(user.address)).to.equal(true);
+    // and an oracle owner action
+    const longer = oracle.interface.encodeFunctionData("setFeed", [0, env.BTC_USD_FEED!, 7200]);
+    await tl.schedule(oracleAddress, 0, longer, ethers.ZeroHash, ethers.ZeroHash, DELAY);
+    await time.increase(DELAY + 1);
+    await tl.execute(oracleAddress, 0, longer, ethers.ZeroHash, ethers.ZeroHash);
+    expect((await oracle.feedOf(0))[2]).to.equal(7200);
+  });
+
+  it("guardian options", async () => {
+    const { env, multisig, operator, user } = await loadFixture(externals);
+    // no timelock, no GUARDIAN_ADDRESS: no guardian
+    let result = await run(env);
+    expect(await result.exchange.guardian()).to.equal(ethers.ZeroAddress);
+    expect(result.timelock).to.equal(undefined);
+    expect(JSON.parse(fs.readFileSync(result.file, "utf8")).timelock).to.equal(undefined);
+    // explicit guardian without a timelock
+    result = await run({ ...env, GUARDIAN_ADDRESS: user.address });
+    expect(await result.exchange.guardian()).to.equal(user.address);
+    expect(await result.exchange.pendingOwner()).to.equal(multisig.address);
+    // explicit guardian with a timelock overrides the default
+    result = await run({ ...env, GUARDIAN_ADDRESS: operator.address, TIMELOCK_DELAY_SECONDS: "60" });
+    expect(await result.exchange.guardian()).to.equal(operator.address);
+    expect(() => loadConfig({ ...env, TIMELOCK_DELAY_SECONDS: "2592001" })).to.throw("TIMELOCK_DELAY_SECONDS must be at most 30 days");
+    expect(() => loadConfig({ ...env, TIMELOCK_DELAY_SECONDS: "soon" })).to.throw("TIMELOCK_DELAY_SECONDS must be a non-negative integer");
+    expect(loadConfig({ ...env, TIMELOCK_DELAY_SECONDS: "0" }).guardian).to.equal(ethers.ZeroAddress);
+    expect(loadConfig({ ...env, TIMELOCK_DELAY_SECONDS: "60" }).guardian).to.equal(multisig.address);
+  });
+
   it("recognizes the well-known test accounts", async () => {
     const signers = await ethers.getSigners();
     // hardhat's default accounts are exactly those

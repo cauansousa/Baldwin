@@ -76,6 +76,17 @@ USDC token and existing Chainlink feeds. It deploys no mocks and mints nothing.
    contracts is deployed, the abandoned ones are harmless).
 4. **The multisig must call `acceptOwnership()` on the Exchange and on the
    ChainlinkOracle.** Until then the deployer key is still the owner of both.
+
+   **With a timelock** (`TIMELOCK_DELAY_SECONDS` > 0) the script also deploys an
+   OpenZeppelin `TimelockController` (minimum delay as given, the multisig as only
+   proposer and executor, no admin), makes the multisig (or `GUARDIAN_ADDRESS`) the
+   guardian, and transfers ownership of both contracts to the *timelock*. The multisig
+   must then, on the timelock, `schedule` `acceptOwnership()` for both contracts, wait
+   out the delay and `execute` both; the script prints the exact calls with their
+   arguments. Until that has executed the deployer key is still the owner and nothing
+   owner-only works through the multisig, except pausing (guardian). Afterwards every
+   owner action goes through schedule + execute. The timelock address is recorded as
+   the optional `timelock` field of the deployment file.
 5. Verify the sources with the two commands the script prints, e.g.
    `npx hardhat verify --network arbitrumSepolia <exchange> <usdc> <oracle> <deployer> <feeRecipient> <maxPriceAge> <fundingCap> <band>`
    (needs `ETHERSCAN_API_KEY`).
@@ -145,10 +156,26 @@ including each refusal.
   every market the accounts involved hold a position in, so margin checks see it. The
   views (`accountValue`, `freeCollateral`, `isLiquidatable`) cannot accrue and may be
   ahead of what a transaction will find until `updateFunding` has run.
-- **Funding.** `updateFunding` (anyone; also called by fills and liquidations of that
-  market) acts at most once per hour: `rate = clamp((mark − index)/index, ±cap)`,
+- **Funding.** `updateFunding` (anyone; also called by fills, liquidations and
+  withdrawals) acts at most once per hour per market:
+  `rate = clamp((markTwap − index)/index, ±cap)`,
   `cumulativeFunding += index × rate × elapsed / 1h`, with `elapsed` capped at 8 hours.
-  Mark is the last fill price. Positions settle the index difference whenever touched.
+  Positions settle the index difference whenever touched.
+  `markTwap` is the time-weighted average fill price of the period being closed: each
+  fill price counts for the time until the next fill (the last one until the accrual),
+  and the time before the period's first fill counts at the index. A period without
+  fills has no premium; prices are never carried over from an earlier period. So a fill
+  just before the accrual has almost no weight (a band-edge fill one second before moves
+  the hourly rate by 0.14 bps, against a 10 bps cap), and a stale last trade cannot keep
+  funding running in a market that stopped trading. `markPrice` (last fill) is
+  informational. `markTwap(marketId)` and `currentFundingRate(marketId)` (WAD per hour)
+  show the open period; they return 0 instead of reverting when the index is unavailable.
+- **Insurance fund.** Fed by half of every liquidation penalty and by
+  `depositInsurance(amount)`, which anyone can call. **Deposits are one-way: there is no
+  withdrawal, for anyone.** A deposit first repays recorded bad debt (`totalBadDebt`
+  goes down by `min(amount, totalBadDebt)`, which closes the real USDC shortfall) and
+  only the remainder is added to the fund. The fund is spent only on deficits of
+  liquidated accounts.
 - **Liquidation.** If `accountValue < maintenance margin`, anyone can take over up to
   `maxSize` of a position at the index price. The liquidator therefore needs collateral
   and ends up holding the position. The penalty (bps of the liquidated notional, capped at
@@ -175,7 +202,8 @@ including each refusal.
   outage, not even to close; in exchange nobody can trade at a price that can no longer
   be checked.
 - **Pause** (and markets with `active = false`): only fills in which both sides reduce.
-  Deposits, withdrawals, cancels, funding and liquidations stay open.
+  Deposits, withdrawals, cancels, funding and liquidations stay open. The owner or the
+  guardian (`setGuardian`, owner only) can pause; only the owner can unpause.
 
 ## Trust model
 
@@ -191,11 +219,15 @@ including each refusal.
 - **Owner**: fully trusted, for parameters and, through `setOracle`, for prices: **the
   owner can replace the oracle and thereby set any price, liquidate anyone and withdraw
   the collateral as "profit". `setOracle` exists so that a permanently broken oracle can
-  be replaced; before mainnet the owner must be a multisig behind a timelock.** It can add/update markets (margins, fees up to
+  be replaced; before mainnet the owner must be a multisig behind a timelock (the
+  deployment script can set one up, see above).** It can add/update markets (margins, fees up to
   1%, penalty up to the maintenance margin, caps), set operators and the fee recipient,
   and pause. Raising the maintenance margin makes accounts liquidatable, so the owner can
   effectively take traders' margin; it must be a multisig behind a timelock. Ownership
   moves in two steps (`Ownable2Step`): the new owner has to accept.
+- **Guardian**: can pause, nothing else, and cannot unpause. A malicious guardian can
+  halt new position-taking until the owner (through the timelock, if any) unpauses and
+  replaces it.
 - **Oracle**: fully trusted. A wrong price lets positions be opened, liquidated and profits
   withdrawn at that price. The exchange's owner can replace the oracle; the Chainlink
   adapter's owner chooses the feeds, their staleness limits and the sequencer uptime
@@ -211,20 +243,24 @@ including each refusal.
 - No external audit yet. Tests are example-based plus one randomized invariant test; there
   is no fuzzing/formal verification (Foundry was not available).
 - **No socialized loss / ADL.** Bad debt is only recorded. When `totalBadDebt > 0` the
-  contract holds less USDC than it owes and the last withdrawers cannot be paid. There is
-  no way yet to repay bad debt or to top up or withdraw the insurance fund.
+  contract holds less USDC than it owes and the last withdrawers cannot be paid, unless
+  somebody volunteers to repay it through `depositInsurance`. The insurance fund cannot
+  be withdrawn or redeployed.
+- **No emergency settlement**: there is no mode in which users can exit a market whose
+  price never comes back (see Oracle below).
 - **Underwater accounts pay no liquidation reward** (the penalty is capped at the account's
   value), so nobody but a protocol-run keeper has a reason to liquidate them.
 - **Liquidators take inventory**: they receive the position at the index price and must
   hedge or unwind it themselves. No close factor: an account one unit under maintenance
   can be liquidated completely. Liquidations are not subject to the minimum fill size.
-- **Mark price = last fill** and funding samples it once per accrual. It can be old, and
-  the operator (or two cooperating traders) can place it anywhere inside the price band
-  with one minimum-size fill, so funding can still be steered up to the rate cap; a
-  TWAP/impact price is needed. The rate sampled at accrual is charged for the whole
-  elapsed period, also on positions opened just before the accrual. Funding is not
-  charged for time beyond 8 hours without an accrual, nor while the index price is stale,
-  and anyone may trigger that zero-rate accrual while the oracle is stale.
+- **Funding mark is a TWAP of fills, not an order-book price.** One fill shortly before
+  an accrual no longer matters, but in a thin market whoever trades alone still sets the
+  TWAP: a band-edge fill early in an otherwise quiet period carries that period (up to
+  the rate cap), and repeating it every hour costs only fees on the minimum size. An
+  impact/mid price from the book would be needed to close this. The rate found at accrual
+  is charged for the whole elapsed period, also on positions opened just before it.
+  Funding is not charged for time beyond 8 hours without an accrual, nor while the index
+  price is stale, and anyone may trigger that zero-rate accrual while the oracle is stale.
 - **Off-chain cancels are not binding on-chain.** A cancel sent only to the engine (or an
   order the engine dropped) can still be settled by the operator while the signature is
   valid. What bounds this now: every order expires within 30 days at most, and
@@ -263,8 +299,9 @@ including each refusal.
   per open position), so gas grows with the number of markets (capped at 16).
 - A liquidatable account can still close its whole position in-band before it is
   liquidated and thereby pay no penalty; only partial reductions on bad terms are refused.
-- No timelock and no parameter change delays; pause has no guardian role. Until the
-  multisig accepts ownership after a deployment, a single deployer key is the owner.
+- The timelock is optional (`TIMELOCK_DELAY_SECONDS`); nothing in the contracts enforces
+  a delay, and a deployment without it leaves the multisig as direct owner. Until
+  ownership has been accepted after a deployment, a single deployer key is the owner.
 - The testnet deployment script has only run against a local node with stand-in
   contracts. It has not run against Arbitrum Sepolia, and source verification
   (`hardhat verify`) has not been tried. There is no mainnet deployment script.

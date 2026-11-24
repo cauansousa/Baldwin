@@ -139,4 +139,6 @@ export interface Deployment {
   markets: { marketId: number; symbol: string }[];
   /** Block the Exchange was created in; where event readers start. Absent on local deployments. */
   deploymentBlock?: number;
+  /** TimelockController that owns the contracts, when the deployment uses one. */
+  timelock?: `0x${string}`;
 }

@@ -385,6 +385,10 @@ describe("Review regressions", () => {
           await time.increase(HOUR + 5);
           await refresh();
           for (let i = 0; i < n; i++) await exchange.updateFunding(i);
+          // ... a fill in every market in the new period, so each has a TWAP to close ...
+          for (let i = 0; i < n; i++) {
+            await ctx.settleOk([await ctx.trade(alice, bob, wad("0.01"), (wad(MARKET_PRICE(i)) * 104n) / 100n, { marketId: i })]);
+          }
           // ... and every market due for another accrual when the match is settled
           await time.increase(HOUR + 5);
           await refresh();

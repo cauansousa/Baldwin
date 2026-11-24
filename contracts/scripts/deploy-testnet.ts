@@ -32,6 +32,10 @@ export interface TestnetConfig {
   owner: string;
   allowEoaOwner: boolean;
   allowTestKey: boolean;
+  /** 0 = no timelock: the multisig becomes the owner directly. */
+  timelockDelay: bigint;
+  /** Account that may pause. Zero address = none. With a timelock it defaults to the owner (multisig). */
+  guardian: string;
   operator: string;
   feeRecipient: string;
   maxPriceAge: bigint;
@@ -123,6 +127,8 @@ export function loadConfig(env: Env): TestnetConfig {
     owner: address("OWNER_ADDRESS"),
     allowEoaOwner: raw("ALLOW_EOA_OWNER") === "true",
     allowTestKey: raw("ALLOW_TEST_KEY") === "true",
+    timelockDelay: integer("TIMELOCK_DELAY_SECONDS", 0n),
+    guardian: address("GUARDIAN_ADDRESS", false),
     operator: address("OPERATOR_ADDRESS"),
     feeRecipient: address("FEE_RECIPIENT"),
     maxPriceAge: integer("MAX_PRICE_AGE", btcStaleness > ethStaleness ? btcStaleness : ethStaleness),
@@ -155,6 +161,11 @@ export function loadConfig(env: Env): TestnetConfig {
   };
 
   if (problems.length) throw new Error(`Configuration problems:\n  - ${problems.join("\n  - ")}`);
+
+  // Behind a timelock the owner cannot pause quickly; unless told otherwise the multisig
+  // keeps that ability as guardian.
+  if (config.timelockDelay > 0n && config.guardian === ethers.ZeroAddress) config.guardian = config.owner;
+  if (config.timelockDelay > 30n * 24n * 3600n) problems.push("TIMELOCK_DELAY_SECONDS must be at most 30 days");
 
   // The same rules the contracts enforce, checked here so that nothing is deployed in vain.
   const c = config;
@@ -298,6 +309,9 @@ export async function deployTestnet(config: TestnetConfig, log: Log = console.lo
     [ethers.getCreateAddress({ from: deployer.address, nonce: deployerNonce })]: "the ChainlinkOracle about to be deployed",
     [ethers.getCreateAddress({ from: deployer.address, nonce: deployerNonce + 1 })]: "the Exchange about to be deployed",
   };
+  if (config.timelockDelay > 0n) {
+    reserved[ethers.getCreateAddress({ from: deployer.address, nonce: deployerNonce + 2 })] = "the TimelockController about to be deployed";
+  }
   for (const m of config.markets) reserved[m.feed] = `the ${m.symbol} feed`;
   reserved[ethers.ZeroAddress] = "the zero address";
   for (const [name, value] of [
@@ -305,6 +319,9 @@ export async function deployTestnet(config: TestnetConfig, log: Log = console.lo
     ["FEE_RECIPIENT", config.feeRecipient],
   ]) {
     if (reserved[value]) problems.push(`${name} ${value} is ${reserved[value]}`);
+  }
+  if (config.guardian !== ethers.ZeroAddress && reserved[config.guardian]) {
+    problems.push(`GUARDIAN_ADDRESS ${config.guardian} is ${reserved[config.guardian]}`);
   }
 
   if (problems.length) throw new Error(`Preflight failed, nothing was deployed:\n  - ${problems.join("\n  - ")}`);
@@ -350,6 +367,21 @@ export async function deployTestnet(config: TestnetConfig, log: Log = console.lo
   log(`Exchange deployed at ${exchangeAddress}`);
   record("deploy Exchange", { exchange: exchangeAddress });
 
+  // Optional timelock between the multisig and the contracts: the multisig proposes and
+  // executes, nobody administers the timelock itself (admin = address(0)).
+  let timelockAddress: string | undefined;
+  if (config.timelockDelay > 0n) {
+    const timelock = await (
+      await ethers.getContractFactory("TimelockController", deployer)
+    ).deploy(config.timelockDelay, [config.owner], [config.owner], ethers.ZeroAddress);
+    await timelock.waitForDeployment();
+    timelockAddress = await timelock.getAddress();
+    log(`TimelockController deployed at ${timelockAddress} (delay ${config.timelockDelay}s, proposer and executor ${config.owner})`);
+    record("deploy TimelockController", { timelock: timelockAddress });
+  }
+  /** Who ends up as owner of Exchange and ChainlinkOracle. */
+  const finalOwner = timelockAddress ?? config.owner;
+
   const markets: { marketId: number; symbol: string }[] = [];
   for (const [marketId, m] of config.markets.entries()) {
     await (await oracle.setFeed(marketId, m.feed, m.maxStaleness)).wait();
@@ -378,10 +410,17 @@ export async function deployTestnet(config: TestnetConfig, log: Log = console.lo
   log(`operator ${config.operator}`);
   record("set operator");
 
-  const ownershipPending = config.owner !== deployer.address;
+  if (config.guardian !== ethers.ZeroAddress) {
+    await (await exchange.setGuardian(config.guardian)).wait();
+    log(`guardian ${config.guardian} (can pause, cannot unpause)`);
+    record("set guardian", { guardian: config.guardian });
+  }
+
+  const ownershipPending = finalOwner !== deployer.address;
   if (ownershipPending) {
-    await (await exchange.transferOwnership(config.owner)).wait();
-    await (await oracle.transferOwnership(config.owner)).wait();
+    await (await exchange.transferOwnership(finalOwner)).wait();
+    await (await oracle.transferOwnership(finalOwner)).wait();
+    record("start ownership transfer", { pendingOwner: finalOwner });
   }
 
   // --------------------------------------------------------------- output
@@ -394,6 +433,8 @@ export async function deployTestnet(config: TestnetConfig, log: Log = console.lo
     oracle: oracleAddress,
     markets,
     ...(exchangeReceipt ? { deploymentBlock: exchangeReceipt.blockNumber } : {}),
+    // Optional extra field: present only when a timelock was deployed.
+    ...(timelockAddress ? { timelock: timelockAddress } : {}),
   };
   fs.writeFileSync(file, JSON.stringify(deployment, null, 2) + "\n");
   fs.rmSync(incompleteFile, { force: true });
@@ -404,7 +445,31 @@ export async function deployTestnet(config: TestnetConfig, log: Log = console.lo
   log(`fee recipient ${config.feeRecipient}`);
   log(`maxPriceAge ${config.maxPriceAge}s, funding cap ${config.maxFundingRateBps} bps/h, price band ${config.maxPriceDeviationBps} bps`);
   log(`written ${file}`);
-  if (ownershipPending) {
+  const acceptCalldata = exchange.interface.encodeFunctionData("acceptOwnership");
+  if (timelockAddress) {
+    const zero = ethers.ZeroHash;
+    log("");
+    log(`OWNERSHIP IS NOT TRANSFERRED YET. The deployer ${deployer.address} remains owner of both contracts`);
+    log(`until the TimelockController ${timelockAddress} has accepted ownership. Until then NOTHING`);
+    log("owner-only works through the multisig or the timelock (pausing does: the guardian can pause).");
+    log(`The multisig ${config.owner} must send these calls to the timelock ${timelockAddress}:`);
+    log("  1. schedule both (one transaction each, or scheduleBatch):");
+    for (const [name, target] of [
+      ["Exchange", exchangeAddress],
+      ["ChainlinkOracle", oracleAddress],
+    ]) {
+      log(`     schedule(target=${target}, value=0, data=${acceptCalldata}, predecessor=${zero}, salt=${zero}, delay=${config.timelockDelay})   // ${name}.acceptOwnership()`);
+    }
+    log(`  2. wait ${config.timelockDelay} seconds`);
+    log("  3. execute both:");
+    for (const [name, target] of [
+      ["Exchange", exchangeAddress],
+      ["ChainlinkOracle", oracleAddress],
+    ]) {
+      log(`     execute(target=${target}, value=0, payload=${acceptCalldata}, predecessor=${zero}, salt=${zero})   // ${name}.acceptOwnership()`);
+    }
+    log("  Afterwards every owner action (markets, operators, oracle, unpause, ...) goes through schedule + execute.");
+  } else if (ownershipPending) {
     log("");
     log(`OWNERSHIP IS NOT TRANSFERRED YET. The deployer ${deployer.address} remains owner until`);
     log(`${config.owner} calls acceptOwnership() on BOTH contracts:`);
@@ -417,8 +482,13 @@ export async function deployTestnet(config: TestnetConfig, log: Log = console.lo
   log("verify the sources (needs ETHERSCAN_API_KEY):");
   log(`  npx hardhat verify --network ${network.name} ${oracleAddress} ${oracleArgs.join(" ")}`);
   log(`  npx hardhat verify --network ${network.name} ${exchangeAddress} ${exchangeArgs.join(" ")}`);
+  if (timelockAddress) {
+    log(`  TimelockController ${timelockAddress}: its constructor takes arrays, so pass the arguments in a file:`);
+    log(`    module.exports = [${config.timelockDelay}, ["${config.owner}"], ["${config.owner}"], "${ethers.ZeroAddress}"];`);
+    log(`    npx hardhat verify --network ${network.name} --constructor-args <that file> ${timelockAddress}`);
+  }
 
-  return { deployment, file, exchange, oracle, ownershipPending };
+  return { deployment, file, exchange, oracle, ownershipPending, timelock: timelockAddress, finalOwner };
 }
 
 async function main() {
