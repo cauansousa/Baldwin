@@ -90,6 +90,11 @@ export const EXCHANGE_ABI = [
   "error NegativeAccountValue(address trader)",
   "error ReduceOnlyViolated(address trader)",
   "error PriceOutOfBand(uint256 price, uint256 index)",
+  "error StalePrice(uint32 marketId)",
+  "error OnlyReducingAllowed()",
+  "error OpenInterestCapExceeded()",
+  "error FillTooSmall()",
+  "error InsufficientGas()",
 ] as const;
 
 export const ERC20_ABI = [
