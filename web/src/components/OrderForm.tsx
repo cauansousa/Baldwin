@@ -1,15 +1,25 @@
 import type { Order } from "@shared";
 import { useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { useSignTypedData } from "wagmi";
+import { readContract } from "wagmi/actions";
 import { engine } from "../api";
-import type { MarketInfo } from "../api/types";
+import type { EngineHealth, MarketInfo } from "../api/types";
 import { config } from "../config";
 import type { ChainAccount, ChainMarket, ExchangeStatus } from "../hooks/useChain";
 import { queryKeys } from "../hooks/useEngine";
-import { describeError } from "../lib/errors";
-import { DEFAULT_EXPIRY_SECONDS, defaultExpiry, generateNonce, normalizeSignature, orderToJson, orderTypedData } from "../lib/order";
+import { describeError, describeOrderReason } from "../lib/errors";
+import {
+  DEFAULT_EXPIRY_SECONDS,
+  defaultExpiry,
+  knownNonceFloor,
+  nextNonce,
+  normalizeSignature,
+  orderToJson,
+  orderTypedData,
+} from "../lib/order";
 import { classifyLimitPrice, estimateOrder, priceBand } from "../lib/risk";
+import { exchangeAbi, wagmiConfig } from "../wagmi";
 import { formatBps, formatPrice, formatSize, formatUsdc, parseWad } from "../lib/units";
 
 export interface OrderPrefill {
@@ -33,6 +43,8 @@ interface Props {
   chainMarket: ChainMarket | undefined;
   account: ChainAccount | undefined;
   exchangeStatus: ExchangeStatus | undefined;
+  /** The engine's own view of this market (index price, enforced band), when it reports one. */
+  engineMarket: EngineHealth["markets"][number] | undefined;
   /** Connected address on the right network; undefined disables submission. */
   trader: `0x${string}` | undefined;
   prefill: OrderPrefill | undefined;
@@ -50,7 +62,7 @@ const STATUS_LABELS: Record<string, string> = {
 /** Statuses meaning the order did not survive; shown as a warning, not a success. */
 const CLOSED_STATUSES = new Set(["cancelled", "expired", "rejected"]);
 
-export function OrderForm({ market, chainMarket, account, exchangeStatus, trader, prefill }: Props) {
+export function OrderForm({ market, chainMarket, account, exchangeStatus, engineMarket, trader, prefill }: Props) {
   const queryClient = useQueryClient();
   const { signTypedDataAsync } = useSignTypedData();
 
@@ -61,6 +73,8 @@ export function OrderForm({ market, chainMarket, account, exchangeStatus, trader
   const [postOnly, setPostOnly] = useState(false);
   const [ioc, setIoc] = useState(false);
   const [submit, setSubmit] = useState<Submit>({ status: "idle" });
+  // Lets the user abandon a wallet prompt that never answers without leaving the form stuck.
+  const attempt = useRef(0);
 
   useEffect(() => {
     if (!prefill) return;
@@ -113,10 +127,12 @@ export function OrderForm({ market, chainMarket, account, exchangeStatus, trader
 
   // Fills must happen within index ± maxPriceDeviationBps.
   const maxDeviation = exchangeStatus?.maxPriceDeviationBps;
+  // Prefer the band the engine actually enforces; otherwise derive it from the contract.
   const band =
-    chainMarket?.indexPrice !== undefined && maxDeviation !== undefined
+    engineMarket?.band ??
+    (chainMarket?.indexPrice !== undefined && maxDeviation !== undefined
       ? priceBand(chainMarket.indexPrice, maxDeviation)
-      : undefined;
+      : undefined);
   const bandPosition = band && parsed.price !== undefined ? classifyLimitPrice(isBuy, parsed.price, band) : undefined;
 
   const busy = submit.status === "signing" || submit.status === "sending";
@@ -128,28 +144,50 @@ export function OrderForm({ market, chainMarket, account, exchangeStatus, trader
         ? "Conecte a carteira na rede correta"
         : params && !params.active
           ? "Mercado inativo"
-          : undefined;
+          : engineMarket && engineMarket.indexPrice === null
+            ? "Mercado suspenso (sem preço índice)"
+            : undefined;
   const canSubmit = !blocker && !busy && parsed.price !== undefined && parsed.size !== undefined;
 
   async function onSubmit(event: FormEvent) {
     event.preventDefault();
     if (!canSubmit || !market || !trader || !config.exchange) return;
     if (parsed.price === undefined || parsed.size === undefined) return;
-    const order: Order = {
-      trader,
-      marketId: market.marketId,
-      isBuy,
-      reduceOnly,
-      size: parsed.size,
-      limitPrice: parsed.price,
-      nonce: generateNonce(),
-      expiry: defaultExpiry(),
-    };
+    const id = ++attempt.current;
+    const current = () => attempt.current === id;
     try {
       setSubmit({ status: "signing" });
+      // Nonces below the on-chain minimum (raised by a bulk cancel) are dead: stay above it.
+      let minValidNonce = account?.minValidNonce ?? 0n;
+      const floor = knownNonceFloor(trader);
+      if (floor > minValidNonce) minValidNonce = floor;
+      try {
+        const onChain = await readContract(wagmiConfig, {
+          abi: exchangeAbi,
+          address: config.exchange,
+          chainId: config.chainId,
+          functionName: "minValidNonce",
+          args: [trader],
+        });
+        if (onChain > minValidNonce) minValidNonce = onChain;
+      } catch {
+        // RPC hiccup: fall back to the last value we know.
+      }
+      if (!current()) return;
+      const order: Order = {
+        trader,
+        marketId: market.marketId,
+        isBuy,
+        reduceOnly,
+        size: parsed.size,
+        limitPrice: parsed.price,
+        nonce: nextNonce(minValidNonce),
+        expiry: defaultExpiry(),
+      };
       const signature = normalizeSignature(
         await signTypedDataAsync(orderTypedData(config.chainId, config.exchange, order)),
       );
+      if (!current()) return;
       setSubmit({ status: "sending" });
       const result = await engine.postOrder({
         order: orderToJson(order),
@@ -159,7 +197,8 @@ export function OrderForm({ market, chainMarket, account, exchangeStatus, trader
       });
       const status = STATUS_LABELS[result.status] ?? result.status;
       const fills = result.fills.length > 0 ? ` · ${result.fills.length} execução(ões) aguardando liquidação` : "";
-      const reason = result.reason ? ` Motivo: ${result.reason}` : "";
+      const reason = result.reason ? ` Motivo: ${describeOrderReason(result.reason)}.` : "";
+      if (!current()) return;
       setSubmit({
         status: "success",
         message: `Ordem enviada${status ? `: ${status}` : ""}${fills}.${reason}`,
@@ -167,7 +206,7 @@ export function OrderForm({ market, chainMarket, account, exchangeStatus, trader
       });
       setSize("");
     } catch (err) {
-      setSubmit({ status: "error", message: describeError(err) });
+      if (current()) setSubmit({ status: "error", message: describeError(err) });
     } finally {
       void queryClient.invalidateQueries({ queryKey: queryKeys.openOrders(trader) });
       void queryClient.invalidateQueries({ queryKey: queryKeys.chain });
@@ -314,6 +353,21 @@ export function OrderForm({ market, chainMarket, account, exchangeStatus, trader
                 : `${isBuy ? "Comprar" : "Vender"} ${base}`)}
         </button>
 
+        {submit.status === "signing" && (
+          <p className="note" role="status">
+            Aguardando a assinatura na carteira (não custa gás).{" "}
+            <button
+              type="button"
+              className="link note-action"
+              onClick={() => {
+                attempt.current++;
+                setSubmit({ status: "idle" });
+              }}
+            >
+              Desistir
+            </button>
+          </p>
+        )}
         {submit.status === "success" && (
           <p className={`note ${submit.warn ? "note-warn" : "note-ok"}`} role="status">
             {submit.message}

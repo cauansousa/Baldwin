@@ -7,7 +7,9 @@ interface ImportMetaEnv {
   readonly VITE_EXCHANGE_ADDRESS?: string;
   readonly VITE_USDC_ADDRESS?: string;
   readonly VITE_MOCK?: string;
+  /** Optional block-explorer base URL for chains the app has no built-in definition for. */
+  readonly VITE_EXPLORER_URL?: string;
 }
 
-/** Injected by vite.config.ts; contracts/deployments/localhost.json or null. */
-declare const __LOCAL_DEPLOYMENT__: unknown;
+/** Injected by vite.config.ts: contents of contracts/deployments/*.json in dev, [] in builds. */
+declare const __DEV_DEPLOYMENTS__: unknown[];

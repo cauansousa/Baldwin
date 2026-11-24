@@ -17,16 +17,49 @@ export function normalizeSignature(signature: `0x${string}`): `0x${string}` {
   return signature;
 }
 
+const UINT64_MASK = 0xffff_ffff_ffff_ffffn;
+
 /**
  * Nonce unique per trader: millisecond timestamp in the high bits, 64 random
  * bits below. Roughly time-ordered, and collision-free across tabs/devices
  * for practical purposes.
  */
-export function generateNonce(
-  nowMs: number = Date.now(),
-  random: bigint = randomUint64(),
-): bigint {
-  return (BigInt(Math.trunc(nowMs)) << 64n) | (random & 0xffff_ffff_ffff_ffffn);
+export function generateNonce(nowMs: number = Date.now(), random: bigint = randomUint64()): bigint {
+  return (BigInt(Math.trunc(nowMs)) << 64n) | (random & UINT64_MASK);
+}
+
+/**
+ * Nonce for a new order that the contract will accept: like generateNonce, but
+ * never below `minValidNonce` (raised by `cancelAllOrders`; nonces below it are
+ * dead). Matters right after a bulk cancel, or if this device's clock is behind.
+ */
+export function nextNonce(minValidNonce: bigint, nowMs: number = Date.now(), random: bigint = randomUint64()): bigint {
+  const nonce = generateNonce(nowMs, random);
+  if (nonce >= minValidNonce) return nonce;
+  return (((minValidNonce >> 64n) + 1n) << 64n) | (random & UINT64_MASK);
+}
+
+/**
+ * Value for `cancelAllOrders`: strictly above every nonce this app could have
+ * produced up to `nowMs` (those are below (nowMs + 1) << 64) and strictly above
+ * the current on-chain minimum, which the contract requires.
+ */
+export function bulkCancelNonce(currentMinValidNonce: bigint, nowMs: number = Date.now()): bigint {
+  const aboveAllSigned = (BigInt(Math.trunc(nowMs)) + 1n) << 64n;
+  return aboveAllSigned > currentMinValidNonce ? aboveAllSigned : currentMinValidNonce + 1n;
+}
+
+// Highest minimum this tab has set on-chain, per trader. Covers the moment
+// between a confirmed bulk cancel and the next successful chain read.
+const localNonceFloor = new Map<string, bigint>();
+
+export function rememberNonceFloor(trader: string, minValidNonce: bigint): void {
+  const key = trader.toLowerCase();
+  if (minValidNonce > (localNonceFloor.get(key) ?? 0n)) localNonceFloor.set(key, minValidNonce);
+}
+
+export function knownNonceFloor(trader: string): bigint {
+  return localNonceFloor.get(trader.toLowerCase()) ?? 0n;
 }
 
 function randomUint64(): bigint {

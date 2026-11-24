@@ -9,6 +9,7 @@ import { describeError } from "../lib/errors";
 import { marginUsageBps } from "../lib/risk";
 import { formatBps, formatUsdc, parseUsdc, toInputString } from "../lib/units";
 import { erc20Abi, exchangeAbi, wagmiConfig } from "../wagmi";
+import { TxStatus } from "./TxStatus";
 
 const MINT_AMOUNT = 10_000n * 10n ** BigInt(USDC_DECIMALS);
 
@@ -107,7 +108,11 @@ export function AccountPanel({ account, loadError, trader, connected }: Props) {
         <div className="empty">Conecte a carteira para ver saldos e margem.</div>
       ) : (
         <>
-          {loadError != null && !account && <p className="note note-error">{describeError(loadError)}</p>}
+          {loadError != null && (
+            <p className="note note-error" role="alert">
+              {describeError(loadError)} {account ? "Os saldos abaixo podem estar desatualizados." : ""}
+            </p>
+          )}
           <dl className="summary">
             <div>
               <dt>USDC na carteira</dt>
@@ -152,7 +157,7 @@ export function AccountPanel({ account, loadError, trader, connected }: Props) {
                 onClick={() => {
                   setMode(m);
                   setAmount("");
-                  tx.reset();
+                  tx.dismiss();
                 }}
               >
                 {m === "deposit" ? "Depositar" : "Sacar"}
@@ -197,10 +202,14 @@ export function AccountPanel({ account, loadError, trader, connected }: Props) {
             </button>
           )}
 
-          {tx.state.status === "wallet" && <p className="note" role="status">{tx.state.label}: confirme na carteira…</p>}
-          {tx.state.status === "pending" && <p className="note" role="status">{tx.state.label}: aguardando confirmação na rede…</p>}
-          {tx.state.status === "success" && <p className="note note-ok" role="status">{tx.state.label}</p>}
-          {tx.state.status === "error" && <p className="note note-error" role="alert">{tx.state.message}</p>}
+          {!isLocalChain && (
+            <p className="footnote">
+              Rede de testes: o USDC de teste vem do faucet da Circle e o ETH para gás, de um faucet da Arbitrum
+              Sepolia. Nenhum deles tem valor real.
+            </p>
+          )}
+
+          <TxStatus state={tx.state} onDismiss={tx.dismiss} />
         </>
       )}
     </section>

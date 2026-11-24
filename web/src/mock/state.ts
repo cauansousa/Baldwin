@@ -59,6 +59,8 @@ export const markets: MockMarket[] = [
 ];
 
 export const account = {
+  minValidNonce: 0n,
+  cancelledNonces: new Set<bigint>(),
   walletUsdc: usdc(25_000),
   allowance: 0n,
   balance: usdc(12_500),
@@ -133,6 +135,14 @@ export const openOrders: OpenOrder[] = [
 ];
 
 export const newOrderHash = fakeHash;
+
+/** Mirrors what the engine does when it sees an on-chain cancel: drops the dead orders. */
+export function dropDeadOrders(): void {
+  for (let i = openOrders.length - 1; i >= 0; i--) {
+    const nonce = openOrders[i]!.order.nonce;
+    if (nonce < account.minValidNonce || account.cancelledNonces.has(nonce)) openOrders.splice(i, 1);
+  }
+}
 
 export const getMarket = (marketId: number) => markets.find((m) => m.marketId === marketId);
 export const indexPrice = (m: MockMarket) => BigInt(m.priceCents) * CENT;

@@ -1,5 +1,6 @@
-import { EngineError, engineErrorMessage } from "../lib/errors";
+import { EngineError, parseEngineError } from "../lib/errors";
 import {
+  normalizeHealth,
   normalizeMarkets,
   normalizeOpenOrders,
   normalizeOrderBook,
@@ -28,7 +29,10 @@ async function request(baseUrl: string, path: string, init?: RequestInit): Promi
   } catch {
     body = undefined;
   }
-  if (!res.ok) throw new EngineError(res.status, engineErrorMessage(res.status, body, text));
+  if (!res.ok) {
+    const { message, code } = parseEngineError(res.status, body, text);
+    throw new EngineError(res.status, message, code);
+  }
   return body;
 }
 
@@ -114,6 +118,9 @@ function openFeed(baseUrl: string, marketId: number, handlers: FeedHandlers): ()
 
 export function createHttpEngine(baseUrl: string): EngineApi {
   return {
+    async getHealth() {
+      return normalizeHealth(await request(baseUrl, "/health"));
+    },
     async getMarkets() {
       return normalizeMarkets(await request(baseUrl, "/markets"));
     },

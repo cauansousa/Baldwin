@@ -59,6 +59,21 @@ export interface PostOrderResult {
   fills: { price: bigint; size: bigint }[];
 }
 
+/** What GET /health says the engine currently believes. */
+export interface EngineHealth {
+  /** False when on-chain settlement is stalled. */
+  ok: boolean;
+  /** Undefined when the engine runs without a chain reader. */
+  paused?: boolean;
+  markets: {
+    marketId: number;
+    /** Null when the engine has no fresh index price: the market is halted. */
+    indexPrice: bigint | null;
+    /** Fill-price band the engine enforces, WAD. */
+    band: { lower: bigint; upper: bigint } | null;
+  }[];
+}
+
 export interface FeedHandlers {
   onStatus(connected: boolean): void;
   /** Full book snapshot, or null meaning "the book changed, re-fetch it". */
@@ -67,6 +82,7 @@ export interface FeedHandlers {
 }
 
 export interface EngineApi {
+  getHealth(): Promise<EngineHealth>;
   getMarkets(): Promise<MarketInfo[]>;
   getOrderBook(marketId: number, depth: number): Promise<OrderBook>;
   getTrades(marketId: number): Promise<Trade[]>;

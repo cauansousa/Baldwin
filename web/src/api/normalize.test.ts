@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DATA_MESSAGE_TYPES } from "./http";
-import { isCancellable, mergeTrades, normalizeMarkets, normalizeOpenOrders, normalizeOrderBook, normalizeTrades, tryNormalizeOrderBook } from "./normalize";
+import { isCancellable, normalizeHealth, mergeTrades, normalizeMarkets, normalizeOpenOrders, normalizeOrderBook, normalizeTrades, tryNormalizeOrderBook } from "./normalize";
 
 describe("engine payload normalization", () => {
   it("sorts the book and drops empty levels", () => {
@@ -62,6 +62,31 @@ describe("engine payload normalization", () => {
     expect(DATA_MESSAGE_TYPES.has("snapshot")).toBe(true);
     expect(DATA_MESSAGE_TYPES.has("update")).toBe(true);
     for (const t of ["subscribed", "unsubscribed", "pong", "error"]) expect(DATA_MESSAGE_TYPES.has(t)).toBe(false);
+  });
+
+  it("reads the chain section of GET /health", () => {
+    const health = normalizeHealth({
+      ok: false,
+      settlement: { stalled: true },
+      chain: {
+        paused: true,
+        markets: [
+          { marketId: 0, indexPrice: "100", band: { lo: "95", hi: "105" } },
+          { marketId: 1, indexPrice: null, band: null },
+        ],
+      },
+    });
+    expect(health).toEqual({
+      ok: false,
+      paused: true,
+      markets: [
+        { marketId: 0, indexPrice: 100n, band: { lower: 95n, upper: 105n } },
+        { marketId: 1, indexPrice: null, band: null },
+      ],
+    });
+    // Engine without a chain reader, or an unexpected body: nothing is assumed.
+    expect(normalizeHealth({ ok: true, chain: null })).toEqual({ ok: true, paused: undefined, markets: [] });
+    expect(normalizeHealth("nope")).toEqual({ ok: true, paused: undefined, markets: [] });
   });
 
   it("normalizes markets", () => {

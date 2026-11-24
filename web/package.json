@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite",
     "dev:mock": "VITE_MOCK=1 vite",
+    "dev:testnet": "vite --mode testnet",
     "build": "tsc --noEmit && vite build",
+    "build:testnet": "tsc --noEmit && vite build --mode testnet",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"

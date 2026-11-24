@@ -71,6 +71,10 @@ function callExchange(data: Hex): Hex {
       const { initial, maintenance } = state.marginRequirement();
       return encodeFunctionResult({ abi: exchangeAbi, functionName, result: [initial, maintenance] });
     }
+    case "minValidNonce":
+      return encodeFunctionResult({ abi: exchangeAbi, functionName, result: state.account.minValidNonce });
+    case "maxOrderLifetime":
+      return encodeFunctionResult({ abi: exchangeAbi, functionName, result: 604_800n });
     case "paused":
       return encodeFunctionResult({ abi: exchangeAbi, functionName, result: false });
     case "maxPriceDeviationBps":
@@ -119,6 +123,13 @@ function sendTransaction(to: string | undefined, data: Hex) {
       if (amount > state.freeCollateral()) throw new RpcError(3, "execution reverted: insufficient margin");
       a.balance -= amount;
       a.walletUsdc += amount;
+    } else if (call.functionName === "cancelOrder") {
+      a.cancelledNonces.add(call.args[0]);
+      state.dropDeadOrders();
+    } else if (call.functionName === "cancelAllOrders") {
+      if (call.args[0] <= a.minValidNonce) throw new RpcError(3, "execution reverted: nonce not increasing");
+      a.minValidNonce = call.args[0];
+      state.dropDeadOrders();
     } else throw new RpcError(-32601, `mock: exchange.${call.functionName} not implemented`);
     return;
   }

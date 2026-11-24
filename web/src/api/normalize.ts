@@ -2,7 +2,7 @@
 // decimal strings (docs/SPEC.md).
 
 import { bigintFromJson } from "../lib/units";
-import type { BookLevel, MarketInfo, OpenOrder, OrderBook, PostOrderResult, Trade } from "./types";
+import type { BookLevel, EngineHealth, MarketInfo, OpenOrder, OrderBook, PostOrderResult, Trade } from "./types";
 
 type Json = Record<string, unknown>;
 
@@ -18,6 +18,23 @@ function unwrapList(value: unknown, keys: string[]): unknown[] {
     }
   }
   throw new Error("Resposta inesperada do motor de ordens.");
+}
+
+export function normalizeHealth(value: unknown): EngineHealth {
+  const v = isObject(value) ? value : {};
+  const chain = isObject(v.chain) ? v.chain : undefined;
+  const nullable = (x: unknown, field: string) => (x === null || x === undefined ? null : bigintFromJson(x, field));
+  const markets = (Array.isArray(chain?.markets) ? chain.markets : []).filter(isObject).flatMap((m) => {
+    try {
+      const band = isObject(m.band)
+        ? { lower: bigintFromJson(m.band.lo ?? m.band.lower, "band.lo"), upper: bigintFromJson(m.band.hi ?? m.band.upper, "band.hi") }
+        : null;
+      return [{ marketId: Number(m.marketId), indexPrice: nullable(m.indexPrice, "indexPrice"), band }];
+    } catch {
+      return [];
+    }
+  });
+  return { ok: v.ok !== false, paused: typeof chain?.paused === "boolean" ? chain.paused : undefined, markets };
 }
 
 export function normalizeMarkets(value: unknown): MarketInfo[] {

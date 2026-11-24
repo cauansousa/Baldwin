@@ -2,10 +2,10 @@ import { useQuery } from "@tanstack/react-query";
 import { readContract } from "wagmi/actions";
 import type { MarketInfo } from "../api/types";
 import { config } from "../config";
-import { erc20Abi, exchangeAbi, wagmiConfig } from "../wagmi";
+import { CHAIN_POLL_MS, erc20Abi, exchangeAbi, wagmiConfig } from "../wagmi";
 import { queryKeys } from "./useEngine";
 
-const POLL_MS = 3000;
+const POLL_MS = CHAIN_POLL_MS;
 
 export interface MarketParams {
   active: boolean;
@@ -35,6 +35,8 @@ export interface ChainAccount {
   initialMargin?: bigint;
   maintenanceMargin?: bigint;
   freeCollateral?: bigint;
+  /** Nonces below this were cancelled in bulk on-chain. */
+  minValidNonce?: bigint;
   positions: ChainPosition[];
 }
 
@@ -97,7 +99,7 @@ export function useExchangeStatus() {
   return useQuery({
     queryKey: [...queryKeys.chain, "status", exchange],
     enabled: !!exchange,
-    refetchInterval: 10_000,
+    refetchInterval: Math.max(10_000, POLL_MS),
     queryFn: async (): Promise<ExchangeStatus> => {
       const ex = { abi: exchangeAbi, address: exchange!, chainId } as const;
       const [paused, maxPriceDeviationBps] = await readAll([
@@ -120,7 +122,7 @@ export function useChainAccount(trader: `0x${string}` | undefined, markets: Mark
     queryFn: async (): Promise<ChainAccount> => {
       const ex = { abi: exchangeAbi, address: exchange!, chainId } as const;
       const account = trader!;
-      const [walletUsdc, balance, accountValue, margin, freeCollateral, positions] = await readAll([
+      const [walletUsdc, balance, accountValue, margin, freeCollateral, minValidNonce, positions] = await readAll([
         usdc
           ? readContract(wagmiConfig, { abi: erc20Abi, address: usdc, chainId, functionName: "balanceOf", args: [account] })
           : Promise.resolve(undefined),
@@ -128,6 +130,7 @@ export function useChainAccount(trader: `0x${string}` | undefined, markets: Mark
         readContract(wagmiConfig, { ...ex, functionName: "accountValue", args: [account] }),
         readContract(wagmiConfig, { ...ex, functionName: "marginRequirement", args: [account] }),
         readContract(wagmiConfig, { ...ex, functionName: "freeCollateral", args: [account] }),
+        readContract(wagmiConfig, { ...ex, functionName: "minValidNonce", args: [account] }),
         readAll(ids.map((id) => readContract(wagmiConfig, { ...ex, functionName: "getPosition", args: [account, id] }))),
       ] as const);
       return {
@@ -137,6 +140,7 @@ export function useChainAccount(trader: `0x${string}` | undefined, markets: Mark
         initialMargin: margin?.[0],
         maintenanceMargin: margin?.[1],
         freeCollateral,
+        minValidNonce,
         positions: (positions ?? []).flatMap((p, i) =>
           p && p.size !== 0n ? [{ marketId: ids[i]!, size: p.size, entryNotional: p.entryNotional }] : [],
         ),

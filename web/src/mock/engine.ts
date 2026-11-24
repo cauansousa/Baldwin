@@ -1,6 +1,6 @@
 import type { EngineApi, OrderBook } from "../api/types";
 import { EngineError } from "../lib/errors";
-import { buildBook, getMarket, makeTrade, markets, newOrderHash, openOrders } from "./state";
+import { account, buildBook, getMarket, makeTrade, markets, newOrderHash, openOrders } from "./state";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -12,6 +12,9 @@ function requireMarket(marketId: number) {
 
 /** Fake engine: same interface as the HTTP client, backed by mock/state.ts. */
 export const mockEngine: EngineApi = {
+  async getHealth() {
+    return { ok: true, paused: false, markets: [] };
+  },
   async getMarkets() {
     return markets.map(({ marketId, symbol }) => ({ marketId, symbol }));
   },
@@ -30,6 +33,10 @@ export const mockEngine: EngineApi = {
     const size = BigInt(req.order.size);
     if (size < m.minOrderSize) throw new EngineError(400, "order size below market minimum");
     if (!/^0x[0-9a-f]{128}(1b|1c)$/i.test(req.signature)) throw new EngineError(400, "signature must be a 65-byte hex string with v = 27/28");
+    const nonce = BigInt(req.order.nonce);
+    if (nonce < account.minValidNonce || account.cancelledNonces.has(nonce)) {
+      throw new EngineError(409, "O nonce desta ordem já foi cancelado. Envie uma nova ordem.", "NONCE_CANCELLED");
+    }
     const orderHash = newOrderHash();
     if (req.ioc) return { orderHash, status: "cancelled", reason: "IOC order: nothing to match", fills: [] };
     openOrders.unshift({

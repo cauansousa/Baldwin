@@ -15,6 +15,11 @@ export const queryKeys = {
   chain: ["chain"] as const,
 };
 
+/** Engine self-report: settlement health, pause flag and halted markets. Best effort. */
+export function useEngineHealth() {
+  return useQuery({ queryKey: ["engine", "health"] as const, queryFn: () => engine.getHealth(), refetchInterval: 10_000 });
+}
+
 export function useMarkets() {
   return useQuery({ queryKey: queryKeys.markets, queryFn: () => engine.getMarkets(), refetchInterval: 30_000 });
 }

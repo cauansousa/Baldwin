@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { hashTypedData } from "viem";
-import { engineErrorMessage, describeError, EngineError } from "./errors";
+import { describeError, describeOrderReason, EngineError, engineErrorMessage, parseEngineError, TxTimeoutError } from "./errors";
 import {
+  bulkCancelNonce,
+  knownNonceFloor,
+  nextNonce,
+  rememberNonceFloor,
   cancelTypedData,
   DEFAULT_EXPIRY_SECONDS,
   defaultExpiry,
@@ -68,7 +72,85 @@ describe("order helpers", () => {
   });
 });
 
+describe("on-chain bulk cancel nonces", () => {
+  const now = 1_800_000_000_000;
+  const MAX_RANDOM = 2n ** 64n - 1n;
+
+  it("the new minimum is strictly above every nonce signed up to now", () => {
+    const min = bulkCancelNonce(0n, now);
+    expect(min).toBeGreaterThan(generateNonce(now, MAX_RANDOM));
+    expect(min).toBeGreaterThan(generateNonce(now - 86_400_000, MAX_RANDOM));
+    expect(min).toBe((BigInt(now) + 1n) << 64n);
+  });
+
+  it("is strictly greater than the current on-chain minimum, even if that is ahead of the clock", () => {
+    const ahead = (BigInt(now) + 10_000n) << 64n;
+    expect(bulkCancelNonce(ahead, now)).toBe(ahead + 1n);
+    const same = bulkCancelNonce(0n, now);
+    expect(bulkCancelNonce(same, now)).toBe(same + 1n);
+    expect(bulkCancelNonce(same - 1n, now)).toBe(same);
+  });
+
+  it("orders signed after a bulk cancel get nonces at or above the new minimum", () => {
+    const min = bulkCancelNonce(0n, now);
+    // Same millisecond as the cancel, one later, and a device whose clock is far behind.
+    for (const t of [now, now + 1, now - 3_600_000]) {
+      for (const r of [0n, 12345n, MAX_RANDOM]) expect(nextNonce(min, t, r)).toBeGreaterThanOrEqual(min);
+    }
+    // Normally the nonce is just the time-based one.
+    expect(nextNonce(0n, now, 7n)).toBe(generateNonce(now, 7n));
+    expect(nextNonce(min, now + 5, 7n)).toBe(generateNonce(now + 5, 7n));
+    // Still unique within a millisecond when bumped above the minimum.
+    expect(nextNonce(min + 5n, now, 1n)).not.toBe(nextNonce(min + 5n, now, 2n));
+  });
+
+  it("remembers the highest floor per trader, case-insensitively", () => {
+    expect(knownNonceFloor(trader)).toBe(0n);
+    rememberNonceFloor(trader, 10n);
+    rememberNonceFloor(trader.toLowerCase(), 5n);
+    expect(knownNonceFloor(trader.toUpperCase().replace("0X", "0x"))).toBe(10n);
+  });
+});
+
 describe("error messages", () => {
+  it("maps every engine error code to Portuguese", () => {
+    const body = (code: string, message = "english detail") => ({ error: { code, message } });
+    expect(parseEngineError(422, body("PRICE_OUTSIDE_BAND"), "")).toEqual({
+      code: "PRICE_OUTSIDE_BAND",
+      message: "Preço fora da banda permitida em torno do preço índice.",
+    });
+    expect(engineErrorMessage(400, body("INVALID_EXPIRY"), "")).toMatch(/Validade inválida/);
+    expect(engineErrorMessage(429, body("TRADER_SUSPENDED"), "")).toMatch(/suspensa/);
+    expect(engineErrorMessage(429, body("RATE_LIMITED"), "")).toMatch(/Muitas requisições/);
+    expect(engineErrorMessage(503, body("EXCHANGE_PAUSED"), "")).toMatch(/pausada/);
+    expect(engineErrorMessage(503, body("MARKET_HALTED"), "")).toMatch(/Mercado suspenso/);
+    expect(engineErrorMessage(503, body("CHAIN_UNAVAILABLE"), "")).toMatch(/blockchain/);
+    expect(engineErrorMessage(422, body("INSUFFICIENT_MARGIN"), "")).toBe("Margem insuficiente para esta ordem.");
+    for (const code of [
+      "UNKNOWN_MARKET", "MARKET_INACTIVE", "BELOW_MIN_SIZE", "EXPIRED", "DUPLICATE_ORDER", "NONCE_CANCELLED", "NONCE_REUSED",
+      "BAD_SIGNATURE", "ALREADY_FILLED", "REDUCE_ONLY_NO_POSITION", "POST_ONLY_WOULD_CROSS", "NOT_FOUND", "INTERNAL",
+    ]) {
+      const message = engineErrorMessage(400, body(code), "");
+      expect(message, code).not.toContain("english detail");
+      expect(message.length, code).toBeGreaterThan(10);
+    }
+    // Validation errors keep the server's specifics; unknown codes fall back to the server text.
+    expect(engineErrorMessage(400, body("BAD_REQUEST", "order.size must be..."), "")).toBe("Requisição inválida. (order.size must be...)");
+    expect(parseEngineError(418, body("NEW_CODE", "something new"), "")).toEqual({ code: "NEW_CODE", message: "something new" });
+  });
+
+  it("translates the reason of an order the engine closed", () => {
+    expect(describeOrderReason("price outside the oracle price band")).toMatch(/fora da banda/);
+    expect(describeOrderReason("IOC order: match failed on-chain, size not re-posted")).toMatch(/IOC/);
+    expect(describeOrderReason("something else")).toBe("something else");
+  });
+
+  it("a confirmation timeout says the transaction may still confirm", () => {
+    const err = new TxTimeoutError(`0x${"0".repeat(64)}`);
+    expect(describeError(err)).toMatch(/pode ainda confirmar/);
+    expect(describeError(Object.assign(new Error("x"), { name: "HttpRequestError" }))).toMatch(/RPC/);
+  });
+
   it("uses the engine's own message for 4xx", () => {
     expect(engineErrorMessage(400, { error: "insufficient margin" }, "")).toBe("insufficient margin");
     expect(engineErrorMessage(422, { message: "bad signature" }, "")).toBe("bad signature");
