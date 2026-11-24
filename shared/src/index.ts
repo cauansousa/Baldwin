@@ -102,6 +102,13 @@ export const EXCHANGE_ABI = [
   "error InvalidExpiry()",
   "error OrderIsCancelled()",
   "error OrderExpired()",
+  "error NonceNotIncreased()",
+  // Raised by ChainlinkOracle and bubbled through the Exchange.
+  "error SequencerDown()",
+  "error SequencerGracePeriodNotOver()",
+  "error FeedStale(uint32 marketId, uint256 updatedAt)",
+  "error InvalidAnswer(uint32 marketId)",
+  "error FeedNotSet(uint32 marketId)",
 ] as const;
 
 export const ERC20_ABI = [
