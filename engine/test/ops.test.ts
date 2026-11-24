@@ -326,6 +326,52 @@ describe("logging and config", () => {
   });
 });
 
+describe("keeper with a partly failing oracle", () => {
+  it("liquidates in a market whose own price is fresh although the account views revert, and skips markets without a price", async () => {
+    const WAD = 10n ** 18n;
+    const positions = new Map<string, bigint>([[`${alice.address}:1`, 2n * WAD], [`${alice.address}:2`, -3n * WAD]]);
+    const done: [string, number, bigint][] = [];
+    const chain = {
+      async blockNumber() {
+        return 1n;
+      },
+      async touchedPositions() {
+        return [{ trader: alice.address, marketId: 1 }, { trader: alice.address, marketId: 2 }];
+      },
+      async positionSize(t: string, m: number) {
+        return positions.get(`${t}:${m}`) ?? 0n;
+      },
+      async isLiquidatable(): Promise<boolean> {
+        throw new Error("FeedStale(2, 0)"); // market 2's feed is stale: account-wide views revert
+      },
+      async liquidate(t: string, m: number, size: bigint) {
+        done.push([t, m, size]);
+        positions.set(`${t}:${m}`, 0n);
+      },
+      async ownFreeCollateral() {
+        return 10n ** 12n;
+      },
+      async indexPrice(m: number) {
+        if (m === 2) throw new Error("FeedStale(2, 0)");
+        return 100n * WAD;
+      },
+      async initialMarginBps() {
+        return 2000n;
+      },
+      async updateFunding() {},
+      async lastFundingTime() {
+        return 10n ** 12n;
+      },
+      async blockTimestamp() {
+        return 1000n;
+      },
+    };
+    const keeper = new Keeper({ chain, marketIds: [1, 2] });
+    await keeper.tick();
+    expect(done).toEqual([[alice.address, 1, 2n * WAD]]);
+  });
+});
+
 describe("keeper persistence", () => {
   it("cursor and tracked accounts survive a restart; nothing is rescanned or forgotten", async () => {
     const path = tmp("keeper.json");
@@ -389,6 +435,7 @@ describe("keeper persistence", () => {
   it("a keeper whose views revert (oracle down) keeps going and retries on the next tick", async () => {
     let down = true;
     const funded: number[] = [];
+    const attempts: [string, number, bigint][] = [];
     const chain = {
       async blockNumber() {
         return 1n;
@@ -403,7 +450,10 @@ describe("keeper persistence", () => {
         if (down) throw new Error("SequencerDown()");
         return false;
       },
-      async liquidate() {},
+      async liquidate(t: string, m: number, size: bigint) {
+        attempts.push([t, m, size]);
+        if (down) throw new Error("NotLiquidatable()");
+      },
       async ownFreeCollateral() {
         return 0n;
       },
@@ -427,6 +477,7 @@ describe("keeper persistence", () => {
     const keeper = new Keeper({ chain, marketIds: [1, 2] });
     await keeper.tick(); // must not throw
     expect(funded).toEqual([]);
+    expect(attempts).toEqual([[alice.address, 1, 5n]]); // tried anyway: this market's own price is readable
     expect(keeper.trackedAccounts()).toEqual([alice.address]);
     down = false;
     await keeper.tick();

@@ -168,7 +168,7 @@ describe("ViemSettler", () => {
 
     expect(rpc.sent).toHaveLength(1);
     const tx = parseTransaction(rpc.sent[0]!);
-    expect(tx).toMatchObject({ nonce: 7, chainId: DOMAIN.chainId, maxFeePerGas: 100n, maxPriorityFeePerGas: 10n, gas: 300_000n + 700_000n });
+    expect(tx).toMatchObject({ nonce: 7, chainId: DOMAIN.chainId, maxFeePerGas: 100n, maxPriorityFeePerGas: 10n, gas: 3n * 700_000n + 300_000n });
     expect(tx.to!.toLowerCase()).toBe(EXCHANGE.toLowerCase());
     const call = decodeFunctionData({ abi: exchangeAbi, data: tx.data! });
     expect(call.functionName).toBe("settleMatches");
@@ -262,13 +262,29 @@ describe("ViemSettler", () => {
     expect(rpc.sent).toEqual([]);
   });
 
+  it("budgets every match at the contract's floor even when the estimate is low, and follows a high estimate", async () => {
+    // a batch whose matches fail cheaply at estimation: the estimate says 150k for 4 matches
+    const low = setup();
+    const matches = [await makeMatch("m1"), await makeMatch("m2"), await makeMatch("m3"), await makeMatch("m4")];
+    low.rpc.gasEstimate = 150_000n;
+    low.rpc.onSend = () => ok(matches);
+    await low.settler.settle({ id: "b1", matches });
+    expect(parseTransaction(low.rpc.sent[0]!).gas).toBe(4n * 700_000n + 300_000n);
+    // an L2 estimate dominated by L1 data cost
+    const high = setup();
+    high.rpc.gasEstimate = 6_000_000n;
+    high.rpc.onSend = () => ok(matches);
+    await high.settler.settle({ id: "b1", matches });
+    expect(parseTransaction(high.rpc.sent[0]!).gas).toBe(9_000_000n);
+  });
+
   it("when the node cannot estimate gas (not a revert), a computed limit is used after an eth_call check", async () => {
     const { rpc, settler } = setup();
     const matches = [await makeMatch("m1"), await makeMatch("m2")];
     rpc.estimateError = new Error("transaction gas limit (30311717) is greater than the cap (16777216)");
     rpc.onSend = () => ok(matches);
     expect((await settler.settle({ id: "b1", matches })).map((r) => r.status)).toEqual(["settled", "settled"]);
-    const gas = 200_000n + 2n * (700_000n + 500_000n);
+    const gas = 2n * 700_000n + 300_000n;
     expect(rpc.calls).toEqual([gas]);
     expect(parseTransaction(rpc.sent[0]!).gas).toBe(gas);
     // ... and if that check says the batch reverts, nothing is sent

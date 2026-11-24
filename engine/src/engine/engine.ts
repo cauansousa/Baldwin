@@ -730,6 +730,12 @@ export class Engine extends EventEmitter<EngineEvents> {
       throw new EngineError("BELOW_MIN_SIZE", `size is below the market minimum ${market.minOrderSize}`);
     }
     const now = BigInt(this.clock());
+    // Nonces are a millisecond timestamp in the high bits. The contract refuses to
+    // bulk-cancel beyond ((now + 1 day) * 1000) << 64, so an order above that bound
+    // could never be covered by cancelAllOrders.
+    if (order.nonce > ((now + 86_400n) * 1000n) << 64n) {
+      throw new EngineError("INVALID_ORDER", "nonce is too far in the future: it must not exceed ((now + 1 day) in ms) << 64");
+    }
     if (order.expiry === 0n) throw new EngineError("INVALID_EXPIRY", "orders must have an expiry");
     if (order.expiry <= now + this.minTimeToExpiry) {
       throw new EngineError("EXPIRED", `order is expired or expires in less than ${this.minTimeToExpiry} seconds`);

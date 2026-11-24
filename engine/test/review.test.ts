@@ -127,6 +127,15 @@ describe("1: dead nonces survive a restart", () => {
     expect(h.engine.getOrder(r.orderHash)!.status).toBe("open");
   });
 
+  it("refuses nonces that cancelAllOrders could never reach", async () => {
+    const h = harness();
+    const bound = ((1000n + 86_400n) * 1000n) << 64n; // clock is at 1000
+    expect(await code(h.place(alice, true, 100, 1, { order: { nonce: bound } }))).toBe("OK");
+    expect(await code(h.place(alice, true, 100, 1, { order: { nonce: bound + 1n } }))).toBe("INVALID_ORDER");
+    // what clients send: a millisecond timestamp in the high bits
+    expect(await code(h.place(bob, true, 100, 1, { order: { nonce: (1_000_000n << 64n) | 12345n } }))).toBe("OK");
+  });
+
   it("orders must expire: no expiry, too far out, or too soon are refused", async () => {
     const h = harness({ minTimeToExpirySec: 60, expiryBufferSec: 30, maxTimeToExpirySec: 7 * 86400 });
     expect(await code(h.place(alice, true, 100, 1, { order: { expiry: 0n } }))).toBe("INVALID_EXPIRY");

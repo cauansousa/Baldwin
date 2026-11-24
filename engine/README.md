@@ -110,6 +110,8 @@ the engine currently believes: pause flag and, per market, index price and price
 - **Expiry is mandatory**: at least `MIN_TIME_TO_EXPIRY_SEC` (60 s) and at most
   `MAX_TIME_TO_EXPIRY_SEC` (7 days) ahead. Resting orders leave the book `EXPIRY_BUFFER_SEC`
   (30 s) before their expiry so that a match cannot reach the chain too late.
+- Nonces are expected to grow over time (a millisecond timestamp in the high bits). A nonce above
+  `((now + 1 day) in ms) << 64` is refused: the contract could never bulk-cancel it.
 - One order per (trader, nonce). A signed `Cancel` or an on-chain `cancelOrder` kills the nonce;
   an on-chain `cancelAllOrders(minValidNonce)` kills every nonce of the trader below it. Both
   on-chain cancels are picked up from events within `LOG_POLL_INTERVAL_MS` and remove the
@@ -330,8 +332,11 @@ chain you run on.
   else, reports `stalled` on `/health`, and refuses new orders with 503.
 - A batch whose transaction reverted as a whole (e.g. the contract's `InsufficientGas`), or would
   revert in gas estimation, did not settle; it is retried up to three times and then its matches
-  are failed as "nothing identifiable". The gas limit is 1.5× the estimate plus the contract's
-  per-match gas floor (400,000 + 150,000 × markets).
+  are failed as "nothing identifiable". The gas limit is `max(estimate × 1.5, matches × floor +
+  300,000)`, where floor is the contract's per-match gas floor (`MATCH_GAS_FLOOR_BASE` +
+  `MATCH_GAS_FLOOR_PER_MARKET` × markets, currently 400,000 + 150,000 × markets): the estimate
+  alone would be too low when a match fails cheaply at estimation but runs fully at inclusion.
+  The two constants are read from the contract at start-up; the settings are the fallback.
 - A transaction counts as final once it is `CONFIRMATIONS` blocks deep (see "Finality").
 - All of this survives a restart: the batch in flight is recorded before it is broadcast (see
   "Durable state and restarts").
@@ -363,8 +368,11 @@ chain you run on.
   multicall): slow with a very large book and a rate-limited RPC.
 - Trader fault counters and suspensions are in memory and reset on restart.
 - Some nodes cannot estimate gas for `settleMatches` (seen with Hardhat's node, whose search
-  does not cope with the contract's per-match gas floor). The engine then uses a computed gas
-  limit after an `eth_call` check; that fallback does not include an L2's L1 data cost.
+  does not cope with the contract's per-match gas floor). The engine then uses the computed
+  budget after an `eth_call` check; that fallback does not include an L2's L1 data cost.
+- The per-match gas floor is read once at start-up (public constants `MATCH_GAS_BASE`,
+  `MATCH_GAS_PER_MARKET`; settings as fallback) and the market count likewise: restart the
+  engine after markets are added.
 - `/metrics` and `/health` are unauthenticated. Rate limiting is per IP and in memory; set
   `TRUST_PROXY` only behind a proxy. EOA signatures only (no EIP-1271). The WebSocket book feed
   sends full snapshots, not deltas.

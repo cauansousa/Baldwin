@@ -171,7 +171,19 @@ export class Keeper {
           continue;
         }
         for (const [marketId, size] of open) {
-          if (!(await this.chain.isLiquidatable(entry.trader))) break;
+          let liquidatable: boolean;
+          try {
+            liquidatable = await this.chain.isLiquidatable(entry.trader);
+          } catch (e) {
+            // The account views revert when the oracle fails for ANY market the account is
+            // in. The contract can still liquidate a market whose own price is fresh, so
+            // try exactly those; `liquidate` is simulated first and simply refuses if
+            // the account is healthy.
+            this.onRpcError?.(e);
+            await this.liquidateBlind(entry.trader, marketId, size);
+            continue;
+          }
+          if (!liquidatable) break;
           await this.liquidate(entry.trader, marketId, size);
         }
       } catch (e) {
@@ -195,6 +207,30 @@ export class Keeper {
       await this.chain.liquidate(trader, marketId, affordable);
     } catch (e) {
       this.log.warn("partial liquidation failed", { trader, marketId, error: errMessage(e) });
+    }
+  }
+
+  /** Liquidation attempt without knowing whether the account is liquidatable (views unavailable). */
+  private async liquidateBlind(trader: Address, marketId: number, size: bigint): Promise<void> {
+    try {
+      await this.chain.indexPrice(marketId);
+    } catch {
+      return; // this market's own price is unavailable: nothing can be done here
+    }
+    try {
+      await this.chain.liquidate(trader, marketId, size);
+      this.log.info("liquidated while account views were unavailable", { trader, marketId, size });
+      return;
+    } catch {
+      // not liquidatable, or the keeper cannot margin the whole position
+    }
+    try {
+      const affordable = await this.affordableSize(marketId);
+      if (affordable === 0n || affordable >= size) return;
+      await this.chain.liquidate(trader, marketId, affordable);
+      this.log.info("liquidated partially while account views were unavailable", { trader, marketId, size: affordable });
+    } catch {
+      // as above
     }
   }
 

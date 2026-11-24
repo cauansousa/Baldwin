@@ -137,6 +137,9 @@ export interface EngineConfig extends CommonConfig {
   /** First block to scan for cancels when the store has no cursor (default: current head). */
   startBlock: bigint | undefined;
   gasLimitCap: bigint;
+  /** The contract's per-match gas floor = base + perMarket x marketCount. */
+  matchGasFloorBase: bigint;
+  matchGasFloorPerMarket: bigint;
   receiptTimeoutMs: number;
   receiptPollMs: number;
   chainRefreshMs: number;
@@ -169,6 +172,8 @@ export function loadEngineConfig(env: Env = process.env): EngineConfig {
     logPollIntervalMs: int(env, "LOG_POLL_INTERVAL_MS", 2000, 100),
     startBlock: optionalBlock(env, "START_BLOCK"),
     gasLimitCap: BigInt(int(env, "GAS_LIMIT_CAP", 16_000_000, 21_000)),
+    matchGasFloorBase: BigInt(int(env, "MATCH_GAS_FLOOR_BASE", 400_000, 0)),
+    matchGasFloorPerMarket: BigInt(int(env, "MATCH_GAS_FLOOR_PER_MARKET", 150_000, 0)),
     receiptTimeoutMs: int(env, "RECEIPT_TIMEOUT_MS", 30_000, 100),
     receiptPollMs: int(env, "RECEIPT_POLL_MS", 500, 10),
     chainRefreshMs: int(env, "CHAIN_REFRESH_MS", 2000, 100),

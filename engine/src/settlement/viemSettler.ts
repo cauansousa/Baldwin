@@ -61,10 +61,13 @@ export interface ViemSettlerOptions {
   /** Upper bound for the gas limit. Default 16,000,000 (below the 2^24 per-transaction cap of EIP-7825). */
   gasLimitCap?: bigint;
   /**
-   * Gas the contract insists on having left before each match
-   * (400,000 + 150,000 x marketCount); added on top of the estimate. Default 700,000.
+   * Gas the contract insists on having left before each match (currently
+   * 400,000 + 150,000 x marketCount; configurable because it is re-measured when the
+   * contract changes). Every match is budgeted at this. Default 700,000.
    */
   gasFloorPerMatch?: bigint;
+  /** Fixed part of the gas budget (intrinsic gas, calldata, loop overhead). Default 300,000. */
+  gasOverhead?: bigint;
   /** Unmined broadcast rounds after which the transaction is replaced with higher fees. Default 2. */
   bumpAfterRounds?: number;
   /** Never sign with a maxFeePerGas above this (wei). Default: no cap. */
@@ -186,6 +189,7 @@ export class ViemSettler implements Settler {
   private readonly maxRounds: number;
   private readonly gasLimitCap: bigint;
   private readonly gasFloorPerMatch: bigint;
+  private readonly gasOverhead: bigint;
   private readonly bumpAfterRounds: number;
   private readonly maxFeePerGasCap: bigint | undefined;
   private readonly releasePolls: number;
@@ -210,6 +214,7 @@ export class ViemSettler implements Settler {
     this.maxRounds = opts.maxRounds ?? 4;
     this.gasLimitCap = opts.gasLimitCap ?? 16_000_000n;
     this.gasFloorPerMatch = opts.gasFloorPerMatch ?? 700_000n;
+    this.gasOverhead = opts.gasOverhead ?? 300_000n;
     this.bumpAfterRounds = Math.max(1, opts.bumpAfterRounds ?? 2);
     this.maxFeePerGasCap = opts.maxFeePerGasCap;
     this.releasePolls = opts.releasePolls ?? 5;
@@ -342,27 +347,36 @@ export class ViemSettler implements Settler {
   }
 
   /**
-   * Gas limit for the batch. Normally the node's estimate (which on an L2 includes the
-   * L1 data cost) times 1.5, plus the contract's per-match floor: the contract reverts
-   * the whole batch with InsufficientGas when less than the floor is left before a match.
-   * Some nodes cannot estimate this call (their search does not cope with that floor);
-   * then a computed limit is used, after checking with eth_call that the batch goes
-   * through with it.
+   * Gas limit for the batch: max(estimate x 1.5, matches x per-match floor + overhead).
+   *
+   * The estimate alone is not enough. The contract reverts the whole batch with
+   * InsufficientGas when less than its per-match floor is left before a match, and a
+   * match that fails cheaply during estimation (oracle about to refresh, price just
+   * outside the band) can run in full at inclusion. So every match is budgeted at the
+   * floor regardless of what the estimate saw. The estimate still matters on an L2,
+   * where it includes the L1 data cost.
+   *
+   * Some nodes cannot estimate this call at all (their search does not cope with the
+   * floor); then the computed budget is used after an eth_call check with it.
    */
   private async gasLimit(data: Hex, matches: number): Promise<bigint> {
     const tx = { from: this.account.address, to: this.exchange, data };
+    const budget = BigInt(matches) * this.gasFloorPerMatch + this.gasOverhead;
     const clamp = (g: bigint) => (g > this.gasLimitCap ? this.gasLimitCap : g);
+    let estimate: bigint;
     try {
-      const estimate = await this.rpc.estimateGas(tx);
-      const gas = (estimate * 3n) / 2n + this.gasFloorPerMatch;
-      return gas > this.gasLimitCap ? (estimate > this.gasLimitCap ? estimate : this.gasLimitCap) : gas;
+      estimate = await this.rpc.estimateGas(tx);
     } catch (e) {
       if (e instanceof BatchRevertedError) throw e;
-      const gas = clamp(200_000n + BigInt(matches) * (this.gasFloorPerMatch + 500_000n));
-      this.log.warn("gas estimation failed; using a computed gas limit", { gas, error: errMessage(e) });
+      const gas = clamp(budget);
+      this.log.warn("gas estimation failed; using the computed gas budget", { gas, error: errMessage(e) });
       await this.rpc.call({ ...tx, gas }); // BatchRevertedError if it would revert; other errors: nothing was sent
       return gas;
     }
+    const padded = (estimate * 3n) / 2n;
+    const gas = padded > budget ? padded : budget;
+    // Never below the plain estimate, even if that exceeds the cap.
+    return gas > this.gasLimitCap ? (estimate > this.gasLimitCap ? estimate : this.gasLimitCap) : gas;
   }
 
   /** Sign the first attempt, or a replacement with higher fees (if the cap leaves room for one). */

@@ -1,4 +1,4 @@
-import { createPublicClient, formatEther, type PublicClient } from "viem";
+import { createPublicClient, formatEther, parseAbi, type PublicClient } from "viem";
 import { buildServer } from "./api/server.ts";
 import { cancelWatcher } from "./chain/cancelWatcher.ts";
 import { rpcTransport } from "./chain/transport.ts";
@@ -45,6 +45,24 @@ async function main(): Promise<void> {
   const markets = await Promise.all(deployment.markets.map((m) => chain.getMarket(m.marketId)));
   const marketCount = await chain.marketCount();
 
+  // The contract's per-match gas floor. Its constants are public but not part of the
+  // shared interface, so read them if they are there and use the configured values otherwise.
+  const floorAbi = parseAbi(["function MATCH_GAS_BASE() view returns (uint256)", "function MATCH_GAS_PER_MARKET() view returns (uint256)"]);
+  let floorBase = cfg.matchGasFloorBase;
+  let floorPerMarket = cfg.matchGasFloorPerMarket;
+  try {
+    [floorBase, floorPerMarket] = await Promise.all([
+      client.readContract({ address: deployment.exchange, abi: floorAbi, functionName: "MATCH_GAS_BASE" }),
+      client.readContract({ address: deployment.exchange, abi: floorAbi, functionName: "MATCH_GAS_PER_MARKET" }),
+    ]);
+  } catch {
+    log.warn("could not read the contract's match gas floor; using MATCH_GAS_FLOOR_BASE / MATCH_GAS_FLOOR_PER_MARKET", {
+      base: floorBase,
+      perMarket: floorPerMarket,
+    });
+  }
+  const gasFloorPerMatch = floorBase + floorPerMarket * BigInt(marketCount);
+
   // ---- durable state, settlement, engine
   const store = new SqliteStore(cfg.storePath);
   const settler = new ViemSettler({
@@ -58,8 +76,7 @@ async function main(): Promise<void> {
     receiptTimeoutMs: cfg.receiptTimeoutMs,
     pollIntervalMs: cfg.receiptPollMs,
     gasLimitCap: cfg.gasLimitCap,
-    // The contract's per-match gas floor (MATCH_GAS_BASE + MATCH_GAS_PER_MARKET x markets).
-    gasFloorPerMatch: 400_000n + 150_000n * BigInt(marketCount),
+    gasFloorPerMatch,
     maxFeePerGasCap: cfg.maxFeePerGasCap,
   });
   const engine = new Engine({
@@ -142,6 +159,7 @@ async function main(): Promise<void> {
     operatorBalanceEth: formatEther(operatorBalance),
     confirmations: cfg.confirmations,
     store: cfg.storePath,
+    gasFloorPerMatch,
     markets: markets.map((m) => m.symbol),
   });
   if (operatorBalance < cfg.operatorMinBalance) {
