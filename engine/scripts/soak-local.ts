@@ -134,8 +134,8 @@ async function placeRandom(t: Trader, giveUpAt: number): Promise<void> {
   sent.set(hash, s);
   const x = rnd();
   const r = await submit(s, x < 0.15 ? { ioc: true } : x < 0.25 ? { postOnly: true } : {}, giveUpAt);
-  if (!r) return bump(stats.rejected, "NO_ANSWER");
-  if (r.status !== 200) return bump(stats.rejected, r.body?.error?.code ?? `HTTP_${r.status}`);
+  if (!r) return void bump(stats.rejected, "NO_ANSWER");
+  if (r.status !== 200) return void bump(stats.rejected, r.body?.error?.code ?? `HTTP_${r.status}`);
   if (r.body.orderHash !== hash) throw new Error(`engine computed another order hash: ${r.body.orderHash} vs ${hash}`);
   s.accepted = true;
   s.status = r.body.status;
@@ -283,22 +283,22 @@ async function main(): Promise<void> {
   for (const k of trades.keys()) if (!fillKeys.has(k)) fail(`engine trade without an on-chain Fill: ${k}`);
 
   // 4. positions net to zero per market; open interest is balanced
+  // Everyone who ever held a position on this (local) chain, not only this run's traders.
   const accounts = new Set<`0x${string}`>(traders.map((t) => t.address));
-  for (const l of fillLogs) {
+  for (const l of await pub.getContractEvents({ address: dep.exchange, abi, eventName: "Fill", fromBlock: 0n, toBlock: head, strict: true })) {
     accounts.add(l.args.maker);
     accounts.add(l.args.taker);
   }
-  for (const l of liquidations) {
+  for (const l of await pub.getContractEvents({ address: dep.exchange, abi, eventName: "Liquidation", fromBlock: 0n, toBlock: head, strict: true })) {
     accounts.add(l.args.trader);
     accounts.add(l.args.liquidator);
   }
   for (const m of dep.markets) {
     let sum = 0n;
     for (const a of accounts) sum += (await pub.readContract({ address: dep.exchange, abi, functionName: "getPosition", args: [a, m.marketId] })).size;
-    // Accounts that traded before this run started are not in the set: compare with open interest instead.
+    if (sum !== 0n) fail(`market ${m.marketId}: positions sum to ${sum}, not 0`);
     const [longs, shorts] = await pub.readContract({ address: dep.exchange, abi, functionName: "openInterest", args: [m.marketId] });
     if (longs !== shorts) fail(`market ${m.marketId}: open interest longs ${longs} != shorts ${shorts}`);
-    if (startBlock <= 30n && sum !== 0n) fail(`market ${m.marketId}: positions sum to ${sum}, not 0`);
   }
 
   // 5. engine health

@@ -343,6 +343,8 @@ export class Engine extends EventEmitter<EngineEvents> {
   private chainStateAt = 0;
   private marketsAt = 0;
   private statsAt = 0;
+  /** Seconds by which the latest block's timestamp is ahead of this host's clock (>= 0). */
+  private chainTimeLead = 0n;
   private readonly statsRefreshMs: number;
   private readonly fundingInterval: bigint;
   private insuranceFund: bigint | null = null;
@@ -736,6 +738,17 @@ export class Engine extends EventEmitter<EngineEvents> {
           st.index = null;
         }
       }
+      // Expiry is judged by block.timestamp. If the chain's clock is ahead of this host's
+      // (clock skew; a local node that advances a second per block), orders must be
+      // treated as expiring that much earlier, or they would reach the chain too late.
+      try {
+        const lead = (await chain.blockTimestamp()) - BigInt(this.clock());
+        const capped = lead > 900n ? 900n : lead < 0n ? 0n : lead;
+        if (lead > 900n && this.chainTimeLead < 900n) this.log.warn("chain time is far ahead of the host clock; check the clocks", { leadSeconds: lead });
+        this.chainTimeLead = capped;
+      } catch {
+        // keep the last known lead
+      }
       this.chainStateAt = Date.now();
       if (Date.now() - this.statsAt >= this.statsRefreshMs) {
         await this.refreshStats(chain);
@@ -965,7 +978,7 @@ export class Engine extends EventEmitter<EngineEvents> {
     if (order.size < market.minOrderSize) {
       throw new EngineError("BELOW_MIN_SIZE", `size is below the market minimum ${market.minOrderSize}`);
     }
-    const now = BigInt(this.clock());
+    const now = this.timeNow();
     // Nonces are a millisecond timestamp in the high bits. The contract refuses to
     // bulk-cancel beyond ((now + 1 day) * 1000) << 64, so an order above that bound
     // could never be covered by cancelAllOrders.
@@ -1283,8 +1296,13 @@ export class Engine extends EventEmitter<EngineEvents> {
     }
   }
 
+  /** "Now" for expiry purposes: the later of host time and chain time. */
+  private timeNow(): bigint {
+    return BigInt(this.clock()) + this.chainTimeLead;
+  }
+
   private bookNow(): bigint {
-    return BigInt(this.clock()) + this.expiryBuffer;
+    return this.timeNow() + this.expiryBuffer;
   }
 
   private isExpired(order: Order): boolean {

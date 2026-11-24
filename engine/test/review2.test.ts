@@ -718,3 +718,24 @@ describe("item 13: operator nonce after a restart", () => {
     expect(sent).toEqual([7, 3]);
   });
 });
+
+describe("expiry follows chain time when the chain's clock is ahead of the host's", () => {
+  it("orders are judged against the later of the two clocks", async () => {
+    const h = harness({ withChain: true, expiryBufferSec: 5 });
+    const early = await h.place(alice, true, 99, 1, { order: { expiry: 1200n } });
+    const late = await h.place(alice, true, 98, 1, { order: { expiry: 2000n } });
+    h.chain.time = 1300n; // block.timestamp is 300 s ahead of this host (clock 1000)
+    await h.engine.refreshChainState();
+    h.engine.sweepExpired();
+    expect(h.engine.getOrder(early.orderHash)!.status).toBe("expired"); // already expired for the contract
+    expect(h.engine.getOrder(late.orderHash)!.status).toBe("open");
+    expect(await code(h.place(bob, true, 97, 1, { order: { expiry: 1290n } }))).toBe("EXPIRED");
+    expect(await code(h.place(bob, true, 97, 1, { order: { expiry: 1306n } }))).toBe("OK");
+    // a chain clock behind the host's changes nothing
+    h.chain.time = 500n;
+    await h.engine.refreshChainState();
+    expect(await code(h.place(bob, true, 96, 1, { order: { expiry: 1004n } }))).toBe("EXPIRED");
+    expect(await code(h.place(bob, true, 96, 1, { order: { expiry: 1006n } }))).toBe("OK");
+  });
+});
+
