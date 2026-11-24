@@ -137,6 +137,53 @@ describe("Exchange", () => {
       await exchange.connect(multisig).setPaused(true);
     });
 
+    it("ownership cannot be renounced", async () => {
+      const { exchange, owner, stranger } = await loadFixture(deployFixture);
+      await expect(exchange.renounceOwnership()).to.be.revertedWithCustomError(exchange, "RenounceDisabled");
+      await expect(exchange.connect(stranger).renounceOwnership()).to.be.revertedWithCustomError(exchange, "OwnableUnauthorizedAccount");
+      expect(await exchange.owner()).to.equal(owner.address);
+    });
+
+    it("the owner can replace the oracle", async () => {
+      const { exchange, oracle, stranger, ctx, alice, bob } = await loadFixture(deployFixture);
+      const other = await (await ethers.getContractFactory("MockOracle")).deploy();
+      const otherAddress = await other.getAddress();
+      await expect(exchange.connect(stranger).setOracle(otherAddress)).to.be.revertedWithCustomError(exchange, "OwnableUnauthorizedAccount");
+      await expect(exchange.setOracle(ethers.ZeroAddress)).to.be.revertedWithCustomError(exchange, "ZeroAddress");
+      await expect(exchange.setOracle(stranger.address)).to.be.revertedWithCustomError(exchange, "NotAContract");
+
+      // the scenario it exists for: the current oracle reverts for good
+      await exchange.connect(alice).deposit(usdc(50_000));
+      await exchange.connect(bob).deposit(usdc(50_000));
+      await ctx.settleOk([await ctx.trade(alice, bob, ONE, BTC_PRICE)]);
+      await oracle.setBroken(true);
+      await expect(exchange.connect(alice).withdraw(1)).to.be.revertedWithCustomError(oracle, "OracleBroken");
+
+      await other.setPrice(BTC, wad(51_000));
+      await other.setPrice(ETH, wad(2_000));
+      await expect(exchange.setOracle(otherAddress)).to.emit(exchange, "OracleUpdated").withArgs(otherAddress);
+      expect(await exchange.oracle()).to.equal(otherAddress);
+      expect(await exchange.indexPrice(BTC)).to.equal(wad(51_000));
+      expect(await exchange.accountValue(alice.address)).to.equal(usdc(50_990));
+      await exchange.connect(alice).withdraw(usdc(1_000));
+    });
+
+    it("the constructor rejects an oracle without code", async () => {
+      const { exchange, token, owner } = await loadFixture(deployFixture);
+      const F = await ethers.getContractFactory("Exchange");
+      await expect(F.deploy(await token.getAddress(), owner.address, owner.address, owner.address, 60, 10, 500)).to.be.revertedWithCustomError(exchange, "NotAContract");
+    });
+
+    it("caps the number of markets", async () => {
+      const { exchange } = await loadFixture(deployFixture);
+      expect(await exchange.MAX_MARKETS()).to.equal(16);
+      for (let i = 2; i < 16; i++) await exchange.addMarket(marketConfig(`M${i}-USD`));
+      expect(await exchange.marketCount()).to.equal(16);
+      await expect(exchange.addMarket(marketConfig("ONE-TOO-MANY"))).to.be.revertedWithCustomError(exchange, "TooManyMarkets");
+      // the gas floor at the cap fits in a block many times over
+      expect((await exchange.MATCH_GAS_BASE()) + 16n * (await exchange.MATCH_GAS_PER_MARKET())).to.be.lt(10_000_000n);
+    });
+
     it("validates market parameters", async () => {
       const { exchange } = await loadFixture(deployFixture);
       const bad = [
@@ -151,6 +198,10 @@ describe("Exchange", () => {
         { maintenanceMarginBps: 505, liquidationPenaltyBps: 150 },
         { maintenanceMarginBps: 520, liquidationPenaltyBps: 150, makerFeeBps: 20 },
         { maintenanceMarginBps: 500, liquidationPenaltyBps: 150, makerFeeBps: 0, takerFeeBps: 0 },
+        // 8h of capped funding (8 * 10 bps) + band (500) must stay below the maintenance margin
+        { maintenanceMarginBps: 580, liquidationPenaltyBps: 150 },
+        { minOrderSize: 0 },
+        { maxOpenInterest: 0 },
       ];
       for (const o of bad) {
         await expect(exchange.addMarket(marketConfig("X-USD", o))).to.be.revertedWithCustomError(exchange, "InvalidMarketConfig");
@@ -428,11 +479,43 @@ describe("Exchange", () => {
       expect(await exchange.isCancelled(alice.address, 2_000)).to.equal(true);
       expect(await ctx.settleError(await ctx.match(alice, newer, bob, sell(), wad("0.05")))).to.equal("OrderIsCancelled");
 
-      // raising again kills more; the maximum value kills everything below it
-      await exchange.connect(alice).cancelAllOrders(ethers.MaxUint256);
-      const late = ctx.order(alice, true, size, BTC_PRICE, { nonce: ethers.MaxUint256 - 1n });
+      // raising again kills more
+      await exchange.connect(alice).cancelAllOrders(5_000);
+      const late = ctx.order(alice, true, size, BTC_PRICE, { nonce: 4_999 });
       expect(await ctx.settleError(await ctx.match(alice, late, bob, sell(), size))).to.equal("OrderIsCancelled");
-      await expect(exchange.connect(alice).cancelAllOrders(ethers.MaxUint256)).to.be.revertedWithCustomError(exchange, "NonceNotIncreased");
+    });
+
+    it("bulk cancel is bounded by the nonce scheme (ms timestamp << 64), so it cannot disable an account for good", async () => {
+      const { exchange, ctx, alice, bob } = await loadFixture(deployFixture);
+      await exchange.connect(alice).deposit(usdc(50_000));
+      await exchange.connect(bob).deposit(usdc(50_000));
+      const size = wad("0.1");
+      const nonceAt = (seconds: number, counter = 0n) => ((BigInt(seconds) * 1000n) << 64n) | counter;
+
+      await expect(exchange.connect(alice).cancelAllOrders(ethers.MaxUint256)).to.be.revertedWithCustomError(exchange, "NonceTooHigh");
+      const t = (await time.latest()) + 10;
+      await time.setNextBlockTimestamp(t);
+      await expect(exchange.connect(alice).cancelAllOrders(nonceAt(t + 86_400) + 1n)).to.be.revertedWithCustomError(exchange, "NonceTooHigh");
+      expect(await exchange.minValidNonce(alice.address)).to.equal(0);
+
+      // the intended use: cancel everything signed before "now"
+      const before = ctx.order(alice, true, size, BTC_PRICE, { nonce: nonceAt(t - 5, 7n) });
+      const after = ctx.order(alice, true, size, BTC_PRICE, { nonce: nonceAt(t + 5, 1n) });
+      await exchange.connect(alice).cancelAllOrders(nonceAt(t + 1));
+      const sell = () => ctx.order(bob, false, size, BTC_PRICE);
+      expect(await ctx.settleError(await ctx.match(alice, before, bob, sell(), size))).to.equal("OrderIsCancelled");
+      expect(await ctx.settleError(await ctx.match(alice, after, bob, sell(), size))).to.equal("");
+
+      // the highest accepted value is one day ahead; the account can trade again after that
+      const t2 = (await time.latest()) + 10;
+      await time.setNextBlockTimestamp(t2);
+      await exchange.connect(alice).cancelAllOrders(nonceAt(t2 + 86_400));
+      const blocked = ctx.order(alice, true, size, BTC_PRICE, { nonce: nonceAt(t2 + 3_600) });
+      expect(await ctx.settleError(await ctx.match(alice, blocked, bob, sell(), size))).to.equal("OrderIsCancelled");
+      await time.increaseTo(t2 + 86_400 + 1);
+      await ctx.oracle.setPrice(BTC, BTC_PRICE);
+      const fresh = ctx.order(alice, true, size, BTC_PRICE, { nonce: nonceAt(t2 + 86_400 + 1), expiry: t2 + 10 * 86_400 });
+      expect(await ctx.settleError(await ctx.match(alice, fresh, bob, ctx.order(bob, false, size, BTC_PRICE, { expiry: t2 + 10 * 86_400 }), size))).to.equal("");
     });
 
     it("orders must expire, at most maxOrderLifetime ahead", async () => {

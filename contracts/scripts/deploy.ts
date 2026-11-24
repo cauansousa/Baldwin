@@ -32,7 +32,9 @@ async function main() {
   const signers = await ethers.getSigners();
   const deployer = signers[0];
   const chainId = Number((await ethers.provider.getNetwork()).chainId);
-  if (chainId === 1) throw new Error("refusing to deploy mocks to mainnet");
+  // Mock collateral with an open mint and an oracle anyone can write to: local chains only.
+  // (This also keeps the script from overwriting a real deployments/<network>.json.)
+  if (chainId !== 31337) throw new Error(`deploy.ts deploys mocks and only runs on a local chain (31337), not on chain ${chainId}`);
   console.log(`network ${network.name} (chain ${chainId}), deployer ${deployer.address}`);
 
   const token = await (await ethers.getContractFactory("MockUSDC")).deploy();
@@ -97,6 +99,6 @@ async function main() {
 }
 
 main().catch((e) => {
-  console.error(e);
+  console.error(e instanceof Error ? e.message : String(e));
   process.exitCode = 1;
 });

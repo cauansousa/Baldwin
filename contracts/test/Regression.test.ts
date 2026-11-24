@@ -141,11 +141,14 @@ describe("Review regressions", () => {
 
     it("market parameters must keep a reducing fill health-neutral: band + fee < maintenance", async () => {
       const { exchange } = await loadFixture(deployFixture);
-      await expect(exchange.updateMarket(BTC, marketConfig("BTC-USD", { maintenanceMarginBps: 505 }))).to.be.revertedWithCustomError(
-        exchange,
-        "InvalidMarketConfig",
-      );
-      await exchange.updateMarket(BTC, marketConfig("BTC-USD", { maintenanceMarginBps: 506 }));
+      for (const maintenanceMarginBps of [505, 506, 580]) {
+        await expect(exchange.updateMarket(BTC, marketConfig("BTC-USD", { maintenanceMarginBps }))).to.be.revertedWithCustomError(
+          exchange,
+          "InvalidMarketConfig",
+        );
+      }
+      // 581 > 8h of capped funding (80) + band (500)
+      await exchange.updateMarket(BTC, marketConfig("BTC-USD", { maintenanceMarginBps: 581 }));
     });
   });
 

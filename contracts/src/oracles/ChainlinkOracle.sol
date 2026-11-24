@@ -36,14 +36,15 @@ contract ChainlinkOracle is IOracle, Ownable2Step {
 
     /// @notice Chainlink L2 sequencer uptime feed (answer 0 = up, 1 = down);
     ///         address(0) disables the check (L1, or chains without such a feed).
-    AggregatorV3Interface public immutable sequencerUptimeFeed;
+    AggregatorV3Interface public sequencerUptimeFeed;
     /// @notice Seconds after the sequencer came back up during which prices are still
     ///         rejected, so that feeds and users can catch up before liquidations resume.
-    uint256 public immutable sequencerGracePeriod;
+    uint256 public sequencerGracePeriod;
 
     mapping(uint32 marketId => Feed) private _feeds;
 
     event FeedSet(uint32 indexed marketId, address aggregator, uint8 decimals, uint32 maxStaleness);
+    event SequencerUptimeFeedSet(address indexed feed, uint256 gracePeriod);
 
     error FeedNotSet(uint32 marketId);
     error InvalidFeed();
@@ -51,10 +52,29 @@ contract ChainlinkOracle is IOracle, Ownable2Step {
     error FeedStale(uint32 marketId, uint256 updatedAt);
     error SequencerDown();
     error SequencerGracePeriodNotOver();
+    error RenounceDisabled();
 
     constructor(address owner_, address sequencerUptimeFeed_, uint256 sequencerGracePeriod_) Ownable(owner_) {
-        sequencerUptimeFeed = AggregatorV3Interface(sequencerUptimeFeed_);
-        sequencerGracePeriod = sequencerGracePeriod_;
+        _setSequencerUptimeFeed(sequencerUptimeFeed_, sequencerGracePeriod_);
+    }
+
+    /// @notice Set, replace or (with address(0)) disable the sequencer uptime check and
+    ///         its grace period. This is the way out if the uptime feed itself breaks,
+    ///         which would otherwise make every price unavailable for good.
+    function setSequencerUptimeFeed(address feed, uint256 gracePeriod) external onlyOwner {
+        _setSequencerUptimeFeed(feed, gracePeriod);
+    }
+
+    function _setSequencerUptimeFeed(address feed, uint256 gracePeriod) private {
+        if (feed != address(0) && feed.code.length == 0) revert InvalidFeed();
+        sequencerUptimeFeed = AggregatorV3Interface(feed);
+        sequencerGracePeriod = gracePeriod;
+        emit SequencerUptimeFeedSet(feed, gracePeriod);
+    }
+
+    /// @notice Disabled: without an owner a broken feed could never be replaced.
+    function renounceOwnership() public view override onlyOwner {
+        revert RenounceDisabled();
     }
 
     /// @notice Set (or replace) the feed of a market. Decimals are read once and cached.
@@ -103,8 +123,9 @@ contract ChainlinkOracle is IOracle, Ownable2Step {
     ///      can be stale without looking stale; right after it comes back, users need
     ///      time to react before their positions are judged at the new prices.
     function _requireSequencerUp() private view {
-        if (address(sequencerUptimeFeed) == address(0)) return;
-        (, int256 answer, uint256 startedAt, , ) = sequencerUptimeFeed.latestRoundData();
+        AggregatorV3Interface uptimeFeed = sequencerUptimeFeed;
+        if (address(uptimeFeed) == address(0)) return;
+        (, int256 answer, uint256 startedAt, , ) = uptimeFeed.latestRoundData();
         // startedAt == 0: the uptime feed has not been initialized on this chain yet.
         if (answer != 0 || startedAt == 0 || startedAt > block.timestamp) revert SequencerDown();
         if (block.timestamp - startedAt <= sequencerGracePeriod) revert SequencerGracePeriodNotOver();

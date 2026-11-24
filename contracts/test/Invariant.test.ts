@@ -220,7 +220,7 @@ describe("Solvency invariant (randomized)", function () {
       // shorts at the index price. Afterwards only cash balances remain.
       await refreshPrices();
       for (const m of MARKETS) {
-        const cfg = marketConfig(m === BTC ? "BTC-USD" : "ETH-USD", { minOrderSize: 0, maxOpenInterest: wad(1_000_000) });
+        const cfg = marketConfig(m === BTC ? "BTC-USD" : "ETH-USD", { minOrderSize: 1, maxOpenInterest: wad(1_000_000) });
         await exchange.updateMarket(m, cfg);
       }
       const everyone = [...traders, liquidator];

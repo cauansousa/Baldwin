@@ -145,6 +145,43 @@ describe("ChainlinkOracle", () => {
     });
   });
 
+  it("the owner can replace or disable the sequencer feed, e.g. when it breaks", async () => {
+    const { oracle, Agg, sequencer, stranger } = await deploy(true);
+    const agg = await Agg.deploy(8);
+    await oracle.setFeed(0, await agg.getAddress(), HEARTBEAT);
+    await agg.set(5_000_000_000_000n, await time.latest());
+    // the uptime feed gets stuck reporting "down" (or reverting): every price is gone
+    const now = await time.latest();
+    await sequencer.setRound(1, now, now);
+    await expect(oracle.getPrice(0)).to.be.revertedWithCustomError(oracle, "SequencerDown");
+
+    await expect(oracle.connect(stranger).setSequencerUptimeFeed(ethers.ZeroAddress, 0)).to.be.revertedWithCustomError(oracle, "OwnableUnauthorizedAccount");
+    await expect(oracle.setSequencerUptimeFeed(stranger.address, GRACE)).to.be.revertedWithCustomError(oracle, "InvalidFeed");
+
+    await expect(oracle.setSequencerUptimeFeed(ethers.ZeroAddress, 0)).to.emit(oracle, "SequencerUptimeFeedSet").withArgs(ethers.ZeroAddress, 0);
+    expect(await oracle.sequencerUptimeFeed()).to.equal(ethers.ZeroAddress);
+    expect((await oracle.getPrice(0))[0]).to.equal(wad(50_000));
+
+    // a replacement feed with a different grace period
+    const replacement = await Agg.deploy(0);
+    const t = await time.latest();
+    await replacement.setRound(0, t - 100, t);
+    await expect(oracle.setSequencerUptimeFeed(await replacement.getAddress(), 50))
+      .to.emit(oracle, "SequencerUptimeFeedSet")
+      .withArgs(await replacement.getAddress(), 50);
+    expect(await oracle.sequencerGracePeriod()).to.equal(50);
+    expect((await oracle.getPrice(0))[0]).to.equal(wad(50_000));
+    await oracle.setSequencerUptimeFeed(await replacement.getAddress(), 10_000);
+    await expect(oracle.getPrice(0)).to.be.revertedWithCustomError(oracle, "SequencerGracePeriodNotOver");
+  });
+
+  it("ownership cannot be renounced", async () => {
+    const { oracle, owner, stranger } = await deploy();
+    await expect(oracle.renounceOwnership()).to.be.revertedWithCustomError(oracle, "RenounceDisabled");
+    await expect(oracle.connect(stranger).renounceOwnership()).to.be.revertedWithCustomError(oracle, "OwnableUnauthorizedAccount");
+    expect(await oracle.owner()).to.equal(owner.address);
+  });
+
   it("only the owner sets feeds; ownership moves in two steps", async () => {
     const { oracle, Agg, stranger, multisig, owner } = await deploy();
     const agg = await Agg.deploy(8);
