@@ -175,7 +175,8 @@ describe("Review 2 regressions", () => {
       expect(await exchange.isLiquidatableIn(carol.address, BTC)).to.equal(false);
       await expect(exchange.connect(liquidator).liquidate(carol.address, BTC, MAX)).to.be.revertedWithCustomError(exchange, "NotLiquidatable");
 
-      // the ETH price goes stale: ETH is valued at entry, 14,986 - 9,000 vs 4,100 + 2,000
+      // the ETH price goes stale: ETH is valued at the last price a transaction saw (the
+      // 2,000 of her own fill), 14,986 - 9,000 vs 4,100 + 2,000
       await time.increase(HOUR + 1);
       await oracle.setPrice(BTC, wad(41_000));
       expect(await exchange.isLiquidatableIn(carol.address, BTC)).to.equal(true);
@@ -271,19 +272,20 @@ describe("Review 2 regressions", () => {
       const { exchange, oracle, ctx, alice, bob } = f;
       await exchange.connect(alice).deposit(usdc(5_000));
       await exchange.connect(bob).deposit(usdc(100_000));
-      // 10 ETH long, 1% above the index: needs 4,000 initial margin, value ~4,796
+      // 10 ETH long, 1% above the index: needs 4,000 initial margin, value 4,795.96
       await ctx.settleOk([await ctx.trade(alice, bob, wad(10), wad(2_020), { marketId: ETH })]);
-      await time.increase(8 * HOUR);
+      await time.increase(2 * HOUR);
       await oracle.setPrice(BTC, BTC_PRICE);
       await oracle.setPrice(ETH, ETH_PRICE);
-      // 8h at 10 bps on 20,000 = 160 of funding are due but not accrued: the view still
-      // shows 795.96 free, enough for 0.07 BTC (700 margin + fee) ...
+      // One hour at the cap (10 bps of 20,000 = 20) is due on the ETH long but not accrued:
+      // the view still shows 795.96 free, enough for 0.079 BTC (790 margin + 0.79 fee) ...
       expect(await exchange.freeCollateral(alice.address)).to.equal(usdc("795.96"));
-      // ... but the fill accrues ETH funding first, and 635.96 is not enough
-      expect(await ctx.settleError(await ctx.trade(alice, bob, wad("0.07"), BTC_PRICE))).to.equal("InsufficientMargin");
+      // ... but the fill accrues ETH funding first, and 775.96 is not enough
+      expect(await ctx.settleError(await ctx.trade(alice, bob, wad("0.079"), BTC_PRICE))).to.equal("InsufficientMargin");
       expect(await exchange.cumulativeFunding(ETH)).to.equal(0); // the failed match left no trace
-      expect(await ctx.settleError(await ctx.trade(alice, bob, wad("0.06"), BTC_PRICE))).to.equal("");
-      expect(await exchange.cumulativeFunding(ETH)).to.equal(wad(16));
+      expect(await ctx.settleError(await ctx.trade(alice, bob, wad("0.07"), BTC_PRICE))).to.equal("");
+      // 2 USD per ETH: one hour's worth, spread over the two hours since the fill
+      expect(await exchange.cumulativeFunding(ETH)).to.be.closeTo(wad(2), wad("0.001"));
     });
 
     it("a liquidation accrues the other markets of both accounts", async () => {
@@ -296,15 +298,15 @@ describe("Review 2 regressions", () => {
         await ctx.trade(alice, bob, ONE, BTC_PRICE),
         await ctx.trade(alice, bob, wad(10), wad(2_020), { marketId: ETH }),
       ]);
-      await time.increase(8 * HOUR);
+      await time.increase(2 * HOUR);
       await oracle.setPrice(ETH, ETH_PRICE);
-      // balance 14,985.96; ETH -200; BTC at 42,000: -8,000 -> 6,785.96 vs maintenance 4,200 + 2,000.
-      // Healthy before the 160 of ETH funding that is due ...
-      await oracle.setPrice(BTC, wad(41_400)); // -8,600 -> 6,185.96 vs 6,140: still healthy without funding
+      // balance 14,985.96; ETH -200; BTC at 41,360: -8,640 -> 6,145.96 vs maintenance 4,136 + 2,000.
+      // Healthy before the 20 of ETH funding that is due ...
+      await oracle.setPrice(BTC, wad(41_360));
       expect(await exchange.isLiquidatable(alice.address)).to.equal(false);
-      // ... but liquidate() accrues it first: 6,025.96 < 6,140
+      // ... but liquidate() accrues it first: 6,125.96 < 6,136
       await expect(exchange.connect(liquidator).liquidate(alice.address, BTC, MAX)).to.emit(exchange, "Liquidation");
-      expect(await exchange.cumulativeFunding(ETH)).to.equal(wad(16));
+      expect(await exchange.cumulativeFunding(ETH)).to.be.closeTo(wad(2), wad("0.001"));
     });
   });
 });

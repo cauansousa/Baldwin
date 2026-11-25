@@ -63,12 +63,16 @@ services:
     depends_on:
       engine:
         condition: service_started
+    # Compose does not restart a container for being "unhealthy". The keeper therefore
+    # exits by itself when its ticks stop completing (KEEPER_STUCK_EXIT_MS), and
+    # `restart: unless-stopped` starts a fresh one. This check only reports: /health is
+    # 503 while the event scan has not reached the head or the engine does not answer.
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:9100/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s
       timeout: 5s
       retries: 4
-      start_period: 30s
+      start_period: 120s
 
 volumes:
   engine-data:

@@ -3,7 +3,7 @@
 import { expect } from "chai";
 import { ethers } from "hardhat";
 import { loadFixture, takeSnapshot, time } from "@nomicfoundation/hardhat-network-helpers";
-import { BTC, BTC_PRICE, Ctx, ETH, HOUR, MAX_PRICE_AGE, deployFixture, marketConfig, usdc, wad } from "./helpers";
+import { BTC, BTC_PRICE, Ctx, ETH, HOUR, MAX_PRICE_AGE, deployFixture, marketConfig, startNewFundingPeriodAtNextFill, usdc, wad } from "./helpers";
 
 const ONE = wad(1);
 const MAX = ethers.MaxUint256;
@@ -225,10 +225,11 @@ describe("Review regressions", () => {
         last += HOUR;
       }
       const lost = before - (await exchange.accountValue(alice.address));
-      // 24 x (5% x 1/3600 of 50,000) = 16.67 USDC. With the last fill as the mark the same
-      // fills cost her the capped rate all day: 24 x 50 = 1,200 USDC.
-      expect(lost).to.be.gt(usdc(16));
-      expect(lost).to.be.lt(usdc(17));
+      // Each of those fills stood for one second: 24 x (cap / 3600 of 50,000) = 0.33 USDC.
+      // With the last fill as the mark the same fills cost her the capped rate all day:
+      // 24 x 50 = 1,200 USDC.
+      expect(lost).to.be.gt(usdc("0.33"));
+      expect(lost).to.be.lt(usdc("0.34"));
     });
 
     it("small fills are only for completing an order or closing a position", async () => {
@@ -279,21 +280,31 @@ describe("Review regressions", () => {
 
   describe("L: withdraw accrues funding first", () => {
     it("free collateral cannot be withdrawn just before due funding is charged", async () => {
-      const { exchange, oracle, ctx, alice, bob } = await loadFixture(deployFixture);
+      const f = await loadFixture(deployFixture);
+      const { exchange, oracle, ctx, alice, bob } = f;
       await exchange.connect(alice).deposit(usdc(20_000));
       await exchange.connect(bob).deposit(usdc(20_000));
-      // long opened 5% above the index: the premium is at the cap (10 bps per hour)
+      // long opened 5% above the index, at the start of a funding period: the premium is
+      // at the cap (10 bps per hour)
+      await startNewFundingPeriodAtNextFill(f);
       await ctx.settleOk([await ctx.trade(alice, bob, ONE, wad(52_500))]);
-      await time.increase(8 * HOUR);
+      const t0 = Number(await exchange.lastFundingTime(BTC));
+      await time.setNextBlockTimestamp(t0 + HOUR - 1);
       await oracle.setPrice(BTC, BTC_PRICE);
 
       // The view does not know about funding that is due but not accrued yet ...
       const staleFree = await exchange.freeCollateral(alice.address);
-      // ... but withdraw accrues it first: 8h * 50 USDC = 400 are owed.
+      // ... but withdraw accrues it first: one hour at the cap = 50 USDC are owed.
+      const snapshot = await takeSnapshot();
+      await time.setNextBlockTimestamp(t0 + HOUR);
       await expect(exchange.connect(alice).withdraw(staleFree)).to.be.revertedWithCustomError(exchange, "InsufficientFreeCollateral");
-      await expect(exchange.connect(alice).withdraw(staleFree - usdc(400) + 1n)).to.be.revertedWithCustomError(exchange, "InsufficientFreeCollateral");
-      await expect(exchange.connect(alice).withdraw(staleFree - usdc(400))).to.emit(exchange, "FundingUpdated");
-      expect(await exchange.cumulativeFunding(BTC)).to.equal(wad(400));
+      await snapshot.restore();
+      await time.setNextBlockTimestamp(t0 + HOUR);
+      await expect(exchange.connect(alice).withdraw(staleFree - usdc(50) + 1n)).to.be.revertedWithCustomError(exchange, "InsufficientFreeCollateral");
+      await snapshot.restore();
+      await time.setNextBlockTimestamp(t0 + HOUR);
+      await expect(exchange.connect(alice).withdraw(staleFree - usdc(50))).to.emit(exchange, "FundingUpdated");
+      expect(await exchange.cumulativeFunding(BTC)).to.equal(wad(50));
       const [initial] = await exchange.marginRequirement(alice.address);
       expect(await exchange.accountValue(alice.address)).to.equal(initial);
       expect(await exchange.freeCollateral(alice.address)).to.equal(0);

@@ -10,14 +10,18 @@
 #
 # NOTE: written without a Docker daemon at hand; see the README ("Docker").
 
+# Pinned to a patch release: the engine needs node:sqlite (Node >= 22.13), and a moving
+# tag would change the runtime under a long-lived deployment.
+ARG NODE_IMAGE=node:22.14.0-slim
+
 # ---- production dependencies only (tsx is a runtime dependency: sources run as TypeScript)
-FROM node:22-slim AS deps
+FROM ${NODE_IMAGE} AS deps
 WORKDIR /app/engine
 COPY engine/package.json engine/package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
 # ---- runtime
-FROM node:22-slim
+FROM ${NODE_IMAGE}
 ENV NODE_ENV=production
 WORKDIR /app/engine
 COPY --from=deps /app/engine/node_modules ./node_modules
@@ -38,7 +42,9 @@ ENV STORE_PATH=/data/engine.sqlite \
 USER node
 EXPOSE 8080
 
-# node is PID 1 and handles SIGTERM itself (graceful shutdown); give it more than
+# The process handles SIGTERM itself (graceful shutdown). With `docker run --init` or
+# compose's `init: true` (as in docker-compose.testnet.yml) tini is PID 1 and forwards
+# the signal; without it node is PID 1, which also works. Either way give it more than
 # SHUTDOWN_TIMEOUT_MS before SIGKILL (docker stop -t 45, or stop_grace_period).
 ENTRYPOINT ["node", "--disable-warning=ExperimentalWarning", "--import", "tsx"]
 CMD ["src/main.ts"]

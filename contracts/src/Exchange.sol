@@ -120,10 +120,11 @@ contract Exchange is IExchange, Ownable2Step, ReentrancyGuard, EIP712 {
         // --- one slot: premium bookkeeping of the current funding period, see _recordFill ---
         uint64 periodFirstFillTime; // 0 = no fill in this period yet
         uint64 lastFillTime;
-        uint64 liveTime; // seconds of the period covered by completed fill-to-fill segments
+        // sum of clamp(premium, ±rate cap) * seconds over the completed fill-to-fill segments
+        int128 cappedPremiumTimeSum;
         // --- one slot ---
         int128 lastPremium; // (price - index) / index of the last fill, WAD, at the index of that moment
-        int128 premiumTimeSum; // sum of premium * seconds over the completed fill-to-fill segments
+        int128 premiumTimeSum; // sum of premium * seconds over the completed segments (for markTwap)
     }
 
     Market[] private _markets;
@@ -693,7 +694,7 @@ contract Exchange is IExchange, Ownable2Step, ReentrancyGuard, EIP712 {
         state.lastFundingTime = block.timestamp;
         if (state.periodFirstFillTime != 0) {
             state.periodFirstFillTime = 0;
-            state.liveTime = 0;
+            state.cappedPremiumTimeSum = 0;
             state.premiumTimeSum = 0;
         }
         emit FundingUpdated(marketId, rateWad / BPS_WAD, state.cumulativeFunding, block.timestamp);
@@ -722,9 +723,9 @@ contract Exchange is IExchange, Ownable2Step, ReentrancyGuard, EIP712 {
         if (state.periodFirstFillTime == 0) {
             state.periodFirstFillTime = uint64(block.timestamp);
         } else {
-            uint256 weight = _lastFillWeight(state);
-            state.liveTime += uint64(weight);
-            state.premiumTimeSum += (int256(state.lastPremium) * weight.toInt256()).toInt128();
+            int256 weight = _lastFillWeight(state).toInt256();
+            state.premiumTimeSum += (int256(state.lastPremium) * weight).toInt128();
+            state.cappedPremiumTimeSum += (_capPremium(state.lastPremium) * weight).toInt128();
         }
         state.lastFillTime = uint64(block.timestamp);
         state.lastPremium = (((price.toInt256() - index.toInt256()) * WAD) / index.toInt256()).toInt128();
@@ -736,47 +737,52 @@ contract Exchange is IExchange, Ownable2Step, ReentrancyGuard, EIP712 {
         return Math.min(block.timestamp - state.lastFillTime, FUNDING_INTERVAL);
     }
 
-    /// @dev Premium statistics of the current funding period so far.
+    /// @dev clamp(premium, ± maxFundingRateBps), WAD.
+    function _capPremium(int256 premium) private view returns (int256) {
+        int256 cap = maxFundingRateBps.toInt256() * BPS_WAD;
+        if (premium > cap) return cap;
+        if (premium < -cap) return -cap;
+        return premium;
+    }
+
+    /// @dev Time-weighted average premium (WAD) of the current funding period so far,
+    ///      uncapped. Informational (markTwap); the funding rate is _fundingRate.
     ///
-    ///        average  = sum(premium_i * weight_i) / T      T = time since the period started
-    ///        liveTime = sum(weight_i)
+    ///        average = sum(premium_i * weight_i) / T       T = time since the period started
     ///
     ///      weight_i is the time from fill i to the next fill (for the last fill: to now),
     ///      capped at FUNDING_INTERVAL. All other time - before the period's first fill,
-    ///      beyond the cap, a whole period without fills - is not "live": it counts as
-    ///      zero premium, and nothing is carried over from an earlier period.
-    function _premiumStats(
-        MarketState storage state
-    ) private view returns (int256 average, uint256 liveTime, uint256 period) {
-        period = block.timestamp - state.lastFundingTime;
-        if (state.periodFirstFillTime == 0 || period == 0) return (0, 0, period);
-        uint256 weight = _lastFillWeight(state);
-        liveTime = state.liveTime + weight;
-        average = (int256(state.premiumTimeSum) + int256(state.lastPremium) * weight.toInt256()) / period.toInt256();
+    ///      beyond the cap, a whole period without fills - counts as zero premium, and
+    ///      nothing is carried over from an earlier period.
+    function _averagePremium(MarketState storage state) private view returns (int256) {
+        uint256 period = block.timestamp - state.lastFundingTime;
+        if (state.periodFirstFillTime == 0 || period == 0) return 0;
+        int256 weight = _lastFillWeight(state).toInt256();
+        return (int256(state.premiumTimeSum) + int256(state.lastPremium) * weight) / period.toInt256();
     }
 
     /// @dev Funding rate of the current period, WAD per hour:
     ///
-    ///        rate = clamp(average premium, ± maxFundingRate * liveTime / T)
+    ///        rate = sum(clamp(premium_i, ± maxFundingRate) * weight_i) / T
     ///
-    ///      i.e. the time-weighted average premium, limited to the rate cap for the part
-    ///      of the period in which there was a live price observation. Scaling the cap by
-    ///      liveTime / T means a fill can never earn more than the capped rate for the
-    ///      time its premium actually stood: a fill one second before the accrual moves
-    ///      the hourly rate by at most cap / 3600, and if nobody accrues for hours after
-    ///      the last fill, that fill is charged for one interval at most, not for the gap.
-    ///
-    ///      Other consequences of the weighting: fills in the same block as a later fill
-    ///      have no weight; an index that drifts while trades happen at the index produces
-    ///      no funding. A fill early in an otherwise quiet period does carry that period
-    ///      (see README, known limitations).
-    function _fundingRate(MarketState storage state) private view returns (int256 rateWad) {
-        (int256 average, uint256 liveTime, uint256 period) = _premiumStats(state);
-        if (liveTime == 0) return 0;
-        int256 cap = (maxFundingRateBps.toInt256() * BPS_WAD * liveTime.toInt256()) / period.toInt256();
-        rateWad = average;
-        if (rateWad > cap) rateWad = cap;
-        if (rateWad < -cap) rateWad = -cap;
+    ///      with the weights of _averagePremium. Every observation is capped before it is
+    ///      averaged, so the rate is within ± maxFundingRate, and a fill can never earn
+    ///      more than the capped rate for the time its premium actually stood:
+    ///       - a fill one second before the accrual moves the hourly rate by at most
+    ///         cap / 3600, however far from the index it was;
+    ///       - a fill at the edge of the band that is followed by a fair fill a minute
+    ///         later counts for one minute at the cap, not for the average of a 5% premium;
+    ///       - if nobody accrues for hours after the last fill, that fill is charged for
+    ///         one interval at most, not for the gap;
+    ///       - fills in the same block as a later fill have no weight, and an index that
+    ///         drifts while trades happen at the index produces no funding.
+    ///      A fill early in an otherwise quiet period does carry that period (see README,
+    ///      known limitations).
+    function _fundingRate(MarketState storage state) private view returns (int256) {
+        uint256 period = block.timestamp - state.lastFundingTime;
+        if (state.periodFirstFillTime == 0 || period == 0) return 0;
+        int256 weight = _lastFillWeight(state).toInt256();
+        return (int256(state.cappedPremiumTimeSum) + _capPremium(state.lastPremium) * weight) / period.toInt256();
     }
 
     /// @dev Accrues funding in every market in which the account has a position.
@@ -1130,8 +1136,7 @@ contract Exchange is IExchange, Ownable2Step, ReentrancyGuard, EIP712 {
         _requireMarket(marketId);
         (uint256 index, bool usable) = _tryFreshPrice(marketId);
         if (!usable) return 0;
-        (int256 average, , ) = _premiumStats(_marketState[marketId]);
-        return ((index.toInt256() * (WAD + average)) / WAD).toUint256();
+        return ((index.toInt256() * (WAD + _averagePremium(_marketState[marketId]))) / WAD).toUint256();
     }
 
     /// @inheritdoc IExchange

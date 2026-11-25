@@ -1047,13 +1047,11 @@ describe("Exchange", () => {
 
     it("uses the uncapped premium when it is inside the cap", async () => {
       const { exchange, accrueAt, t0, expectedRate } = await fundingFixture(wad(50_025));
-      // premium 5 bps for all of the hour except the few seconds before the fill
-      const rate = expectedRate(HOUR);
-      expect(rate).to.be.lt(5n * 10n ** 14n);
-      expect(rate).to.be.gt(49n * 10n ** 13n);
+      // premium 5 bps for the whole hour
+      expect(expectedRate(HOUR)).to.equal(5n * 10n ** 14n);
       await expect(accrueAt(HOUR))
         .to.emit(exchange, "FundingUpdated")
-        .withArgs(BTC, rate / 10n ** 14n, (BTC_PRICE * rate) / 10n ** 18n, t0 + HOUR);
+        .withArgs(BTC, 5, wad(25), t0 + HOUR);
     });
 
     it("no premium, no funding", async () => {
@@ -1061,22 +1059,43 @@ describe("Exchange", () => {
       await expect(accrueAt(HOUR)).to.emit(exchange, "FundingUpdated").withArgs(BTC, 0, 0, t0 + HOUR);
     });
 
-    it("charges pro rata for the elapsed time, up to 8 hours", async () => {
+    it("a fill's premium counts for one interval at most, however late the accrual", async () => {
+      const cum = (rate: bigint, seconds: number) => (BTC_PRICE * rate * BigInt(Math.min(seconds, 8 * HOUR))) / (10n ** 18n * BigInt(HOUR));
+      // Accrued half an hour late: the 1% premium stood for one hour of the 1.5, so the
+      // cap is scaled to 2/3 and the charge is one hour at the cap, not one and a half.
       const a = await fundingFixture(wad(50_500));
       await a.accrueAt(HOUR + HOUR / 2);
-      expect(await a.exchange.cumulativeFunding(BTC)).to.equal(wad(75));
+      const rateA = a.expectedRate(HOUR + HOUR / 2);
+      expect(rateA).to.equal((10n ** 15n * 2n) / 3n);
+      expect(await a.exchange.cumulativeFunding(BTC)).to.equal(cum(rateA, HOUR + HOUR / 2));
+      expect(await a.exchange.cumulativeFunding(BTC)).to.be.closeTo(wad(50), 10n ** 9n);
       // The premium is not carried into the next period: no fill, no funding.
+      const before = await a.exchange.cumulativeFunding(BTC);
       await a.accrueAt(2 * HOUR + HOUR / 2);
-      expect(await a.exchange.cumulativeFunding(BTC)).to.equal(wad(75));
+      expect(await a.exchange.cumulativeFunding(BTC)).to.equal(before);
       expect(await a.exchange.markPrice(BTC)).to.equal(wad(50_500)); // the last fill is still reported
 
-      // Nobody accrues for 20 hours. The fill's 1% premium counts for one hour only, so
-      // the average over the gap is 1% / 20 = 5 bps, charged for the 8 hours at most.
+      // Nobody accrues for 20 hours: still one hour's worth of premium, spread over the
+      // gap (rate = cap / 20) and charged for 8 of the 20 hours at most.
       const b = await fundingFixture(wad(50_500));
       await b.accrueAt(20 * HOUR);
-      const rate = b.expectedRate(20 * HOUR);
-      expect(rate).to.equal(5n * 10n ** 14n);
-      expect(await b.exchange.cumulativeFunding(BTC)).to.equal(wad(200));
+      const rateB = b.expectedRate(20 * HOUR);
+      expect(rateB).to.equal(10n ** 15n / 20n);
+      expect(await b.exchange.cumulativeFunding(BTC)).to.equal(wad(20));
+
+      // Five hours with a second fill after two: each fill counts for its own hour.
+      const c = await fundingFixture(wad(50_500));
+      await time.setNextBlockTimestamp(c.t0 + 2 * HOUR - 1);
+      await c.oracle.setPrice(BTC, BTC_PRICE);
+      const m = await c.ctx.trade(c.alice, c.bob, wad("0.001"), wad(50_500));
+      await time.setNextBlockTimestamp(c.t0 + 2 * HOUR);
+      await c.ctx.settleOk([m]); // accrues the first two hours (one live), then opens a period
+      expect(await c.exchange.cumulativeFunding(BTC)).to.be.closeTo(wad(50), 10n ** 9n);
+      await time.setNextBlockTimestamp(c.t0 + 5 * HOUR - 1);
+      await c.oracle.setPrice(BTC, BTC_PRICE);
+      await time.setNextBlockTimestamp(c.t0 + 5 * HOUR);
+      await c.exchange.updateFunding(BTC); // three hours, one of them live
+      expect(await c.exchange.cumulativeFunding(BTC)).to.be.closeTo(wad(100), 10n ** 9n);
     });
 
     it("the premium is fixed when the fill happens; the index at accrual only prices the payment", async () => {
@@ -1112,39 +1131,49 @@ describe("Exchange", () => {
         expect(await exchange.markPrice(BTC)).to.equal(0);
       });
 
-      it("weights each fill by the time until the next one; time before the first counts at the index", async () => {
+      it("weights each fill's premium by the time until the next one; time before the first counts as zero", async () => {
         const { exchange, t0, fillAt, refreshAt } = await quiet();
-        await fillAt(600, wad(50_060));
-        await fillAt(1_800, wad(50_030));
+        await fillAt(600, wad(50_040)); // +8 bps
+        await fillAt(1_800, wad(50_030)); // +6 bps
         await refreshAt(3_599);
         await time.setNextBlockTimestamp(t0 + 3_600);
         const tx = await exchange.updateFunding(BTC);
-        // 600s at 50,000 + 1,200s at 50,060 + 1,800s at 50,030 = 50,035
-        const twap = (wad(50_000) * 600n + wad(50_060) * 1_200n + wad(50_030) * 1_800n) / 3_600n;
-        expect(twap).to.equal(wad(50_035));
-        const rate = ((twap - BTC_PRICE) * 10n ** 18n) / BTC_PRICE; // 7 bps
+        // 600s nothing, 1,200s at 8 bps, 1,800s at 6 bps
+        const rate = (8n * 10n ** 14n * 1_200n + 6n * 10n ** 14n * 1_800n) / 3_600n;
+        expect(rate).to.equal(566_666_666_666_666n); // 5.67 bps
         await expect(tx)
           .to.emit(exchange, "FundingUpdated")
-          .withArgs(BTC, rate / 10n ** 14n, (BTC_PRICE * rate) / 10n ** 18n, t0 + 3_600);
-        expect(rate).to.equal(7n * 10n ** 14n);
-        expect(await exchange.cumulativeFunding(BTC)).to.equal(wad(35));
+          .withArgs(BTC, 5, (BTC_PRICE * rate) / 10n ** 18n, t0 + 3_600);
         // the new period starts clean
         expect(await exchange.markTwap(BTC)).to.equal(BTC_PRICE);
         expect(await exchange.currentFundingRate(BTC)).to.equal(0);
       });
 
+      it("caps every observation before averaging; markTwap stays uncapped", async () => {
+        const { exchange, t0, fillAt } = await quiet();
+        await fillAt(600, wad(50_100)); // +20 bps, twice the cap
+        await fillAt(1_800, wad(50_030)); // +6 bps
+        await time.increaseTo(t0 + 3_000);
+        // uncapped average: (20 * 1200 + 6 * 1200) / 3000 = 10.4 bps -> 50,052
+        expect(await exchange.markTwap(BTC)).to.equal(wad(50_052));
+        // rate: (10 * 1200 + 6 * 1200) / 3000 = 6.4 bps, although the average premium is above the cap
+        expect(await exchange.currentFundingRate(BTC)).to.equal(64n * 10n ** 13n);
+      });
+
       it("the views follow the period as it goes", async () => {
         const { exchange, t0, fillAt } = await quiet();
-        await fillAt(600, wad(50_100));
+        await fillAt(600, wad(50_100)); // 20 bps over the index
         // right after the fill it has no weight yet
         expect(await exchange.markTwap(BTC)).to.equal(BTC_PRICE);
+        expect(await exchange.currentFundingRate(BTC)).to.equal(0);
         await time.increaseTo(t0 + 1_200);
-        // 600s at the index, 600s at 50,100
+        // 600s without a fill, 600s at +20 bps: average 10 bps
         expect(await exchange.markTwap(BTC)).to.equal(wad(50_050));
-        expect(await exchange.currentFundingRate(BTC)).to.equal(10n ** 15n); // 10 bps: exactly at the cap
+        // the cap (10 bps) applies to the live half of the period only
+        expect(await exchange.currentFundingRate(BTC)).to.equal(5n * 10n ** 14n);
         await time.increaseTo(t0 + 3_000);
         expect(await exchange.markTwap(BTC)).to.equal(wad(50_080));
-        expect(await exchange.currentFundingRate(BTC)).to.equal(10n ** 15n); // clamped
+        expect(await exchange.currentFundingRate(BTC)).to.equal(8n * 10n ** 14n); // cap * 2400 / 3000
         expect(await exchange.markPrice(BTC)).to.equal(wad(50_100));
       });
 
@@ -1178,12 +1207,12 @@ describe("Exchange", () => {
         expect(await exchange.markPrice(BTC)).to.equal(wad(52_500));
         await time.setNextBlockTimestamp(t0 + 3_600);
         await exchange.updateFunding(BTC);
-        // 5% for 1 of 3,600 seconds = 0.139 bps per hour; the cap is 10 bps, and with the
-        // last fill as the mark this fill alone would have produced the full 10 bps.
-        const rate = (((wad(52_500) - BTC_PRICE) / 3_600n) * 10n ** 18n) / BTC_PRICE;
+        // The premium stood for 1 of 3,600 seconds, so at most 1/3600 of the cap applies:
+        // 0.0028 bps per hour, 1.4 cents per BTC. With the last fill as the mark this fill
+        // alone produced the full 10 bps (50 USD per BTC).
+        const rate = 10n ** 15n / 3_600n;
         expect(await exchange.cumulativeFunding(BTC)).to.equal((BTC_PRICE * rate) / 10n ** 18n);
-        expect(rate).to.be.lt(14n * 10n ** 12n); // < 0.14 bps
-        expect(await exchange.cumulativeFunding(BTC)).to.be.lt(wad("0.7")); // < 0.70 USD per BTC, vs 50 at the cap
+        expect(await exchange.cumulativeFunding(BTC)).to.be.lt(wad("0.014"));
       });
 
       it("... and barely moves an existing honest premium", async () => {
@@ -1217,16 +1246,15 @@ describe("Exchange", () => {
         await fillAt(60, wad(52_500));
         const snapshot = await takeSnapshot();
         await time.increaseTo(t0 + 3_500);
-        expect(await exchange.currentFundingRate(BTC)).to.equal(10n ** 15n); // at the cap
+        // at the cap for the 3,440 of 3,500 seconds it has been standing
+        expect(await exchange.currentFundingRate(BTC)).to.equal((10n ** 15n * 3_440n) / 3_500n);
         await snapshot.restore();
-        // one fair fill a minute later leaves the edge price 60 seconds of weight:
-        // 5% * 60 / 3,500 = 8.6 bps, and less with every further second
+        // one fair fill a minute later leaves the edge price 60 seconds of weight, and every
+        // observation is capped before averaging: 60/3500 of the cap, not 5% * 60/3500
         await fillAt(120, BTC_PRICE);
         await time.increaseTo(t0 + 3_500);
-        const rate = await exchange.currentFundingRate(BTC);
-        expect(rate).to.be.lt(87n * 10n ** 13n);
-        expect(rate).to.be.gt(85n * 10n ** 13n);
-          });
+        expect(await exchange.currentFundingRate(BTC)).to.equal((10n ** 15n * 60n) / 3_500n);
+      });
     });
 
     it("a stale or broken oracle accrues nothing but still advances the clock", async () => {
@@ -1269,6 +1297,7 @@ describe("Exchange", () => {
       await f.exchange.connect(f.alice).deposit(usdc(20_000));
       await f.exchange.connect(f.bob).deposit(usdc(20_000));
       const size = 333333333333333333n;
+      await startNewFundingPeriodAtNextFill(f);
       await f.ctx.settleOk([await f.ctx.trade(f.alice, f.bob, size, wad(50_500))]);
       const t0 = Number(await f.exchange.lastFundingTime(BTC));
       const va = await f.exchange.accountValue(f.alice.address);
@@ -1392,6 +1421,7 @@ describe("Exchange", () => {
       await exchange.connect(alice).deposit(usdc(10_700));
       await exchange.connect(bob).deposit(usdc(40_000));
       await exchange.connect(liquidator).deposit(usdc(100_000));
+      await startNewFundingPeriodAtNextFill(f);
       await ctx.settleOk([await ctx.trade(alice, bob, ONE, wad(50_500))]); // balance 10,689.9
       const t0 = Number(await exchange.lastFundingTime(BTC));
       await time.setNextBlockTimestamp(t0 + HOUR - 1);
@@ -1769,9 +1799,12 @@ describe("Exchange", () => {
         exchange2.interface.encodeFunctionData("deposit", [1]),
         exchange2.interface.encodeFunctionData("settleMatches", [[]]),
         exchange2.interface.encodeFunctionData("liquidate", [f.bob.address, 0, 1]),
+        exchange2.interface.encodeFunctionData("depositInsurance", [1]),
       ]) {
         await evil.arm(await exchange2.getAddress(), data);
         await expect(exchange2.connect(f.alice).deposit(usdc(1))).to.be.revertedWithCustomError(exchange2, "ReentrancyGuardReentrantCall");
+        // and the other way round: re-entering from the transfer of an insurance deposit
+        await expect(exchange2.connect(f.alice).depositInsurance(usdc(1))).to.be.revertedWithCustomError(exchange2, "ReentrancyGuardReentrantCall");
       }
       await evil.disarm();
       await exchange2.connect(f.alice).deposit(usdc(1));

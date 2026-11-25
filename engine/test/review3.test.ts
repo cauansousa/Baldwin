@@ -655,7 +655,8 @@ describe("items 10 and 14: refreshes and caches", () => {
     h.engine["invalidateReads"](carol.address.toLowerCase());
     h.chain.positions.set(me, -wad(1)); // the settled match closed 1
     release();
-    await first;
+    // the slow read was not used either: the order was judged against a fresh read (short 1), so it fit
+    expect(await first).toMatchObject({ status: "pending_settlement" });
     // the next check must see the position as it is now (1), not the stale 2 from the slow read
     await h.engine.idle();
     expect(await code(h.place(carol, true, 100, 2, { order: { reduceOnly: true } }))).toBe("REDUCE_ONLY_EXCEEDS_POSITION");

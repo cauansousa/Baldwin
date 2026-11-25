@@ -1693,19 +1693,23 @@ export class Engine extends EventEmitter<EngineEvents> {
    * match of the trader reaches an outcome.
    */
   private async cachedRead(traderKey: string, key: string, read: () => Promise<bigint>): Promise<bigint> {
-    if (this.preTradeCacheMs <= 0) return read();
-    const hit = this.chainCache.get(traderKey)?.get(key);
+    const hit = this.preTradeCacheMs > 0 ? this.chainCache.get(traderKey)?.get(key) : undefined;
     if (hit && Date.now() - hit.at < this.preTradeCacheMs) return hit.value;
     // A read that was started before the cache was invalidated (a match of the trader
-    // settled meanwhile) may carry the old value: it must not be stored.
-    const generation = this.cacheGeneration.get(traderKey) ?? 0;
-    const value = await read();
-    if ((this.cacheGeneration.get(traderKey) ?? 0) === generation) {
-      let cache = this.chainCache.get(traderKey);
-      if (!cache) this.chainCache.set(traderKey, (cache = new Map()));
-      cache.set(key, { at: Date.now(), value });
+    // settled meanwhile) may carry the old value: it is neither stored nor used. The
+    // caller combines the value with the engine's own unsettled matches, so a value
+    // from before a settlement would count that match twice or not at all.
+    for (let attempt = 0; ; attempt++) {
+      const generation = this.cacheGeneration.get(traderKey) ?? 0;
+      const value = await read();
+      if ((this.cacheGeneration.get(traderKey) ?? 0) === generation) {
+        let cache = this.chainCache.get(traderKey);
+        if (!cache) this.chainCache.set(traderKey, (cache = new Map()));
+        cache.set(key, { at: Date.now(), value });
+        return value;
+      }
+      if (attempt >= 3) return value; // the trader's matches settle faster than we can read: best effort
     }
-    return value;
   }
 
   private invalidateReads(traderKey: string): void {
