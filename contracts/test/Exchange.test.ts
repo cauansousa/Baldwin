@@ -14,6 +14,7 @@ import {
   marketConfig,
   notionalDown,
   notionalUp,
+  startNewFundingPeriodAtNextFill,
   usdc,
   wad,
 } from "./helpers";
@@ -968,18 +969,22 @@ describe("Exchange", () => {
       const f = await loadFixture(deployFixture);
       await f.exchange.connect(f.alice).deposit(usdc(20_000));
       await f.exchange.connect(f.bob).deposit(usdc(20_000));
+      // the fill opens a funding period, so its premium stands for all of it
+      await startNewFundingPeriodAtNextFill(f);
       const fill = await f.ctx.settleOk([await f.ctx.trade(f.alice, f.bob, ONE, fillPrice)]);
       const t0 = Number(await f.exchange.lastFundingTime(BTC));
       const fillTime = (await fill.getBlock()).timestamp;
       /**
        * Expected rate (WAD per hour) of an accrual `seconds` after the start of the period,
-       * if the fixture's fill is the only one: the time before it counts at the index.
+       * if the fixture's fill is the only one: its premium over the index of that moment
+       * (50,000) counts from the fill on, for at most one hour; the rest of the period
+       * counts as zero premium, and the cap shrinks in the same proportion.
        */
-      const expectedRate = (seconds: number, index: bigint = BTC_PRICE) => {
-        const twap = (fillPrice * BigInt(t0 + seconds - fillTime) + index * BigInt(fillTime - t0)) / BigInt(seconds);
-        const sdiv = (a: bigint, b: bigint) => a / b; // bigint division truncates towards zero, like Solidity
-        let rate = sdiv((twap - index) * 10n ** 18n, index);
-        const cap = 10n * 10n ** 14n;
+      const expectedRate = (seconds: number) => {
+        const premium = ((fillPrice - BTC_PRICE) * 10n ** 18n) / BTC_PRICE;
+        const live = BigInt(Math.min(t0 + seconds - fillTime, HOUR));
+        let rate = (premium * live) / BigInt(seconds); // bigint division truncates towards zero, like Solidity
+        const cap = (10n * 10n ** 14n * live) / BigInt(seconds);
         if (rate > cap) rate = cap;
         if (rate < -cap) rate = -cap;
         return rate;
@@ -1065,19 +1070,22 @@ describe("Exchange", () => {
       expect(await a.exchange.cumulativeFunding(BTC)).to.equal(wad(75));
       expect(await a.exchange.markPrice(BTC)).to.equal(wad(50_500)); // the last fill is still reported
 
+      // Nobody accrues for 20 hours. The fill's 1% premium counts for one hour only, so
+      // the average over the gap is 1% / 20 = 5 bps, charged for the 8 hours at most.
       const b = await fundingFixture(wad(50_500));
       await b.accrueAt(20 * HOUR);
-      expect(await b.exchange.cumulativeFunding(BTC)).to.equal(wad(400));
+      const rate = b.expectedRate(20 * HOUR);
+      expect(rate).to.equal(5n * 10n ** 14n);
+      expect(await b.exchange.cumulativeFunding(BTC)).to.equal(wad(200));
     });
 
-    it("uses the index price at accrual time", async () => {
-      const { exchange, accrueAt, expectedRate } = await fundingFixture(wad(50_500));
-      // index moved to 50,480: premium just under 3.96 bps
-      await accrueAt(HOUR, wad(50_480));
-      const rateWad = expectedRate(HOUR, wad(50_480));
-      expect(rateWad).to.be.gt(39n * 10n ** 13n);
-      expect(rateWad).to.be.lt(40n * 10n ** 13n);
-      expect(await exchange.cumulativeFunding(BTC)).to.equal((wad(50_480) * rateWad) / 10n ** 18n);
+    it("the premium is fixed when the fill happens; the index at accrual only prices the payment", async () => {
+      const { exchange, accrueAt, t0 } = await fundingFixture(wad(50_500));
+      // The fill was 1% above the index of its moment. That the index has since risen to
+      // 50,480 does not shrink the premium: the rate is at the cap, paid on 50,480.
+      await expect(accrueAt(HOUR, wad(50_480)))
+        .to.emit(exchange, "FundingUpdated")
+        .withArgs(BTC, 10, wad("50.48"), t0 + HOUR);
     });
 
     describe("mark TWAP", () => {

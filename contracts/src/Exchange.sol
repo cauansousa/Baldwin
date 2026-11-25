@@ -110,13 +110,20 @@ contract Exchange is IExchange, Ownable2Step, ReentrancyGuard, EIP712 {
     struct MarketState {
         int256 cumulativeFunding; // USD (WAD) per 1 unit of base, paid by longs to shorts
         uint256 lastFundingTime;
-        uint256 markPrice; // last fill price, 0 until the first fill
-        // Mark TWAP of the current funding period (since lastFundingTime); see _recordFill.
-        uint256 periodFirstFillTime; // 0 = no fill in this period yet
-        uint256 lastFillTime;
-        uint256 priceTimeSum; // sum of price * seconds over the completed fill-to-fill segments
         uint256 longOpenInterest;
         uint256 shortOpenInterest;
+        // --- one slot ---
+        uint128 markPrice; // last fill price, 0 until the first fill
+        // Last index price read successfully by a transaction; used to value this market
+        // for liquidations elsewhere while its price is unavailable. 0 = never read.
+        uint128 lastGoodPrice;
+        // --- one slot: premium bookkeeping of the current funding period, see _recordFill ---
+        uint64 periodFirstFillTime; // 0 = no fill in this period yet
+        uint64 lastFillTime;
+        uint64 liveTime; // seconds of the period covered by completed fill-to-fill segments
+        // --- one slot ---
+        int128 lastPremium; // (price - index) / index of the last fill, WAD, at the index of that moment
+        int128 premiumTimeSum; // sum of premium * seconds over the completed fill-to-fill segments
     }
 
     Market[] private _markets;
@@ -237,6 +244,10 @@ contract Exchange is IExchange, Ownable2Step, ReentrancyGuard, EIP712 {
     function updateMarket(uint32 marketId, Market calldata market) external onlyOwner {
         _requireMarket(marketId);
         _validateMarket(market);
+        // Funding is suspended while a market is inactive. Close the running period under
+        // the old status before switching: charged normally when deactivating, at zero
+        // when reactivating.
+        if (_markets[marketId].active != market.active) _closeFundingPeriod(marketId, true);
         _markets[marketId] = market;
         emit MarketUpdated(marketId);
     }
@@ -279,14 +290,22 @@ contract Exchange is IExchange, Ownable2Step, ReentrancyGuard, EIP712 {
         emit GuardianUpdated(guardian_);
     }
 
-    /// @notice While paused: only fills that reduce both sides' positions. Deposits,
-    ///         withdrawals, cancels, funding and liquidations stay open.
+    /// @notice While paused: only fills that reduce both sides' positions, and no funding.
+    ///         Deposits, withdrawals, cancels and liquidations stay open.
     ///         Pausing: owner or guardian. Unpausing: owner only.
+    /// @dev Funding is suspended while paused: with opening trades blocked, the accounts
+    ///      that can still trade (reducing against each other) would set the rate
+    ///      unopposed. On a change of state every market's running period is closed
+    ///      first: charged normally up to the pause, at zero up to the unpause.
     function setPaused(bool paused_) external {
         if (msg.sender != owner() && !(paused_ && msg.sender == guardian)) {
             revert OwnableUnauthorizedAccount(msg.sender);
         }
-        paused = paused_;
+        if (paused != paused_) {
+            uint256 count = _markets.length;
+            for (uint32 marketId = 0; marketId < count; ++marketId) _closeFundingPeriod(marketId, true);
+            paused = paused_;
+        }
         emit Paused(paused_);
     }
 
@@ -355,11 +374,19 @@ contract Exchange is IExchange, Ownable2Step, ReentrancyGuard, EIP712 {
     ///      moves by the same amount on both sides. Open while paused.
     function depositInsurance(uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
-        uint256 badDebtRepaid = Math.min(amount, totalBadDebt);
-        totalBadDebt -= badDebtRepaid;
-        _insuranceFund += amount - badDebtRepaid;
+        uint256 badDebtRepaid = _creditInsurance(amount);
         _collateral.safeTransferFrom(msg.sender, address(this), amount);
         emit InsuranceDeposit(msg.sender, amount, badDebtRepaid);
+    }
+
+    /// @dev Books `amount` of USDC that belongs to nobody (a deposit to the fund, or the
+    ///      fund's share of a penalty): recorded bad debt is repaid first, the rest goes
+    ///      to the insurance fund. The fund therefore never shows money that the
+    ///      contract does not hold while a shortfall is on record.
+    function _creditInsurance(uint256 amount) private returns (uint256 badDebtRepaid) {
+        badDebtRepaid = Math.min(amount, totalBadDebt);
+        if (badDebtRepaid != 0) totalBadDebt -= badDebtRepaid;
+        _insuranceFund += amount - badDebtRepaid;
     }
 
     /// @inheritdoc IExchange
@@ -425,7 +452,7 @@ contract Exchange is IExchange, Ownable2Step, ReentrancyGuard, EIP712 {
         // Every fill needs a fresh index price and must be priced close to it. This is
         // what stops two accounts from moving value between them through an off-market
         // fill, and keeps the mark price (hence funding) anchored to the index.
-        _requireInBand(marketId, price);
+        uint256 index = _requireInBand(marketId, price);
 
         // Funding up to now is charged on the positions as they were before this fill,
         // using the mark price before this fill. Every other market the two accounts are
@@ -434,6 +461,8 @@ contract Exchange is IExchange, Ownable2Step, ReentrancyGuard, EIP712 {
         _accrueFunding(marketId);
         _accrueFundingOf(m.maker.trader);
         _accrueFundingOf(m.taker.trader);
+        // The fill's premium counts towards the period that is open now.
+        _recordFill(marketId, price, index);
 
         MarketState storage state = _marketState[marketId];
         uint256 longsBefore = state.longOpenInterest;
@@ -451,8 +480,6 @@ contract Exchange is IExchange, Ownable2Step, ReentrancyGuard, EIP712 {
         if (state.longOpenInterest > longsBefore && state.longOpenInterest > _markets[marketId].maxOpenInterest) {
             revert OpenInterestCapExceeded();
         }
-        _recordFill(state, price);
-
         _requireMarginAfterTrade(m.maker.trader, maker.oldSize, maker.newSize, maker.marginBefore);
         _requireMarginAfterTrade(m.taker.trader, taker.oldSize, taker.newSize, taker.marginBefore);
 
@@ -527,11 +554,14 @@ contract Exchange is IExchange, Ownable2Step, ReentrancyGuard, EIP712 {
     ///
     ///      Prices: the liquidated market needs a fresh price. The trader's positions in
     ///      OTHER markets whose price is unavailable (stale, or the oracle reverts) are
-    ///      valued at entry: no unrealized PnL, maintenance on the entry notional,
-    ///      pending funding as usual. Otherwise one dead feed (or a dust position in an
-    ///      illiquid market) would make an account unliquidatable everywhere. The price
-    ///      of this: a trader whose only buffer is unrealized profit in a market without
-    ///      a price can be liquidated although it would be healthy at the true price.
+    ///      valued at the last index price a transaction read for that market
+    ///      (`lastGoodPrice`), or at entry if there never was one; pending funding as
+    ///      usual. Otherwise one dead feed (or a dust position in an illiquid market)
+    ///      would make an account unliquidatable everywhere. The price of this: the
+    ///      valuation of that market is as old as its last good price, so a trader can be
+    ///      liquidated although healthy at the true price, or be judged too kindly.
+    ///      When such a fallback valuation was used, the liquidator receives no share of
+    ///      the penalty (see _chargePenaltyAndAbsorb).
     ///      The liquidator's own margin check always requires fresh prices.
     function liquidate(address trader, uint32 marketId, uint256 maxSize) external nonReentrant {
         if (trader == msg.sender) revert SelfLiquidation();
@@ -549,6 +579,7 @@ contract Exchange is IExchange, Ownable2Step, ReentrancyGuard, EIP712 {
         uint256 closeSize = Math.min(maxSize, _abs(oldSize));
         if (closeSize == 0) revert ZeroAmount();
         uint256 price = _price(marketId);
+        _marketState[marketId].lastGoodPrice = price.toUint128();
         // Signed size moved from the trader to the liquidator.
         int256 moved = oldSize > 0 ? closeSize.toInt256() : -closeSize.toInt256();
 
@@ -580,17 +611,23 @@ contract Exchange is IExchange, Ownable2Step, ReentrancyGuard, EIP712 {
     ) private returns (uint256 penalty, uint256 badDebt) {
         Health memory h = _healthForLiquidation(trader, marketId);
 
-        // The penalty is capped at what the account is still worth, so that it can never
-        // create or enlarge a deficit (which the insurance fund would have to pay).
+        // The penalty is capped at what the account is still worth, so that with fresh
+        // prices it cannot create or enlarge a deficit. If another market had to be
+        // valued without a current price (h.usedFallback), "worth" is an estimate: a loss
+        // there since the last known price is not in it, and the penalty can then exceed
+        // the true value and end up as a deficit later. In that case the liquidator gets
+        // no share: the whole penalty stays with the insurance fund, which is the party
+        // that would pay for the deficit, and nobody can profit from liquidating on a
+        // price that is known to be missing.
         uint256 notional = Math.mulDiv(closeSize, price, NOTIONAL_SCALE, Math.Rounding.Ceil);
         penalty = Math.mulDiv(notional, _markets[marketId].liquidationPenaltyBps, BPS, Math.Rounding.Ceil);
         uint256 payable_ = h.value > 0 ? uint256(h.value) : 0;
         if (penalty > payable_) penalty = payable_;
         if (penalty != 0) {
-            uint256 liquidatorShare = (penalty * LIQUIDATOR_SHARE_BPS) / BPS;
+            uint256 liquidatorShare = h.usedFallback ? 0 : (penalty * LIQUIDATOR_SHARE_BPS) / BPS;
             _balances[trader] -= penalty.toInt256();
-            _balances[msg.sender] += liquidatorShare.toInt256();
-            _insuranceFund += penalty - liquidatorShare;
+            if (liquidatorShare != 0) _balances[msg.sender] += liquidatorShare.toInt256();
+            _creditInsurance(penalty - liquidatorShare);
         }
 
         // With no positions left nothing can bring the balance back above zero.
@@ -616,81 +653,128 @@ contract Exchange is IExchange, Ownable2Step, ReentrancyGuard, EIP712 {
 
     /// @dev Adds to the market's cumulative funding index, at most once per
     ///      FUNDING_INTERVAL.
+    function _accrueFunding(uint32 marketId) private {
+        _closeFundingPeriod(marketId, false);
+    }
+
+    /// @dev Closes the running funding period of a market and starts a new one.
     ///
-    ///        rate  = clamp((markTwap - index) / index, ±maxFundingRateBps)   per hour
+    ///        rate  = funding rate of the period, see _fundingRate              per hour
     ///        index += indexPrice * rate * elapsed / 1 hour
     ///
-    ///      The rate is computed once, at accrual time, from the mark TWAP of the period
-    ///      that ends now (see _markTwap) and the current index price, and is applied to
-    ///      the whole elapsed period (capped at MAX_FUNDING_ELAPSED). If the index price
-    ///      is unavailable or stale, or the market did not trade in the period, the
-    ///      period accrues no funding. This never reverts.
-    function _accrueFunding(uint32 marketId) private {
+    ///      The rate comes from the premiums observed at the period's fills; the index
+    ///      price of this moment only converts the rate into USD per unit of base. The
+    ///      charge covers the elapsed time, capped at MAX_FUNDING_ELAPSED. The period
+    ///      accrues nothing if
+    ///       - the index price is unavailable or stale,
+    ///       - the market did not trade in the period,
+    ///       - the exchange is paused or the market inactive (funding is suspended).
+    ///      Without `force` this does nothing until FUNDING_INTERVAL has passed. It
+    ///      never reverts.
+    function _closeFundingPeriod(uint32 marketId, bool force) private {
         MarketState storage state = _marketState[marketId];
         uint256 elapsed = block.timestamp - state.lastFundingTime;
-        if (elapsed < FUNDING_INTERVAL) return;
+        if (elapsed == 0 || (!force && elapsed < FUNDING_INTERVAL)) return;
 
         int256 rateWad = 0;
         (uint256 index, bool usable) = _tryFreshPrice(marketId);
         if (usable) {
-            rateWad = _fundingRate(state, index);
-            uint256 charged = elapsed > MAX_FUNDING_ELAPSED ? MAX_FUNDING_ELAPSED : elapsed;
-            state.cumulativeFunding +=
-                (index.toInt256() * rateWad * charged.toInt256()) /
-                (WAD * FUNDING_INTERVAL.toInt256());
+            state.lastGoodPrice = index.toUint128();
+            if (!_fundingSuspended(marketId)) {
+                rateWad = _fundingRate(state);
+                uint256 charged = elapsed > MAX_FUNDING_ELAPSED ? MAX_FUNDING_ELAPSED : elapsed;
+                state.cumulativeFunding +=
+                    (index.toInt256() * rateWad * charged.toInt256()) /
+                    (WAD * FUNDING_INTERVAL.toInt256());
+            }
         }
 
         // A new period starts: it has no fills yet.
         state.lastFundingTime = block.timestamp;
         if (state.periodFirstFillTime != 0) {
             state.periodFirstFillTime = 0;
-            state.priceTimeSum = 0;
+            state.liveTime = 0;
+            state.premiumTimeSum = 0;
         }
         emit FundingUpdated(marketId, rateWad / BPS_WAD, state.cumulativeFunding, block.timestamp);
     }
 
-    /// @dev Records a fill for the mark TWAP of the current funding period. Must run
-    ///      after _accrueFunding, so that the fill belongs to the period that is open.
-    ///      The previous fill's price is credited with the time it stood.
-    function _recordFill(MarketState storage state, uint256 price) private {
+    function _fundingSuspended(uint32 marketId) private view returns (bool) {
+        return paused || !_markets[marketId].active;
+    }
+
+    /// @dev Records a fill. Must run after _accrueFunding, so that the fill belongs to
+    ///      the period that is open.
+    ///
+    ///      What is recorded for funding is the fill's PREMIUM over the index of the same
+    ///      moment, (price - index) / index, not its price: comparing old fill prices
+    ///      with a later index would charge plain index drift as if it were a premium.
+    ///      The previous fill's premium is credited with the time it stood, at most one
+    ///      FUNDING_INTERVAL: a trade says nothing about the market an hour later, and a
+    ///      stale last trade must not keep a premium alive while nobody accrues.
+    ///      While funding is suspended (paused / inactive market) fills are not recorded.
+    function _recordFill(uint32 marketId, uint256 price, uint256 index) private {
+        MarketState storage state = _marketState[marketId];
+        state.markPrice = price.toUint128();
+        state.lastGoodPrice = index.toUint128();
+        if (_fundingSuspended(marketId)) return;
+
         if (state.periodFirstFillTime == 0) {
-            state.periodFirstFillTime = block.timestamp;
+            state.periodFirstFillTime = uint64(block.timestamp);
         } else {
-            state.priceTimeSum += state.markPrice * (block.timestamp - state.lastFillTime);
+            uint256 weight = _lastFillWeight(state);
+            state.liveTime += uint64(weight);
+            state.premiumTimeSum += (int256(state.lastPremium) * weight.toInt256()).toInt128();
         }
-        state.lastFillTime = block.timestamp;
-        state.markPrice = price;
+        state.lastFillTime = uint64(block.timestamp);
+        state.lastPremium = (((price.toInt256() - index.toInt256()) * WAD) / index.toInt256()).toInt128();
     }
 
-    /// @dev Time-weighted average mark price of the current funding period, given the
-    ///      current index price.
-    ///
-    ///      Weighting: every fill price counts for the time until the next fill, the last
-    ///      one until now. The time from the start of the period to its first fill counts
-    ///      at the index price (no premium), and so does a whole period without fills:
-    ///      prices are never carried over from an earlier period.
-    ///
-    ///        twap = (sum(price_i * dt_i) + index * (time before the first fill)) / T
-    ///
-    ///      Consequences: a fill shortly before the accrual has almost no weight (one
-    ///      second out of the period); fills in the same block as a later fill have none;
-    ///      and a stale last trade cannot keep a premium alive in a market that stopped
-    ///      trading. A fill early in an otherwise quiet period does carry that period.
-    function _markTwap(MarketState storage state, uint256 index) private view returns (uint256) {
-        uint256 period = block.timestamp - state.lastFundingTime;
-        uint256 firstFill = state.periodFirstFillTime;
-        if (firstFill == 0 || period == 0) return index;
-        uint256 sum = state.priceTimeSum +
-            state.markPrice * (block.timestamp - state.lastFillTime) +
-            index * (firstFill - state.lastFundingTime);
-        return sum / period;
+    /// @dev Seconds for which the last fill's premium counts so far: the time since that
+    ///      fill, at most one FUNDING_INTERVAL.
+    function _lastFillWeight(MarketState storage state) private view returns (uint256) {
+        return Math.min(block.timestamp - state.lastFillTime, FUNDING_INTERVAL);
     }
 
-    /// @dev clamp((markTwap - index) / index, ±maxFundingRateBps), WAD per hour.
-    function _fundingRate(MarketState storage state, uint256 index) private view returns (int256 rateWad) {
-        int256 indexInt = index.toInt256();
-        rateWad = ((_markTwap(state, index).toInt256() - indexInt) * WAD) / indexInt;
-        int256 cap = maxFundingRateBps.toInt256() * BPS_WAD;
+    /// @dev Premium statistics of the current funding period so far.
+    ///
+    ///        average  = sum(premium_i * weight_i) / T      T = time since the period started
+    ///        liveTime = sum(weight_i)
+    ///
+    ///      weight_i is the time from fill i to the next fill (for the last fill: to now),
+    ///      capped at FUNDING_INTERVAL. All other time - before the period's first fill,
+    ///      beyond the cap, a whole period without fills - is not "live": it counts as
+    ///      zero premium, and nothing is carried over from an earlier period.
+    function _premiumStats(
+        MarketState storage state
+    ) private view returns (int256 average, uint256 liveTime, uint256 period) {
+        period = block.timestamp - state.lastFundingTime;
+        if (state.periodFirstFillTime == 0 || period == 0) return (0, 0, period);
+        uint256 weight = _lastFillWeight(state);
+        liveTime = state.liveTime + weight;
+        average = (int256(state.premiumTimeSum) + int256(state.lastPremium) * weight.toInt256()) / period.toInt256();
+    }
+
+    /// @dev Funding rate of the current period, WAD per hour:
+    ///
+    ///        rate = clamp(average premium, ± maxFundingRate * liveTime / T)
+    ///
+    ///      i.e. the time-weighted average premium, limited to the rate cap for the part
+    ///      of the period in which there was a live price observation. Scaling the cap by
+    ///      liveTime / T means a fill can never earn more than the capped rate for the
+    ///      time its premium actually stood: a fill one second before the accrual moves
+    ///      the hourly rate by at most cap / 3600, and if nobody accrues for hours after
+    ///      the last fill, that fill is charged for one interval at most, not for the gap.
+    ///
+    ///      Other consequences of the weighting: fills in the same block as a later fill
+    ///      have no weight; an index that drifts while trades happen at the index produces
+    ///      no funding. A fill early in an otherwise quiet period does carry that period
+    ///      (see README, known limitations).
+    function _fundingRate(MarketState storage state) private view returns (int256 rateWad) {
+        (int256 average, uint256 liveTime, uint256 period) = _premiumStats(state);
+        if (liveTime == 0) return 0;
+        int256 cap = (maxFundingRateBps.toInt256() * BPS_WAD * liveTime.toInt256()) / period.toInt256();
+        rateWad = average;
         if (rateWad > cap) rateWad = cap;
         if (rateWad < -cap) rateWad = -cap;
     }
@@ -802,6 +886,7 @@ contract Exchange is IExchange, Ownable2Step, ReentrancyGuard, EIP712 {
         uint256 initial; // initial margin requirement
         uint256 maintenance; // maintenance margin requirement
         uint256 positions; // number of markets with a non-zero position
+        bool usedFallback; // a market was valued without a current price (liquidation only)
     }
 
     /// @dev Account state before a trade that strictly reduces a position without
@@ -869,7 +954,7 @@ contract Exchange is IExchange, Ownable2Step, ReentrancyGuard, EIP712 {
 
     /// @dev Valuation used to decide and settle a liquidation in `strictMarket`: that
     ///      market needs a fresh price; other markets without a usable price are valued
-    ///      at entry (see `liquidate`).
+    ///      at their last known price, or at entry if there is none (see `liquidate`).
     function _healthForLiquidation(address trader, uint32 strictMarket) private view returns (Health memory h) {
         return _healthWith(trader, true, strictMarket);
     }
@@ -887,13 +972,22 @@ contract Exchange is IExchange, Ownable2Step, ReentrancyGuard, EIP712 {
             if (size == 0) continue;
 
             uint256 price;
-            bool usable = true;
-            if (entryFallback && marketId != strictMarket) (price, usable) = _tryFreshPrice(marketId);
-            else price = _price(marketId);
+            if (entryFallback && marketId != strictMarket) {
+                bool usable;
+                (price, usable) = _tryFreshPrice(marketId);
+                if (!usable) {
+                    // No current price: use the last one a transaction saw. If there
+                    // never was one (price == 0), value the position at entry.
+                    h.usedFallback = true;
+                    price = _marketState[marketId].lastGoodPrice;
+                }
+            } else {
+                price = _price(marketId);
+            }
 
             // Notional for margin purposes, and unrealized PnL.
             uint256 notional;
-            if (usable) {
+            if (price != 0) {
                 uint256 absSize = _abs(size);
                 notional = Math.mulDiv(absSize, price, NOTIONAL_SCALE, Math.Rounding.Ceil);
                 h.value += size > 0
@@ -929,8 +1023,8 @@ contract Exchange is IExchange, Ownable2Step, ReentrancyGuard, EIP712 {
     }
 
     /// @dev Reverts unless |price - index| <= index * maxPriceDeviationBps / 1e4.
-    function _requireInBand(uint32 marketId, uint256 price) private view {
-        uint256 index = _price(marketId);
+    function _requireInBand(uint32 marketId, uint256 price) private view returns (uint256 index) {
+        index = _price(marketId);
         uint256 diff = price > index ? price - index : index - price;
         if (diff * BPS > index * maxPriceDeviationBps) revert PriceOutOfBand(price, index);
     }
@@ -1003,7 +1097,8 @@ contract Exchange is IExchange, Ownable2Step, ReentrancyGuard, EIP712 {
 
     /// @notice Whether `liquidate(trader, marketId, ...)` would find the account under
     ///         maintenance margin right now, using the same valuation as `liquidate`
-    ///         (other markets without a usable price are valued at entry). Unlike
+    ///         (other markets without a usable price are valued at their last known
+    ///         price, or at entry if there is none). Unlike
     ///         `isLiquidatable` it does not revert because of another market's oracle.
     ///         False if the trader has no position in the market; reverts if this
     ///         market's own price is unavailable. Funding not yet accrued is not included.
@@ -1027,21 +1122,34 @@ contract Exchange is IExchange, Ownable2Step, ReentrancyGuard, EIP712 {
     }
 
     /// @inheritdoc IExchange
-    /// @dev Never reverts for an existing market: returns 0 if the index price is
-    ///      unavailable or stale (the TWAP is defined relative to the index).
+    /// @dev index now * (1 + average premium of the current funding period so far): the
+    ///      price the period's fills imply relative to today's index. Equals the index if
+    ///      the market has not traded in the period. Never reverts for an existing
+    ///      market: returns 0 if the index price is unavailable or stale.
     function markTwap(uint32 marketId) external view returns (uint256) {
         _requireMarket(marketId);
         (uint256 index, bool usable) = _tryFreshPrice(marketId);
-        return usable ? _markTwap(_marketState[marketId], index) : 0;
+        if (!usable) return 0;
+        (int256 average, , ) = _premiumStats(_marketState[marketId]);
+        return ((index.toInt256() * (WAD + average)) / WAD).toUint256();
     }
 
     /// @inheritdoc IExchange
     /// @dev Never reverts for an existing market. This is the rate an accrual would use
-    ///      if it happened now; it keeps moving until the period is accrued.
+    ///      if it happened now; it keeps moving until the period is accrued. Zero while
+    ///      funding is suspended (paused, or the market is inactive).
     function currentFundingRate(uint32 marketId) external view returns (int256) {
         _requireMarket(marketId);
-        (uint256 index, bool usable) = _tryFreshPrice(marketId);
-        return usable ? _fundingRate(_marketState[marketId], index) : int256(0);
+        (, bool usable) = _tryFreshPrice(marketId);
+        if (!usable || _fundingSuspended(marketId)) return 0;
+        return _fundingRate(_marketState[marketId]);
+    }
+
+    /// @notice Last index price of the market that a transaction read successfully (fill,
+    ///         funding accrual or liquidation of that market); 0 if none yet. Used to
+    ///         value the market in liquidations elsewhere while its price is unavailable.
+    function lastGoodPrice(uint32 marketId) external view returns (uint256) {
+        return _marketState[marketId].lastGoodPrice;
     }
 
     /// @inheritdoc IExchange

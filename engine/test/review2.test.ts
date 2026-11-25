@@ -116,19 +116,21 @@ describe("F3 / item 9: only the failed fill is undone", () => {
     expect(h.settler.calls).toHaveLength(2);
   });
 
-  it("global condition with a resting taker: only the failed slice is dropped, on both sides; no loop, no strike", async () => {
-    const h = harness({ maxOrderStrikes: 1 });
+  it("global condition with a resting taker: the taker's slice is dropped, the maker gets its size back; a taker that keeps failing is removed", async () => {
+    const h = harness({ maxOrderStrikes: 3 });
     const maker = await h.place(alice, false, 100, 1);
     const deep = await h.place(alice, false, 101, 1);
     h.settler.failWhen = () => err("OpenInterestCapExceeded");
     const taker = await h.place(bob, true, 100, 3); // takes 1 @ 100, rests 2 @ 100
     await h.engine.idle();
-    expect(h.settler.calls).toHaveLength(1);
-    expect(h.engine.getOrder(taker.orderHash)).toMatchObject({ status: "open", remaining: wad(2), filled: 0n, pending: 0n });
-    expect(h.engine.getOrder(maker.orderHash)).toMatchObject({ status: "cancelled", remaining: 0n, reason: expect.stringMatching(/open-interest cap/) });
+    // the maker never loses anything, and gets no strike
+    expect(h.engine.getOrder(maker.orderHash)).toMatchObject({ status: "open", remaining: wad(1), pending: 0n });
     expect(h.engine.getOrder(deep.orderHash)!.status).toBe("open");
-    const book = h.engine.getOrderBook(1, 10);
-    expect(book).toMatchObject({ bids: [{ price: wad(100), size: wad(2) }], asks: [{ price: wad(101), size: wad(1) }] });
+    // the restored maker crossed the resting taker again and the match failed again:
+    // after three such failures the taker's order is taken out, bounded and without blame
+    expect(h.settler.calls).toHaveLength(3);
+    expect(h.engine.getOrder(taker.orderHash)).toMatchObject({ status: "cancelled", remaining: 0n, reason: expect.stringMatching(/open-interest cap.*repeatedly/) });
+    expect(h.engine.getOrderBook(1, 10)).toMatchObject({ bids: [], asks: [{ price: wad(100), size: wad(1) }, { price: wad(101), size: wad(1) }] });
   });
 
   it("global condition with a taker that no longer rests: the maker gets the size back", async () => {
@@ -727,13 +729,17 @@ describe("expiry follows chain time when the chain's clock is ahead of the host'
     h.chain.time = 1300n; // block.timestamp is 300 s ahead of this host (clock 1000)
     await h.engine.refreshChainState();
     h.engine.sweepExpired();
+    expect(h.engine.getOrder(early.orderHash)!.status).toBe("open"); // one reading is not believed
+    await h.engine.refreshChainState();
+    await h.engine.refreshChainState();
+    h.engine.sweepExpired();
     expect(h.engine.getOrder(early.orderHash)!.status).toBe("expired"); // already expired for the contract
     expect(h.engine.getOrder(late.orderHash)!.status).toBe("open");
     expect(await code(h.place(bob, true, 97, 1, { order: { expiry: 1290n } }))).toBe("EXPIRED");
     expect(await code(h.place(bob, true, 97, 1, { order: { expiry: 1306n } }))).toBe("OK");
     // a chain clock behind the host's changes nothing
     h.chain.time = 500n;
-    await h.engine.refreshChainState();
+    await h.engine.refreshChainState(); // the lead is gone at once: the smallest of the last readings counts
     expect(await code(h.place(bob, true, 96, 1, { order: { expiry: 1004n } }))).toBe("EXPIRED");
     expect(await code(h.place(bob, true, 96, 1, { order: { expiry: 1006n } }))).toBe("OK");
   });

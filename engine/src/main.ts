@@ -103,6 +103,9 @@ async function main(): Promise<void> {
     traderOrdersPerMinute: cfg.traderOrdersPerMinute,
     preTradeCacheMs: cfg.preTradeCacheMs,
     fundingIntervalSec: cfg.fundingIntervalSec,
+    maxChainTimeLeadSec: cfg.maxChainTimeLeadSec,
+    globalFailureThreshold: cfg.globalFailureThreshold,
+    globalFailureWindowSec: cfg.globalFailureWindowSec,
     logger: log,
   });
   const watcher = cancelWatcher({

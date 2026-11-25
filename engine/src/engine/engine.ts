@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { OrderBook, type Band, type BookFill, type BookOrder, type CancelReason, type Level, type RestoreOptions } from "../book/orderbook.ts";
+import { DROP_MAKER, DROP_TAKER, OrderBook, type Band, type BookFill, type BookOrder, type CancelReason, type Level, type RestoreOptions } from "../book/orderbook.ts";
 import type { ChainReader } from "../chain/types.ts";
 import { hashOrder, verifyCancelSignature, verifyOrderSignature, type Domain } from "../signing.ts";
 import { BatchRevertedError, type Batch, type MatchResult, type Settler } from "../settlement/types.ts";
@@ -1289,6 +1289,7 @@ export class Engine extends EventEmitter<EngineEvents> {
     if (ioc) this.markDead(order.trader, order.nonce, order.expiry);
 
     this.applyBookEffects(order.marketId, { fills: res.fills, expired: res.expired });
+    this.closeDropped(res.dropped);
     if (res.cancelled > 0n) {
       rec.remaining -= res.cancelled;
       this.close(rec, "cancelled", CANCEL_TEXT[res.cancelReason ?? "ioc"]);
@@ -1534,14 +1535,39 @@ export class Engine extends EventEmitter<EngineEvents> {
       return { ...base, limit: () => 0n, limitReason: "halted" };
     }
     let room = this.oiHeadroom(marketId);
-    if (room === null) return base;
+    const minSize = this.markets.get(marketId)!.minOrderSize;
+    // Positions as they will be after the fills of THIS pass (on top of expectedPosition).
+    const moved = new Map<string, bigint>();
+    /** How much of `size` a reduce-only order may still trade, given where its trader's position is heading. */
+    const covered = (o: { trader: string; isBuy: boolean; reduceOnly?: boolean }, size: bigint): bigint => {
+      if (!o.reduceOnly) return size;
+      const expected = this.expectedPosition.get(`${o.trader}:${marketId}`);
+      if (expected === undefined) return size;
+      const position = expected + (moved.get(o.trader) ?? 0n);
+      const reducible = o.isBuy ? (position < 0n ? -position : 0n) : position > 0n ? position : 0n;
+      return size < reducible ? size : reducible;
+    };
     return {
       ...base,
       limitReason: "oi_cap",
       limit: (maker, taker, size) => {
-        if (maker.reduceOnly || taker.reduceOnly) return size;
-        const allowed = size < room! ? size : room!;
-        room! -= allowed;
+        // A reduce-only order whose position has been (or is being, in this very pass)
+        // traded away by its trader's other orders must not trade: it would only fail
+        // on-chain. It is dropped and matching goes on with the next order.
+        const cm = covered(maker, size);
+        if (cm === 0n || (cm < size && cm < minSize)) return DROP_MAKER;
+        const ct = covered(taker, size);
+        if (ct === 0n || (ct < size && ct < minSize)) return DROP_TAKER;
+        let allowed = cm < ct ? cm : ct;
+        if (room !== null && !maker.reduceOnly && !taker.reduceOnly) {
+          if (room < allowed) allowed = room;
+          if (allowed < size && allowed < minSize) allowed = 0n;
+          room -= allowed;
+        }
+        if (allowed > 0n) {
+          moved.set(maker.trader, (moved.get(maker.trader) ?? 0n) + (maker.isBuy ? allowed : -allowed));
+          moved.set(taker.trader, (moved.get(taker.trader) ?? 0n) + (taker.isBuy ? allowed : -allowed));
+        }
         return allowed;
       },
     };
@@ -1786,6 +1812,16 @@ export class Engine extends EventEmitter<EngineEvents> {
     }
   }
 
+  /** Reduce-only makers the book dropped because their position is gone. */
+  private closeDropped(dropped: { id: string }[]): void {
+    for (const { id } of dropped) {
+      const rec = this.orders.get(id as Hex);
+      if (!rec || rec.closed) continue;
+      rec.remaining = 0n;
+      this.close(rec, "cancelled", UNCOVERED);
+    }
+  }
+
   /**
    * A reduce-only order is only good for as long as the position it reduces is there.
    * When the engine itself matches the trader's position away (with the trader's other
@@ -1809,7 +1845,7 @@ export class Engine extends EventEmitter<EngineEvents> {
           continue;
         }
         covered = 0n;
-        this.remove(rec, "cancelled", "the position this reduce-only order would reduce is being closed by the trader's other orders");
+        this.remove(rec, "cancelled", UNCOVERED);
         this.emit("book", marketId);
       }
     }
@@ -2126,6 +2162,7 @@ export class Engine extends EventEmitter<EngineEvents> {
       }
       rec.remaining += size;
       this.applyBookEffects(marketId, { fills: res.fills, expired: res.expired });
+      this.closeDropped(res.dropped);
       if (res.cancelled > 0n) {
         rec.remaining -= res.cancelled;
         this.close(rec, "cancelled", res.fills.length > 0 ? CANCEL_TEXT.ioc : "IOC order: match failed on-chain, nothing else to match");
@@ -2136,6 +2173,8 @@ export class Engine extends EventEmitter<EngineEvents> {
     this.applyBookEffects(marketId, book.restore(this.toBookOrder(rec), rec.seq, size, opts));
   }
 }
+
+const UNCOVERED = "the position this reduce-only order would reduce is being closed by the trader's other orders";
 
 function emptyWrite() {
   return {

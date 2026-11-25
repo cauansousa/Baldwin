@@ -164,6 +164,11 @@ export interface EngineConfig extends CommonConfig {
   receiptPollMs: number;
   /** Start-up recovery must finish within this, or the process exits non-zero. */
   recoveryTimeoutMs: number;
+  /** Chain time further ahead of the host clock than this halts intake. */
+  maxChainTimeLeadSec: number;
+  /** A trader whose matches fail for global reasons this often within the window is throttled. */
+  globalFailureThreshold: number;
+  globalFailureWindowSec: number;
   intakeTimeoutMs: number;
   traderOrdersPerMinute: number;
   preTradeCacheMs: number;
@@ -206,6 +211,9 @@ export function loadEngineConfig(env: Env = process.env): EngineConfig {
     receiptTimeoutMs: int(env, "RECEIPT_TIMEOUT_MS", 30_000, 100),
     receiptPollMs: int(env, "RECEIPT_POLL_MS", 500, 10),
     recoveryTimeoutMs: int(env, "RECOVERY_TIMEOUT_MS", 120_000, 1000),
+    maxChainTimeLeadSec: int(env, "MAX_CHAIN_TIME_LEAD_SEC", 900, 0),
+    globalFailureThreshold: int(env, "GLOBAL_FAILURE_THRESHOLD", 5, 1),
+    globalFailureWindowSec: int(env, "GLOBAL_FAILURE_WINDOW_SEC", 60, 1),
     intakeTimeoutMs: int(env, "INTAKE_TIMEOUT_MS", 8000, 100),
     traderOrdersPerMinute: int(env, "TRADER_ORDERS_PER_MINUTE", 600, 0),
     preTradeCacheMs: int(env, "PRETRADE_CACHE_MS", 1000, 0),

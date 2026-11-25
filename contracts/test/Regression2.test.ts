@@ -116,13 +116,13 @@ describe("Review 2 regressions", () => {
         .to.emit(exchange, "Liquidation")
         .withArgs(BTC, bob.address, liquidator.address, ONE, wad(44_000), usdc(660), 0);
       expect((await exchange.getPosition(bob.address, BTC)).size).to.equal(0);
-      // 10,090 - 0.004 (ETH fee) - 6,000 - 660, less a good hour of capped BTC funding
-      // (10 bps of 44,000 per hour) that the liquidation accrued and settled
-      const balance = await exchange.balanceOf(bob.address);
-      expect(balance).to.be.lt(usdc("3429.996") - usdc(44));
-      expect(balance).to.be.gt(usdc("3429.996") - usdc(50));
+      // 10,090 - 0.004 (ETH fee) - 6,000 - 660. No funding: every fill was at the index.
+      expect(await exchange.balanceOf(bob.address)).to.equal(usdc("3429.996"));
       expect(await exchange.totalBadDebt()).to.equal(0);
-      expect(await exchange.insuranceFund()).to.equal(usdc(330));
+      // ETH had to be valued without a current price, so the liquidator gets no share of
+      // the penalty: all of it goes to the insurance fund.
+      expect(await exchange.insuranceFund()).to.equal(usdc(660));
+      expect(await exchange.balanceOf(liquidator.address)).to.equal(usdc(100_000));
       // the dust position is untouched and the account is not written off
       expect((await exchange.getPosition(bob.address, ETH)).size).to.equal(wad("0.01"));
     });
@@ -183,10 +183,8 @@ describe("Review 2 regressions", () => {
       expect((await exchange.getPosition(carol.address, BTC)).size).to.equal(0);
       // she keeps the ETH position and its profit
       await oracle.setPrice(ETH, wad(3_000));
-      // 14,986 - 9,000 - 615 (penalty) + 10,000, less a good hour of BTC funding (41 per hour)
-      const value = await exchange.accountValue(carol.address);
-      expect(value).to.be.gt(usdc(15_371) - usdc(47));
-      expect(value).to.be.lt(usdc(15_371) - usdc(41));
+      // 14,986 - 9,000 - 615 (penalty) + 10,000
+      expect(await exchange.accountValue(carol.address)).to.equal(usdc(15_371));
     });
   });
 

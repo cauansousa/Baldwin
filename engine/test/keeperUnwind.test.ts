@@ -30,6 +30,9 @@ function inProcess(engine: Engine) {
   };
   const client: EngineClient = {
     minOrderSizes: () => wrap(async () => new Map(engine.getMarkets().map((m) => [m.marketId, m.minOrderSize]))),
+    time: () => wrap(async () => engine.engineTime()),
+    openOrders: (trader) =>
+      wrap(async () => engine.getOpenOrders(trader).map((v) => ({ orderHash: v.orderHash, order: v.order, status: v.status, remaining: v.remaining, pending: v.pending, filled: v.filled }))),
     submit: (order, signature) => (calls.submit.push(order), wrap(() => engine.submit({ order, signature }))),
     cancel: (hash, signature, trader, nonce) => (calls.cancel.push(hash), wrap(() => engine.cancel(hash, signature, { trader, nonce }))),
   };
@@ -94,8 +97,8 @@ describe("unwinder", () => {
     h.chain.positions.set(KEY, wad(2));
     await unwinder.tick();
     const first = resting()[0]!.orderHash;
-    // a move inside the threshold (20 bps) changes nothing
-    h.chain.index = wad("100.15");
+    // a move inside the threshold (never more than the offset: 10 bps) changes nothing
+    h.chain.index = wad("100.05");
     await h.engine.refreshChainState();
     await unwinder.tick();
     expect(resting()[0]!.orderHash).toBe(first);
@@ -115,6 +118,7 @@ describe("unwinder", () => {
     expect(h.engine.getOrder(second)!.status).toBe("cancelled");
     // nearing expiry: renewed
     const third = resting()[0]!;
+    h.chain.time = BigInt(h.clock.now + 181);
     h.clock.now += 181; // 119 s left of 300
     await unwinder.tick();
     expect(resting()).toHaveLength(1);
@@ -361,6 +365,7 @@ describe("funding, open interest, insurance fund and bad debt in the API", () =>
     h.chain.oi = { longs: wad(7), shorts: wad(7) };
     h.chain.insurance = 1_234_000_000n;
     await h.engine.refreshChainState();
+    await h.engine.refreshStats();
     const app = await buildServer(h.engine);
     const m = (await app.inject({ url: "/markets" })).json()[0];
     expect(m).toMatchObject({
@@ -382,7 +387,7 @@ describe("funding, open interest, insurance fund and bad debt in the API", () =>
     // bad debt appears; some views start reverting (oracle trouble)
     h.chain.badDebt = 5_000_000n;
     h.chain.failing = new Set(["markTwap", "currentFundingRate", "insuranceFund"]);
-    await h.engine.refreshChainState();
+    await h.engine.refreshStats();
     health = (await app.inject({ url: "/health" })).json();
     expect(health.insuranceFund).toBeNull();
     expect(health.totalBadDebt).toBe("5000000");
@@ -403,16 +408,19 @@ describe("funding, open interest, insurance fund and bad debt in the API", () =>
     h.chain.twap = wad(101);
     h.chain.fundingRate = 5n;
     await h.engine.refreshChainState();
+    await h.engine.refreshStats();
     expect(h.engine.getMarkets()[0]).toMatchObject({ markTwap: wad(101), currentFundingRate: 5n });
     h.chain.indexFails = true;
     h.chain.twap = 0n;
     h.chain.fundingRate = 0n;
     await h.engine.refreshChainState();
+    await h.engine.refreshStats();
     expect(h.engine.getMarkets()[0]).toMatchObject({ indexPrice: null, markTwap: null, currentFundingRate: null });
     // a genuine zero rate with a live index stays a zero
     h.chain.indexFails = false;
     h.chain.twap = wad(100);
     await h.engine.refreshChainState();
+    await h.engine.refreshStats();
     expect(h.engine.getMarkets()[0]).toMatchObject({ markTwap: wad(100), currentFundingRate: 0n });
   });
 

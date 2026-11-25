@@ -78,11 +78,17 @@ export type RejectReason =
 export type CancelReason = "ioc" | "self_trade" | "price_band" | "halted" | "post_only" | "oi_cap";
 
 /**
- * Says how much of a prospective fill between `maker` and `taker` may trade (0 = none,
- * anything up to `size`). Called once per prospective fill, in matching order, so it
- * may keep a running budget. Used for limits that depend on who trades with whom
- * (open-interest cap, halted market).
+ * Says how much of a prospective fill between `maker` and `taker` may trade. Called
+ * once per prospective fill, in matching order, so it may keep running budgets.
+ *  - `size`: all of it.
+ *  - `0`: none, and matching stops here (the taker's remainder is cancelled with
+ *    `limitReason`): open-interest cap, halted market.
+ *  - between: that much trades; the pair is then asked about again.
+ *  - `DROP_MAKER` / `DROP_TAKER`: that order can no longer trade at all (a reduce-only
+ *    order whose position is gone). It is removed from the book and matching goes on.
  */
+export const DROP_MAKER = -1n;
+export const DROP_TAKER = -2n;
 export type FillLimit = (maker: Readonly<RestingOrder>, taker: Readonly<BookOrder>, size: bigint) => bigint;
 
 export interface PlaceOptions {
@@ -128,6 +134,8 @@ export type PlaceResult =
       cancelReason?: CancelReason;
       /** Ids of resting orders removed because they had expired. */
       expired: string[];
+      /** Resting orders the fill limit removed (`DROP_MAKER`). */
+      dropped: { id: string; size: bigint }[];
     };
 
 export interface UncrossResult {
@@ -203,6 +211,7 @@ export class OrderBook {
     }
 
     const seq = this.nextSeq++;
+    const dropped: { id: string; size: bigint }[] = [];
     const fills: BookFill[] = [];
     let remaining = size;
     let cancelReason: CancelReason | undefined;
@@ -222,9 +231,18 @@ export class OrderBook {
       let fillSize = remaining < maker.remaining ? remaining : maker.remaining;
       if (opts.limit) {
         const allowed = this.allowed(opts.limit, maker, order, fillSize);
-        if (allowed < fillSize) cancelReason = opts.limitReason ?? "oi_cap"; // stop after this (possibly empty) fill
-        if (allowed === 0n) break;
-        fillSize = allowed;
+        if (allowed === DROP_MAKER) {
+          opposite.shift();
+          this.byId.delete(maker.id);
+          dropped.push({ id: maker.id, size: maker.remaining });
+          continue;
+        }
+        if (allowed <= 0n) {
+          // Nothing (more) may trade here; nothing is skipped: stop.
+          cancelReason = allowed === DROP_TAKER ? "halted" : (opts.limitReason ?? "oi_cap");
+          break;
+        }
+        fillSize = allowed; // if less than the pair could trade, the pair is asked about again
       }
       fills.push({ makerId: maker.id, takerId: order.id, price: maker.price, size: fillSize, takerIsBuy: order.isBuy });
       remaining -= fillSize;
@@ -233,7 +251,6 @@ export class OrderBook {
         opposite.shift();
         this.byId.delete(maker.id);
       }
-      if (cancelReason !== undefined) break;
     }
 
     let rested = 0n;
@@ -251,7 +268,7 @@ export class OrderBook {
       cancelReason = undefined;
     }
 
-    return { accepted: true, seq, fills, rested, cancelled, ...(cancelled > 0n ? { cancelReason } : {}), expired };
+    return { accepted: true, seq, fills, rested, cancelled, ...(cancelled > 0n ? { cancelReason } : {}), expired, dropped };
   }
 
   /**
@@ -339,13 +356,19 @@ export class OrderBook {
       let size = bid.remaining < ask.remaining ? bid.remaining : ask.remaining;
       if (!drop && opts.limit) {
         const allowed = this.allowed(opts.limit, maker, taker, size);
-        if (allowed === 0n) drop = opts.limitReason ?? "oi_cap";
+        if (allowed === DROP_MAKER) {
+          this.remove(maker);
+          res.cancelled.push({ id: maker.id, size: maker.remaining, reason: "halted" });
+          continue;
+        }
+        if (allowed === DROP_TAKER) drop = "halted";
+        else if (allowed === 0n) drop = opts.limitReason ?? "oi_cap";
         else if (allowed < size) {
-          // Trade what is allowed; the newer order then gives way for the rest.
+          // Trade what is allowed and ask about the pair again.
           res.fills.push({ makerId: maker.id, takerId: taker.id, price: maker.price, size: allowed, takerIsBuy: taker.isBuy });
           maker.remaining -= allowed;
           taker.remaining -= allowed;
-          drop = opts.limitReason ?? "oi_cap";
+          continue;
         }
       }
       if (drop) {
@@ -413,6 +436,7 @@ export class OrderBook {
    */
   private allowed(limit: FillLimit, maker: RestingOrder, taker: BookOrder, size: bigint): bigint {
     let a = limit(maker, taker, size);
+    if (a === DROP_MAKER || a === DROP_TAKER) return a;
     if (a > size) a = size;
     if (a < 0n) a = 0n;
     if (a < size && a < this.minOrderSize) a = 0n;

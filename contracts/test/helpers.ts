@@ -84,6 +84,17 @@ export async function deployFixture() {
   return { owner, operator, feeRecipient, alice, bob, carol, dave, liquidator, stranger, token, oracle, exchange, ctx };
 }
 
+/**
+ * Lets the funding interval pass and refreshes the prices, so that the next fill first
+ * closes the old funding period and then opens a new one that starts exactly at that
+ * fill. A premium that stands for the whole period makes for round numbers in tests.
+ */
+export async function startNewFundingPeriodAtNextFill(f: { oracle: MockOracle }, prices: Record<number, bigint> = { [BTC]: BTC_PRICE, [ETH]: ETH_PRICE }) {
+  const { time } = await import("@nomicfoundation/hardhat-network-helpers");
+  await time.increase(HOUR);
+  for (const [market, price] of Object.entries(prices)) await f.oracle.setPrice(Number(market), price);
+}
+
 /** Convenience wrapper around the exchange for building, signing and settling orders. */
 export class Ctx {
   private nonce = 1n;
