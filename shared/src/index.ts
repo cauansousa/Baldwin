@@ -83,6 +83,7 @@ export const EXCHANGE_ABI = [
   "function currentFundingRate(uint32 marketId) view returns (int256)",
   "function guardian() view returns (address)",
   "function oracle() view returns (address)",
+  "function lastGoodPrice(uint32 marketId) view returns (uint256)",
   "function cumulativeFunding(uint32 marketId) view returns (int256)",
   "function openInterest(uint32 marketId) view returns (uint256 longs, uint256 shorts)",
   "function insuranceFund() view returns (uint256)",

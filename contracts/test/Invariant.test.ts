@@ -28,7 +28,7 @@ const MARKETS = [BTC, ETH];
 const STEPS = 300;
 // Coverage the four seeds must reach together (the runs are deterministic; these are a
 // little below what they produce today, so an accidental loss of coverage shows).
-const MIN_TOTALS = { liquidations: 0, fallbackLiquidations: 0, edgeReductions: 0, fills: 0, badDebtRepayments: 0 };
+const MIN_TOTALS = { liquidations: 20, fallbackLiquidations: 5, fallbackWithKnownTruth: 2, edgeReductions: 75, fills: 400, badDebtRepayments: 2 };
 
 describe("Solvency invariant (randomized)", function () {
   this.timeout(600_000);
@@ -47,6 +47,7 @@ describe("Solvency invariant (randomized)", function () {
     // Across the seeds the runs must have covered what the test is for.
     expect(totals.liquidations, "liquidations").to.be.gte(MIN_TOTALS.liquidations);
     expect(totals.fallbackLiquidations, "liquidations with a market valued without a price").to.be.gte(MIN_TOTALS.fallbackLiquidations);
+    expect(totals.fallbackWithKnownTruth, "... where the true value was known and checked").to.be.gte(MIN_TOTALS.fallbackWithKnownTruth);
     expect(totals.edgeReductions, "reducing fills at the band edge").to.be.gte(MIN_TOTALS.edgeReductions);
     expect(totals.fills, "fills").to.be.gte(MIN_TOTALS.fills);
     // most random fills must go through, or the run exercises little

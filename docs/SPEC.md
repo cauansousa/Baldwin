@@ -34,14 +34,19 @@ The source of truth for the on-chain interface is
   millisecond timestamp in the high bits), so `cancelAllOrders(minValidNonce)` cancels
   everything signed before a point in time. Only on-chain cancels bind the contract.
 - Fees: maker/taker bps of notional, charged in USDC, paid to the fee recipient.
-- Funding: hourly; rate = clamp((mark − index) / index, ±cap), longs pay shorts when
-  positive. Mark = time-weighted average fill price over the funding period (the index
-  if the market did not trade), so one fill cannot set the rate. Accrued through a cumulative index, settled into
-  balance whenever a position is touched.
+- Funding: hourly; longs pay shorts when the rate is positive. Each fill records its premium
+  against the index at that fill, `(price − index) / index`, clamped to the cap; the rate is
+  the time-weighted average of those premiums over the period, with time before the first
+  fill at zero and no fill counting for more than one interval. A market that trades at the
+  index, or does not trade, pays nothing. Nothing accrues while paused or in an inactive
+  market. Accrued through a cumulative index, settled into balance whenever a position is
+  touched.
 - Liquidation: anyone may take over a position of an account below maintenance margin at
   the index price. The liquidator becomes the counterparty, so it needs its own collateral
   and must satisfy initial margin afterwards. A position of the liquidated trader in another
-  market whose price is unavailable is valued at entry, so one stale feed cannot shield an account. Penalty (bps of notional) is split between liquidator and insurance
+  market whose price is unavailable is valued at the last good price the exchange saw (entry
+  if none), so one stale feed cannot shield an account; the liquidator then gets no share of
+  the penalty. Penalty (bps of notional) is split between liquidator and insurance
   fund. Losses beyond the account's value are covered by the insurance fund; any
   remainder is recorded as bad debt (event) — socialized loss/ADL is out of MVP scope.
 - Oracle: `IOracle.getPrice(marketId) → (priceWad, updatedAt)`; stale prices revert.
