@@ -234,6 +234,10 @@ export interface KeeperConfig extends CommonConfig {
   unwindOffsetBps: bigint;
   unwindRepriceBps: bigint;
   unwindExpirySec: number;
+  /** How often the unwinder looks at its orders (its own timer, apart from the liquidation loop). */
+  unwindIntervalMs: number;
+  /** The process exits (to be restarted) when no keeper tick has completed for this long. */
+  stuckExitMs: number;
   /** Port of the keeper's own /health and /metrics; 0 = off. */
   port: number;
   host: string;
@@ -269,7 +273,9 @@ export function loadKeeperConfig(env: Env = process.env): KeeperConfig {
     unwind: bool(env, "KEEPER_UNWIND", true),
     engineUrl: engineUrl(env),
     unwindOffsetBps: BigInt(int(env, "KEEPER_UNWIND_OFFSET_BPS", 10, 0)),
-    unwindRepriceBps: BigInt(int(env, "KEEPER_UNWIND_REPRICE_BPS", 20, 1)),
+    unwindRepriceBps: BigInt(int(env, "KEEPER_UNWIND_REPRICE_BPS", 5, 1)),
+    unwindIntervalMs: int(env, "KEEPER_UNWIND_INTERVAL_MS", 1000, 100),
+    stuckExitMs: int(env, "KEEPER_STUCK_EXIT_MS", 300_000, 10_000),
     unwindExpirySec: int(env, "KEEPER_UNWIND_EXPIRY_SEC", 300, 150),
     port: int(env, "KEEPER_PORT", 0, 0),
     host: env.KEEPER_HOST || "127.0.0.1",

@@ -13,6 +13,11 @@ import { createLogger, errMessage } from "./types.ts";
 
 let log = createLogger("info", "engine");
 
+/** Until the engine is up, a signal simply ends the process (there is nothing to flush yet). */
+let onSignal: (signal: string) => void = () => process.exit(0);
+process.on("SIGINT", () => onSignal("SIGINT"));
+process.on("SIGTERM", () => onSignal("SIGTERM"));
+
 async function main(): Promise<void> {
   try {
     process.loadEnvFile();
@@ -187,8 +192,7 @@ async function main(): Promise<void> {
     }
     exitNow(0);
   };
-  process.on("SIGINT", () => void shutdown("SIGINT"));
-  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  onSignal = (signal) => void shutdown(signal);
 
   await app.listen({ port: cfg.port, host: cfg.host });
   log.info("engine listening", {

@@ -201,6 +201,20 @@ export interface EngineOptions {
   statsRefreshMs?: number;
   /** The contract's funding interval, for `nextFundingTime`. Default 3600. */
   fundingIntervalSec?: number;
+  /** Upper bound for one chain read during a refresh. Default 5000. */
+  chainReadTimeoutMs?: number;
+  /**
+   * Matches of a trader (as taker) that could not settle for a reason that is nobody's
+   * fault, within `globalFailureWindowSec`, after which the trader's new orders are
+   * refused for the rest of the window. Default 5.
+   */
+  globalFailureThreshold?: number;
+  /** Default 60. */
+  globalFailureWindowSec?: number;
+  /** Chain time further ahead of the host clock than this halts intake. Default 900. */
+  maxChainTimeLeadSec?: number;
+  /** Dead nonces without an order (pre-emptive cancels) one trader may have. Default 100. */
+  maxOrderlessCancels?: number;
   /** Max matches per settleMatches transaction. Default 20. */
   maxBatchSize?: number;
   /** Delay before re-trying a batch whose outcome is unknown or that reverted. Default 2000. */
@@ -230,6 +244,8 @@ interface OrderRecord {
   closed?: { status: "cancelled" | "expired" | "rejected"; reason: string };
   /** Consecutive unattributed on-chain failures. */
   strikes: number;
+  /** Matches this order took part in as taker that failed through nobody's fault (not persisted). */
+  noFaultFailures: number;
   createdAt: number;
 }
 
@@ -271,7 +287,8 @@ const CANCEL_TEXT: Record<CancelReason, string> = {
   ioc: "IOC remainder cancelled",
   self_trade: "self-trade prevention: would match own resting order",
   price_band: "price outside the oracle price band",
-  halted: "exchange paused or market inactive: only reduce-only orders can trade",
+  halted: "exchange paused, market inactive or without an index price: this order cannot trade now",
+  oi_cap: "open-interest cap reached: only fills that do not add open interest can trade",
   post_only: "post-only order would have taken liquidity",
 };
 
@@ -343,8 +360,31 @@ export class Engine extends EventEmitter<EngineEvents> {
   private chainStateAt = 0;
   private marketsAt = 0;
   private statsAt = 0;
-  /** Seconds by which the latest block's timestamp is ahead of this host's clock (>= 0). */
+  /** Seconds by which the latest block's timestamp is ahead of this host's clock (>= 0), once it has persisted. */
   private chainTimeLead = 0n;
+  /** The last few raw readings of that lead. */
+  private readonly leadSamples: bigint[] = [];
+  /** The lead exceeds `maxChainTimeLead`: clocks cannot be trusted, intake is halted. */
+  private clockSkew: bigint | null = null;
+  private readonly maxChainTimeLead: bigint;
+  private readonly chainReadTimeoutMs: number;
+  private statsRefreshing: Promise<void> | null = null;
+  private statsTimer: NodeJS.Timeout | null = null;
+  /** market -> long open interest as last read (plus what the engine settled since). */
+  private readonly openInterest = new Map<number, bigint>();
+  /** market -> size of unsettled matches that may add open interest. */
+  private readonly pendingOi = new Map<number, bigint>();
+  /** trader -> unix seconds of matches that failed as taker through nobody's fault. */
+  private readonly globalFailures = new Map<string, number[]>();
+  private readonly globalFailureThreshold: number;
+  private readonly globalFailureWindowSec: number;
+  /** trader:market -> position the engine expects once its own unsettled matches have settled. */
+  private readonly expectedPosition = new Map<string, bigint>();
+  /** trader -> number of dead nonces that belong to no order. */
+  private readonly orderlessCancels = new Map<string, number>();
+  private readonly maxOrderlessCancels: number;
+  /** trader -> generation of the chain-read cache (bumped on invalidation). */
+  private readonly cacheGeneration = new Map<string, number>();
   private readonly statsRefreshMs: number;
   private readonly fundingInterval: bigint;
   private insuranceFund: bigint | null = null;
@@ -425,6 +465,11 @@ export class Engine extends EventEmitter<EngineEvents> {
     this.maxChainStateAgeMs = opts.maxChainStateAgeMs ?? 30_000;
     this.marketRefreshMs = opts.marketRefreshMs ?? 30_000;
     this.statsRefreshMs = opts.statsRefreshMs ?? 10_000;
+    this.chainReadTimeoutMs = opts.chainReadTimeoutMs ?? 5000;
+    this.maxChainTimeLead = BigInt(opts.maxChainTimeLeadSec ?? 900);
+    this.globalFailureThreshold = opts.globalFailureThreshold ?? 5;
+    this.globalFailureWindowSec = opts.globalFailureWindowSec ?? 60;
+    this.maxOrderlessCancels = opts.maxOrderlessCancels ?? 100;
     this.fundingInterval = BigInt(opts.fundingIntervalSec ?? 3600);
     this.metrics.gauge("insurance_fund_usdc", "Insurance fund of the exchange, USDC", () => (this.insuranceFund === null ? null : Number(this.insuranceFund) / 1e6));
     this.metrics.gauge("total_bad_debt_usdc", "Bad debt recorded by the exchange, USDC", () => (this.totalBadDebt === null ? null : Number(this.totalBadDebt) / 1e6));
@@ -457,7 +502,7 @@ export class Engine extends EventEmitter<EngineEvents> {
         continue;
       }
       const traderKey = o.order.trader.toLowerCase();
-      const rec: OrderRecord = { ...o, traderKey, reduceOnly: o.order.reduceOnly };
+      const rec: OrderRecord = { ...o, traderKey, reduceOnly: o.order.reduceOnly, noFaultFailures: 0 };
       // Second line of defence: a resting order whose nonce is dead (or that carries a
       // cancel) must not come back, whatever sequence of writes led to this state.
       if (!rec.closed && rec.remaining > 0n) {
@@ -507,6 +552,12 @@ export class Engine extends EventEmitter<EngineEvents> {
       if (list.length > this.tradeHistory) list.shift();
       this.lastPrice.set(t.marketId, t.price);
     }
+    for (const key of this.dead.keys()) {
+      if (this.usedNonces.has(key)) continue;
+      const trader = key.slice(0, key.indexOf(":"));
+      this.orderlessCancels.set(trader, (this.orderlessCancels.get(trader) ?? 0) + 1);
+    }
+    for (const m of [...this.queue, ...(this.current?.matches ?? [])]) this.trackMatch(m, 1n);
     const counters = JSON.parse(store.getMeta("engine.counters") ?? "{}") as { matchSeq?: number; batchSeq?: number; tradeSeq?: number };
     this.matchSeq = counters.matchSeq ?? 0;
     this.batchSeq = counters.batchSeq ?? 0;
@@ -672,6 +723,11 @@ export class Engine extends EventEmitter<EngineEvents> {
       void this.refreshChainState();
       this.refreshTimer = setInterval(() => void this.refreshChainState(), chainRefreshMs);
       this.refreshTimer.unref();
+      // Figures for clients have their own timer and guard: a slow view there never delays
+      // the refresh that matching depends on.
+      void this.refreshStats();
+      this.statsTimer = setInterval(() => void this.refreshStats(), Math.max(1000, this.statsRefreshMs));
+      this.statsTimer.unref();
     }
   }
 
@@ -684,7 +740,8 @@ export class Engine extends EventEmitter<EngineEvents> {
     this.draining = true;
     if (this.sweepTimer) clearInterval(this.sweepTimer);
     if (this.refreshTimer) clearInterval(this.refreshTimer);
-    this.sweepTimer = this.refreshTimer = null;
+    if (this.statsTimer) clearInterval(this.statsTimer);
+    this.sweepTimer = this.refreshTimer = this.statsTimer = null;
     if (drainTimeoutMs > 0 && this.loop) {
       let timer: NodeJS.Timeout | undefined;
       const timedOut = await Promise.race([
@@ -711,19 +768,35 @@ export class Engine extends EventEmitter<EngineEvents> {
    * cancelled. A market whose index cannot be read is halted for new orders until it
    * can. Never rejects.
    */
-  refreshChainState(): Promise<void> {
-    if (!this.chain) return Promise.resolve();
-    this.refreshing ??= this.doRefresh(this.chain).finally(() => (this.refreshing = null));
+  refreshChainState(opts: { fresh?: boolean } = {}): Promise<void> {
+    const chain = this.chain;
+    if (!chain) return Promise.resolve();
+    if (this.refreshing && opts.fresh) {
+      // A refresh already under way may have read the chain before the event the caller
+      // is reacting to: let it finish, then read again.
+      return this.refreshing.then(() => this.refreshChainState());
+    }
+    this.refreshing ??= this.doRefresh(chain).finally(() => (this.refreshing = null));
     return this.refreshing;
+  }
+
+  /** `p`, or a rejection after `chainReadTimeoutMs`. */
+  private timed<T>(p: Promise<T>): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("chain read timed out")), this.chainReadTimeoutMs);
+    });
+    p.catch(() => {});
+    return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
   }
 
   private async doRefresh(chain: ChainReader): Promise<void> {
     try {
-      this.bandBps ??= await chain.maxPriceDeviationBps();
-      this.exchangePaused = await chain.paused();
+      this.bandBps ??= await this.timed(chain.maxPriceDeviationBps());
+      this.exchangePaused = await this.timed(chain.paused());
       if (Date.now() - this.marketsAt >= this.marketRefreshMs) {
         for (const [marketId, old] of this.markets) {
-          const fresh = await chain.getMarket(marketId);
+          const fresh = await this.timed(chain.getMarket(marketId));
           this.markets.set(marketId, { ...fresh, symbol: fresh.symbol || old.symbol });
           this.books.get(marketId)!.minOrderSize = fresh.minOrderSize;
         }
@@ -731,29 +804,22 @@ export class Engine extends EventEmitter<EngineEvents> {
       }
       for (const [marketId, st] of this.marketState) {
         try {
-          st.index = await chain.indexPrice(marketId);
+          st.index = await this.timed(chain.indexPrice(marketId));
           st.band = priceBand(st.index, this.bandBps);
         } catch (e) {
           if (st.index !== null) this.log.warn("index price unavailable; market halted", { marketId, error: errMessage(e) });
           st.index = null;
         }
+        // Open interest gates matching (see matchOptions), so it is read here and not with
+        // the figures for clients. An unreadable value keeps the last one.
+        try {
+          this.openInterest.set(marketId, (await this.timed(chain.openInterest(marketId))).longs);
+        } catch {
+          // keep the last known value
+        }
       }
-      // Expiry is judged by block.timestamp. If the chain's clock is ahead of this host's
-      // (clock skew; a local node that advances a second per block), orders must be
-      // treated as expiring that much earlier, or they would reach the chain too late.
-      try {
-        const lead = (await chain.blockTimestamp()) - BigInt(this.clock());
-        const capped = lead > 900n ? 900n : lead < 0n ? 0n : lead;
-        if (lead > 900n && this.chainTimeLead < 900n) this.log.warn("chain time is far ahead of the host clock; check the clocks", { leadSeconds: lead });
-        this.chainTimeLead = capped;
-      } catch {
-        // keep the last known lead
-      }
+      await this.readChainTime(chain);
       this.chainStateAt = Date.now();
-      if (Date.now() - this.statsAt >= this.statsRefreshMs) {
-        await this.refreshStats(chain);
-        this.statsAt = Date.now();
-      }
     } catch (e) {
       for (const st of this.marketState.values()) st.index = null;
       this.log.warn("chain state refresh failed; markets halted", { error: errMessage(e) });
@@ -773,31 +839,80 @@ export class Engine extends EventEmitter<EngineEvents> {
   }
 
   /**
-   * Figures for clients. Every view is read on its own: one that reverts (stale oracle,
-   * sequencer down) leaves its field null and does not disturb the others or matching.
+   * Expiry is judged by block.timestamp. If the chain's clock is ahead of this host's
+   * (clock skew; a local node that advances a second per block), orders must be treated
+   * as expiring that much earlier, or they would reach the chain too late.
+   *
+   * One reading proves nothing (a lagging or misconfigured backend, a test chain that
+   * travelled in time): the lead that is applied is the smallest of the last three
+   * readings, so it must persist before it expires anything and vanishes at once when
+   * it is gone. A lead beyond `maxChainTimeLead` is not applied at all: then the clocks
+   * cannot be trusted, intake is halted and /health says so.
    */
-  private async refreshStats(chain: ChainReader): Promise<void> {
-    const read = <T>(p: Promise<T>): Promise<T | null> => p.catch(() => null);
+  private async readChainTime(chain: ChainReader): Promise<void> {
+    let raw: bigint;
+    try {
+      raw = (await this.timed(chain.blockTimestamp())) - BigInt(this.clock());
+    } catch {
+      return; // keep what we had
+    }
+    this.leadSamples.push(raw < 0n ? 0n : raw);
+    if (this.leadSamples.length > 3) this.leadSamples.shift();
+    if (this.leadSamples.length < 3) return;
+    const persistent = this.leadSamples.reduce((a, b) => (a < b ? a : b));
+    if (persistent > this.maxChainTimeLead) {
+      if (this.clockSkew === null) {
+        this.log.error("chain time is far ahead of the host clock; order intake halted until the clocks agree", { leadSeconds: persistent });
+      }
+      this.clockSkew = persistent;
+      this.chainTimeLead = 0n;
+    } else {
+      if (this.clockSkew !== null) this.log.info("chain time and host clock agree again", { leadSeconds: persistent });
+      this.clockSkew = null;
+      this.chainTimeLead = persistent;
+    }
+  }
+
+  /**
+   * Figures for clients (funding, open interest, insurance fund, bad debt). Runs on
+   * its own guard, apart from the refresh matching depends on. Every view is read on
+   * its own and with a timeout: one that reverts or hangs (stale oracle, sequencer
+   * down, slow node) leaves its field null and disturbs nothing else. Never rejects.
+   */
+  refreshStats(): Promise<void> {
+    const chain = this.chain;
+    if (!chain) return Promise.resolve();
+    this.statsRefreshing ??= this.doRefreshStats(chain)
+      .catch((e) => this.log.warn("stats refresh failed", { error: errMessage(e) }))
+      .finally(() => (this.statsRefreshing = null));
+    return this.statsRefreshing;
+  }
+
+  private async doRefreshStats(chain: ChainReader): Promise<void> {
+    const read = <T>(p: Promise<T>): Promise<T | null> => this.timed(p).catch(() => null);
     [this.insuranceFund, this.totalBadDebt] = await Promise.all([read(chain.insuranceFund()), read(chain.totalBadDebt())]);
     for (const [marketId, st] of this.marketState) {
-      const [markTwap, currentFundingRate, lastFundingTime, oi] = await Promise.all([
+      const [index, twap, rate, lastFundingTime, oi] = await Promise.all([
+        read(chain.indexPrice(marketId)),
         read(chain.markTwap(marketId)),
         read(chain.currentFundingRate(marketId)),
         read(chain.lastFundingTime(marketId)),
         read(chain.openInterest(marketId)),
       ]);
-      // Both views return 0 instead of reverting while the index is unavailable: 0 is
-      // then "unknown", not a price (and not a rate anyone should display).
-      const indexDown = st.index === null;
+      // markTwap and currentFundingRate return 0 instead of reverting while the index is
+      // unavailable: 0 is then "unknown", not a price, and the rate derived from it is
+      // not a rate anyone should display.
+      const markTwap = twap === null || twap === 0n || index === null ? null : twap;
       st.stats = {
-        markTwap: markTwap === 0n || indexDown ? null : markTwap,
-        currentFundingRate: indexDown ? null : currentFundingRate,
+        markTwap,
+        currentFundingRate: markTwap === null ? null : rate,
         lastFundingTime,
         nextFundingTime: lastFundingTime === null ? null : lastFundingTime + this.fundingInterval,
         openInterestLong: oi?.longs ?? null,
         openInterestShort: oi?.shorts ?? null,
       };
     }
+    this.statsAt = Date.now();
   }
 
   /** Exchange-wide figures (USDC units); null when unknown. */
@@ -811,12 +926,43 @@ export class Engine extends EventEmitter<EngineEvents> {
   }
 
   /** Current exchange-level view the engine matches under (for /health). */
-  chainStatus(): { paused: boolean; markets: { marketId: number; indexPrice: bigint | null; band: Band | null }[] } | null {
+  chainStatus(): {
+    paused: boolean;
+    /** Seconds the chain's clock is (persistently) ahead of the host's and applied to expiry. */
+    chainTimeLeadSec: bigint;
+    /** Set (to the lead in seconds) when the clocks disagree too much: intake is halted. */
+    clockSkewSec: bigint | null;
+    markets: { marketId: number; indexPrice: bigint | null; band: Band | null; openInterestCapReached: boolean }[];
+  } | null {
     if (!this.chain) return null;
     return {
       paused: this.exchangePaused,
-      markets: [...this.marketState].map(([marketId, st]) => ({ marketId, indexPrice: st.index, band: st.band ?? null })),
+      chainTimeLeadSec: this.chainTimeLead,
+      clockSkewSec: this.clockSkew,
+      markets: [...this.marketState].map(([marketId, st]) => ({
+        marketId,
+        indexPrice: st.index,
+        band: st.band ?? null,
+        openInterestCapReached: this.oiHeadroom(marketId) === 0n,
+      })),
     };
+  }
+
+  /** The engine's "now" for order expiry (unix seconds): host time plus the applied chain-time lead. */
+  engineTime(): bigint {
+    return this.timeNow();
+  }
+
+  /**
+   * Size that may still be matched in fills that can add open interest, or null if
+   * open interest is not known. Counts what the chain last reported plus every match
+   * of that kind the engine has made and not yet seen settle.
+   */
+  private oiHeadroom(marketId: number): bigint | null {
+    const oi = this.openInterest.get(marketId);
+    if (oi === undefined) return null;
+    const room = this.markets.get(marketId)!.maxOpenInterest - oi - (this.pendingOi.get(marketId) ?? 0n);
+    return room > 0n ? room : 0n;
   }
 
   /** Resolves once every queued match has reached a final on-chain outcome. */
@@ -965,12 +1111,32 @@ export class Engine extends EventEmitter<EngineEvents> {
     const postOnly = req.postOnly ?? false;
     const ioc = req.ioc ?? false;
 
+    // An order the engine already has is answered with its state before anything else:
+    // whatever the engine is doing (draining, recovering, store trouble, a stalled
+    // settlement) and however close the order is to its expiry, a retry of a known
+    // order must never be told "not applied". The signature is still checked, so that
+    // only someone holding the signed order gets this answer.
+    const hash = hashOrder(this.domain, order);
+    const known = this.orders.get(hash);
+    if (known) {
+      if (!(await verifyOrderSignature(this.domain, order, req.signature))) {
+        throw new EngineError("BAD_SIGNATURE", "signature is not a canonical EIP-712 signature by order.trader");
+      }
+      return this.existing(known);
+    }
+
     const market = this.markets.get(order.marketId);
     if (!market) throw new EngineError("UNKNOWN_MARKET", `unknown market ${order.marketId}`);
     if (!market.active) throw new EngineError("MARKET_INACTIVE", `market ${order.marketId} is not active`);
     if (this.draining) throw new EngineError("SHUTTING_DOWN", "engine is shutting down; not accepting orders");
     if (this.recovering) throw new EngineError("RECOVERING", "engine is reconciling its state with the chain after a restart; try again shortly");
     if (this.storeBroken) throw new EngineError("STORE_UNAVAILABLE", "engine state cannot be persisted; not accepting orders");
+    if (this.clockSkew !== null) {
+      throw new EngineError(
+        "CHAIN_UNAVAILABLE",
+        `chain time is ${this.clockSkew} s ahead of the engine's clock: order expiry cannot be judged; not accepting orders`,
+      );
+    }
     if (this.stalled) {
       // Do not pile up matches while their settlement outcome cannot be determined.
       throw new EngineError("CHAIN_UNAVAILABLE", "settlement is stalled; not accepting orders");
@@ -996,20 +1162,13 @@ export class Engine extends EventEmitter<EngineEvents> {
       throw new EngineError("INVALID_EXPIRY", `expiry must be at most ${this.maxTimeToExpiry} seconds from now`);
     }
 
-    const hash = hashOrder(this.domain, order);
     const traderKey = order.trader.toLowerCase();
-    const known = this.orders.get(hash);
-    if (known) {
-      // Same signed order again: answer with its state. The signature is still checked,
-      // so that only someone holding the signed order gets this answer.
-      if (!(await verifyOrderSignature(this.domain, order, req.signature))) {
-        throw new EngineError("BAD_SIGNATURE", "signature is not a canonical EIP-712 signature by order.trader");
-      }
-      return this.existing(known);
-    }
     this.checkNotSeen(hash, order);
     if (this.isSuspended(traderKey)) {
       throw new EngineError("TRADER_SUSPENDED", "too many of this trader's orders failed on-chain recently; try again later");
+    }
+    if (this.recentCount(this.globalFailures, traderKey, this.globalFailureWindowSec) >= this.globalFailureThreshold) {
+      throw new EngineError("RATE_LIMITED", "too many of this trader's matches could not settle in the last minute; try again shortly");
     }
 
     // From here on a signed Cancel for this hash is honoured even though the order is
@@ -1117,6 +1276,7 @@ export class Engine extends EventEmitter<EngineEvents> {
       filled: priorFilled,
       userCancelled: false,
       strikes: 0,
+      noFaultFailures: 0,
       createdAt: Date.now(),
     };
     this.orders.set(hash, rec);
@@ -1166,8 +1326,22 @@ export class Engine extends EventEmitter<EngineEvents> {
       // the trader and nonce the Cancel signature can be checked on its own, and the
       // nonce is made dead - durably, before answering - so the order cannot land later.
       if (!hint) throw new EngineError("NOT_FOUND", "unknown order; send trader and nonce with the signature to cancel an order the engine has not received");
+      // Only nonces an order could be accepted with can need a pre-emptive cancel.
+      if (hint.nonce > ((this.timeNow() + 86_400n) * 1000n) << 64n) {
+        throw new EngineError("INVALID_ORDER", "nonce is too far in the future: no order with it would be accepted");
+      }
       if (!(await verifyCancelSignature(this.domain, hint.trader, hint.nonce, signature))) {
         throw new EngineError("BAD_SIGNATURE", "signature is not a canonical EIP-712 Cancel signature by the given trader for the given nonce");
+      }
+      const tk = hint.trader.toLowerCase();
+      const key = nonceKey(tk, hint.nonce);
+      // Each of these is a durable row that belongs to no order: bounded per trader,
+      // and rate-limited like orders (counted only now that the signature is known good).
+      if (!this.dead.has(key) && !this.usedNonces.has(key)) {
+        if (!this.takeTraderSlot(tk)) throw new EngineError("RATE_LIMITED", "too many requests from this trader; slow down");
+        if ((this.orderlessCancels.get(tk) ?? 0) >= this.maxOrderlessCancels) {
+          throw new EngineError("RATE_LIMITED", "too many cancels for orders the engine has never received; use cancelAllOrders on-chain to cancel in bulk");
+        }
       }
       this.cancelNonce(hint.trader, hint.nonce, "cancelled by trader");
       // The nonce may belong to an order known under another hash than the one in the URL.
@@ -1212,14 +1386,17 @@ export class Engine extends EventEmitter<EngineEvents> {
     const rec = hash ? this.orders.get(hash) : undefined;
     // Without a known order, keep the entry for as long as any acceptable order could live, plus a day.
     const until = expiry ?? rec?.order.expiry ?? BigInt(this.clock()) + this.maxTimeToExpiry + 86_400n;
-    const known = (this.dead.get(key) ?? 0n) >= until;
+    // Already dead and nothing left to cancel: a repeat (a client retry, or an on-chain
+    // event read again in the rescan window) writes nothing and counts nothing.
+    const known = this.dead.has(key);
     const target = rec && !rec.userCancelled ? rec : undefined;
     if (known && !target) return;
     const closes = target !== undefined && !target.closed && target.remaining > 0n;
     const after = target && this.cancelledState(target, closes, reason);
     this.commitFirst({ orders: after ? [after] : [], deadNonces: [{ trader, nonce, expiry: until }] });
     // Durable. Now the same change in memory.
-    this.dead.set(key, until);
+    if (!known && !rec) this.orderlessCancels.set(traderKey, (this.orderlessCancels.get(traderKey) ?? 0) + 1);
+    this.dead.set(key, until > (this.dead.get(key) ?? 0n) ? until : this.dead.get(key)!);
     if (!known) this.metrics.inc("orders_cancelled_total");
     if (target) this.applyCancel(target, closes, reason);
   }
@@ -1290,8 +1467,17 @@ export class Engine extends EventEmitter<EngineEvents> {
       this.usedNonces.delete(nonceKey(rec.traderKey, rec.order.nonce));
       this.ordersByTrader.get(rec.traderKey)?.delete(hash);
     }
-    for (const [key, expiry] of this.dead) if (expiry <= now) this.dead.delete(key);
-    for (const cache of [this.chainCache]) if (cache.size > 10_000) cache.clear();
+    this.orderlessCancels.clear();
+    for (const [key, expiry] of this.dead) {
+      if (expiry <= now) this.dead.delete(key);
+      else if (!this.usedNonces.has(key)) {
+        const trader = key.slice(0, key.indexOf(":"));
+        this.orderlessCancels.set(trader, (this.orderlessCancels.get(trader) ?? 0) + 1);
+      }
+    }
+    if (this.expectedPosition.size > 50_000) this.expectedPosition.clear();
+    if (this.chainCache.size > 10_000) this.chainCache.clear();
+    if (this.cacheGeneration.size > 100_000) this.cacheGeneration.clear();
     try {
       this.store?.pruneFinished(now, this.tradeHistory);
     } catch (e) {
@@ -1325,11 +1511,39 @@ export class Engine extends EventEmitter<EngineEvents> {
     }
   }
 
+  /**
+   * The conditions matching runs under right now. Besides band and pause:
+   *  - a market without an index price trades nothing (the contract needs a fresh price
+   *    for every fill);
+   *  - open-interest cap. The contract refuses a fill only if it ADDS open interest
+   *    beyond `maxOpenInterest`. A fill in which either order is reduce-only cannot add
+   *    any (the contract makes that side reduce its position), so those always pass.
+   *    Every other fill is assumed to add its full size, and is allowed only while
+   *    chain open interest + unsettled fills of that kind + this pass stay within the
+   *    cap. (Like the pause gate, `reduceOnly` stands for "reducing": reducing flow
+   *    without the flag waits when the cap is reached.)
+   */
   private matchOptions(marketId: number): RestoreOptions {
-    return {
+    const st = this.marketState.get(marketId);
+    const base = {
       now: this.bookNow(),
-      band: this.marketState.get(marketId)?.band,
+      band: st?.band,
       reduceOnlyMakersOnly: this.exchangePaused || !this.markets.get(marketId)!.active,
+    };
+    if (this.chain && st?.index === null && this.chainStateAt !== 0) {
+      return { ...base, limit: () => 0n, limitReason: "halted" };
+    }
+    let room = this.oiHeadroom(marketId);
+    if (room === null) return base;
+    return {
+      ...base,
+      limitReason: "oi_cap",
+      limit: (maker, taker, size) => {
+        if (maker.reduceOnly || taker.reduceOnly) return size;
+        const allowed = size < room! ? size : room!;
+        room! -= allowed;
+        return allowed;
+      },
     };
   }
 
@@ -1345,13 +1559,18 @@ export class Engine extends EventEmitter<EngineEvents> {
     }
   }
 
-  private isSuspended(traderKey: string): boolean {
-    const list = this.faults.get(traderKey);
-    if (!list) return false;
-    const cutoff = this.clock() - this.faultWindowSec;
+  /** Entries of `traderKey` in `log` within the last `windowSec` (older ones are dropped). */
+  private recentCount(log: Map<string, number[]>, traderKey: string, windowSec: number): number {
+    const list = log.get(traderKey);
+    if (!list) return 0;
+    const cutoff = this.clock() - windowSec;
     while (list.length > 0 && list[0]! <= cutoff) list.shift();
-    if (list.length === 0) this.faults.delete(traderKey);
-    return list.length >= this.faultThreshold;
+    if (list.length === 0) log.delete(traderKey);
+    return list.length;
+  }
+
+  private isSuspended(traderKey: string): boolean {
+    return this.recentCount(this.faults, traderKey, this.faultWindowSec) >= this.faultThreshold;
   }
 
   /** Record a dead nonce; it is written with the next commit, together with the order it belongs to. */
@@ -1392,13 +1611,19 @@ export class Engine extends EventEmitter<EngineEvents> {
         // all of the trader's reduce-only orders on this side together must fit into it -
         // every one beyond that could only ever fail on-chain, at a taker's expense.
         const position = await this.cachedRead(traderKey, `pos:${order.marketId}`, () => chain.positionSize(order.trader, order.marketId));
-        const opposite = position !== 0n && (order.isBuy ? position < 0n : position > 0n);
-        if (!opposite) throw new EngineError("REDUCE_ONLY_NO_POSITION", "reduce-only order has no opposite position to reduce");
-        let open = order.size - filled;
+        // What the position will be once the engine's own unsettled matches for this
+        // trader have settled: that, not the on-chain figure, is what is left to reduce.
+        let expected = position;
+        let resting = 0n;
         for (const r of this.liveOrders(traderKey)) {
-          if (r.reduceOnly && r.order.marketId === order.marketId && r.order.isBuy === order.isBuy) open += r.remaining + r.pending;
+          if (r.order.marketId !== order.marketId) continue;
+          expected += r.order.isBuy ? r.pending : -r.pending;
+          if (r.reduceOnly && r.order.isBuy === order.isBuy) resting += r.remaining;
         }
-        if (open > (position < 0n ? -position : position)) {
+        this.expectedPosition.set(`${traderKey}:${order.marketId}`, expected);
+        const reducible = order.isBuy ? (expected < 0n ? -expected : 0n) : expected > 0n ? expected : 0n;
+        if (reducible === 0n) throw new EngineError("REDUCE_ONLY_NO_POSITION", "reduce-only order has no opposite position to reduce");
+        if (resting + (order.size - filled) > reducible) {
           throw new EngineError("REDUCE_ONLY_EXCEEDS_POSITION", "the trader's reduce-only orders on this side would exceed the position they reduce");
         }
         return filled;
@@ -1443,13 +1668,23 @@ export class Engine extends EventEmitter<EngineEvents> {
    */
   private async cachedRead(traderKey: string, key: string, read: () => Promise<bigint>): Promise<bigint> {
     if (this.preTradeCacheMs <= 0) return read();
-    let cache = this.chainCache.get(traderKey);
-    const hit = cache?.get(key);
+    const hit = this.chainCache.get(traderKey)?.get(key);
     if (hit && Date.now() - hit.at < this.preTradeCacheMs) return hit.value;
+    // A read that was started before the cache was invalidated (a match of the trader
+    // settled meanwhile) may carry the old value: it must not be stored.
+    const generation = this.cacheGeneration.get(traderKey) ?? 0;
     const value = await read();
-    if (!cache) this.chainCache.set(traderKey, (cache = new Map()));
-    cache.set(key, { at: Date.now(), value });
+    if ((this.cacheGeneration.get(traderKey) ?? 0) === generation) {
+      let cache = this.chainCache.get(traderKey);
+      if (!cache) this.chainCache.set(traderKey, (cache = new Map()));
+      cache.set(key, { at: Date.now(), value });
+    }
     return value;
+  }
+
+  private invalidateReads(traderKey: string): void {
+    this.chainCache.delete(traderKey);
+    this.cacheGeneration.set(traderKey, (this.cacheGeneration.get(traderKey) ?? 0) + 1);
   }
 
   private status(rec: OrderRecord): OrderStatus {
@@ -1500,7 +1735,7 @@ export class Engine extends EventEmitter<EngineEvents> {
       }
       const id = `m${++this.matchSeq}`;
       this.pendingWrite.addMatches.push({ id, marketId, makerHash: maker.hash, takerHash: taker.hash, fillSize: f.size, price: f.price, batchId: null });
-      this.queue.push({
+      const match: Match = {
         id,
         marketId,
         maker: maker.order,
@@ -1511,7 +1746,14 @@ export class Engine extends EventEmitter<EngineEvents> {
         takerHash: taker.hash,
         fillSize: f.size,
         price: f.price,
-      });
+      };
+      this.queue.push(match);
+      this.trackMatch(match, 1n);
+    }
+    if (fx.fills.length > 0) {
+      for (const trader of new Set(fx.fills.flatMap((f) => [this.orders.get(f.makerId as Hex)!.traderKey, this.orders.get(f.takerId as Hex)!.traderKey]))) {
+        this.pullUncoveredReduceOnly(trader, marketId);
+      }
     }
     for (const id of fx.expired) {
       const rec = this.orders.get(id as Hex);
@@ -1526,6 +1768,51 @@ export class Engine extends EventEmitter<EngineEvents> {
       this.close(rec, "cancelled", CANCEL_TEXT[reason]);
     }
     if (fx.fills.length > 0) this.kick();
+  }
+
+  /**
+   * Account for a match that was made (`sign` 1) or that failed and is undone (`sign` -1):
+   * the open interest it may add while unsettled, and the position each trader is
+   * expected to have once it settles.
+   */
+  private trackMatch(m: Match, sign: 1n | -1n): void {
+    if (!m.maker.reduceOnly && !m.taker.reduceOnly) {
+      this.pendingOi.set(m.marketId, (this.pendingOi.get(m.marketId) ?? 0n) + sign * m.fillSize);
+    }
+    for (const o of [m.maker, m.taker]) {
+      const key = `${o.trader.toLowerCase()}:${m.marketId}`;
+      const expected = this.expectedPosition.get(key);
+      if (expected !== undefined) this.expectedPosition.set(key, expected + sign * (o.isBuy ? m.fillSize : -m.fillSize));
+    }
+  }
+
+  /**
+   * A reduce-only order is only good for as long as the position it reduces is there.
+   * When the engine itself matches the trader's position away (with the trader's other
+   * orders, reduce-only or not), reduce-only orders that are no longer covered are
+   * pulled, newest first, so that they never reach the chain to fail there.
+   * Works from the position read when the trader last placed a reduce-only order,
+   * adjusted by every match the engine has made for the trader since.
+   */
+  private pullUncoveredReduceOnly(traderKey: string, marketId: number): void {
+    const expected = this.expectedPosition.get(`${traderKey}:${marketId}`);
+    if (expected === undefined) return;
+    for (const isBuy of [true, false]) {
+      // a reduce-only buy reduces a short, a reduce-only sell a long
+      let covered = isBuy ? (expected < 0n ? -expected : 0n) : expected > 0n ? expected : 0n;
+      const resting = this.liveOrders(traderKey)
+        .filter((r) => r.reduceOnly && !r.closed && r.remaining > 0n && r.order.marketId === marketId && r.order.isBuy === isBuy)
+        .sort((a, b) => (a.seq < b.seq ? -1 : 1));
+      for (const rec of resting) {
+        if (rec.remaining <= covered) {
+          covered -= rec.remaining;
+          continue;
+        }
+        covered = 0n;
+        this.remove(rec, "cancelled", "the position this reduce-only order would reduce is being closed by the trader's other orders");
+        this.emit("book", marketId);
+      }
+    }
   }
 
   // ----------------------------------------------------------------- settlement
@@ -1588,7 +1875,7 @@ export class Engine extends EventEmitter<EngineEvents> {
       }
       const verdicts = new Map<number, Verdict>();
       // Failures are judged, and liquidity is given back, under the current pause flag and bands.
-      if (results.some((r) => r.status === "failed")) await this.refreshChainState();
+      if (results.some((r) => r.status === "failed")) await this.refreshChainState({ fresh: true });
       for (let i = 0; i < results.length; i++) {
         const r = results[i]!;
         if (r.status === "failed") verdicts.set(i, await this.classify(batch.matches[i]!, r.reason));
@@ -1657,10 +1944,17 @@ export class Engine extends EventEmitter<EngineEvents> {
       rec.filled += m.fillSize;
       rec.strikes = 0;
       this.touch(rec);
-      this.chainCache.delete(rec.traderKey);
+      this.invalidateReads(rec.traderKey);
     }
     this.settledCount++;
     this.metrics.inc("matches_settled_total");
+    if (!m.maker.reduceOnly && !m.taker.reduceOnly) {
+      // No longer pending. Until the next read of the chain, assume it added its full
+      // size to open interest (it added that or less).
+      this.pendingOi.set(m.marketId, (this.pendingOi.get(m.marketId) ?? 0n) - m.fillSize);
+      const oi = this.openInterest.get(m.marketId);
+      if (oi !== undefined) this.openInterest.set(m.marketId, oi + m.fillSize);
+    }
     this.lastPrice.set(m.marketId, m.price);
     const trade: Trade = {
       id: `t${++this.tradeSeq}`,
@@ -1710,8 +2004,9 @@ export class Engine extends EventEmitter<EngineEvents> {
     taker.pending -= m.fillSize;
     this.touch(maker);
     this.touch(taker);
-    this.chainCache.delete(maker.traderKey);
-    this.chainCache.delete(taker.traderKey);
+    this.trackMatch(m, -1n);
+    this.invalidateReads(maker.traderKey);
+    this.invalidateReads(taker.traderKey);
     this.metrics.inc("matches_failed_total");
     this.log.warn("match failed on-chain", {
       match: m.id,
@@ -1731,17 +2026,24 @@ export class Engine extends EventEmitter<EngineEvents> {
     }
     if (verdict.global) {
       const why = `match could not settle on-chain: ${verdict.global}`;
+      // Nobody's fault and no strike for the maker - but a taker (order or trader) that
+      // keeps producing matches which cannot settle is costing the operator a
+      // transaction each time, so both are counted.
+      let list = this.globalFailures.get(taker.traderKey);
+      if (!list) this.globalFailures.set(taker.traderKey, (list = []));
+      list.push(this.clock());
+      taker.noFaultFailures++;
+      // Only the failed fill is undone, and it is the TAKER's slice that is dropped:
+      // the maker gets its size back at its place in the queue. What the taker still
+      // has resting stays - unless this keeps happening to it.
       if (taker.ioc) this.remove(taker, "cancelled", why);
-      const takerRests = !taker.closed && taker.remaining > 0n;
-      if (takerRests) {
-        // The taker still rests at a price that crosses this maker: giving the slice back
-        // would re-match the very same pair at once and fail again. The pair is kept
-        // apart by dropping the failed slice on both sides; everything else they have stays.
-        if (!maker.closed && maker.remaining === 0n && maker.pending === 0n) this.close(maker, "cancelled", why);
-      } else {
-        if (!taker.closed && taker.pending === 0n) this.close(taker, "cancelled", why);
-        this.giveBack(maker, m.fillSize);
-      }
+      else if (taker.noFaultFailures >= this.maxOrderStrikes) this.remove(taker, "cancelled", `${why} (repeatedly)`);
+      else if (!taker.closed && taker.remaining === 0n && taker.pending === 0n) this.close(taker, "cancelled", why);
+      // Restoring the maker re-crosses a taker that still rests. Matching then runs under
+      // the conditions as they are NOW (the chain was re-read before this): a pause, a
+      // halted market or a reached open-interest cap make the newer order give way
+      // instead of matching again; if the condition is gone, matching again is right.
+      this.giveBack(maker, m.fillSize);
       return;
     }
     const unattributed = !verdict.maker.atFault && !verdict.taker.atFault;
@@ -1765,9 +2067,14 @@ export class Engine extends EventEmitter<EngineEvents> {
     const why = side.reason ?? "order at fault";
     this.remove(rec, "rejected", `match failed on-chain: ${why}`);
     if (!side.kind) return; // cancelled / filled / expired on-chain: not something to hold against the trader
-    let list = this.faults.get(rec.traderKey);
-    if (!list) this.faults.set(rec.traderKey, (list = []));
-    list.push(this.clock());
+    // Margin failures count towards suspension. Reduce-only failures do not: ordinary
+    // counterparty flow can cause them (the trader's other order closed the position
+    // first), so anyone could get a trader suspended by trading with them.
+    if (side.kind === "margin") {
+      let list = this.faults.get(rec.traderKey);
+      if (!list) this.faults.set(rec.traderKey, (list = []));
+      list.push(this.clock());
+    }
     // Orders of the same trader that would fail for the same reason must not stay in
     // the book waiting to cost the next taker a failed round.
     const suspended = this.isSuspended(rec.traderKey);

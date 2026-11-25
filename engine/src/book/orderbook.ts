@@ -75,7 +75,15 @@ export type RejectReason =
   | "post_only_would_cross"
   | "post_only_outside_band"
   | "conflicting_flags";
-export type CancelReason = "ioc" | "self_trade" | "price_band" | "halted" | "post_only";
+export type CancelReason = "ioc" | "self_trade" | "price_band" | "halted" | "post_only" | "oi_cap";
+
+/**
+ * Says how much of a prospective fill between `maker` and `taker` may trade (0 = none,
+ * anything up to `size`). Called once per prospective fill, in matching order, so it
+ * may keep a running budget. Used for limits that depend on who trades with whom
+ * (open-interest cap, halted market).
+ */
+export type FillLimit = (maker: Readonly<RestingOrder>, taker: Readonly<BookOrder>, size: bigint) => bigint;
 
 export interface PlaceOptions {
   /** Current time, unix seconds. */
@@ -90,12 +98,20 @@ export interface PlaceOptions {
   allowBelowMin?: boolean;
   /** Only trade with reduce-only makers (exchange paused). */
   reduceOnlyMakersOnly?: boolean;
+  /**
+   * Per-fill limit. Where it allows less than the pair could trade, matching stops
+   * there (nothing is skipped) and the remainder is cancelled with `limitReason`.
+   */
+  limit?: FillLimit | undefined;
+  limitReason?: CancelReason;
 }
 
 export interface RestoreOptions {
   now: bigint;
   band?: Band | undefined;
   reduceOnlyMakersOnly?: boolean;
+  limit?: FillLimit | undefined;
+  limitReason?: CancelReason;
 }
 
 export type PlaceResult =
@@ -203,7 +219,13 @@ export class OrderBook {
         cancelReason = "halted";
         break;
       }
-      const fillSize = remaining < maker.remaining ? remaining : maker.remaining;
+      let fillSize = remaining < maker.remaining ? remaining : maker.remaining;
+      if (opts.limit) {
+        const allowed = this.allowed(opts.limit, maker, order, fillSize);
+        if (allowed < fillSize) cancelReason = opts.limitReason ?? "oi_cap"; // stop after this (possibly empty) fill
+        if (allowed === 0n) break;
+        fillSize = allowed;
+      }
       fills.push({ makerId: maker.id, takerId: order.id, price: maker.price, size: fillSize, takerIsBuy: order.isBuy });
       remaining -= fillSize;
       maker.remaining -= fillSize;
@@ -211,6 +233,7 @@ export class OrderBook {
         opposite.shift();
         this.byId.delete(maker.id);
       }
+      if (cancelReason !== undefined) break;
     }
 
     let rested = 0n;
@@ -313,13 +336,25 @@ export class OrderBook {
       if (bid.trader === ask.trader) drop = "self_trade";
       else if (taker.postOnly) drop = "post_only";
       else if (opts.reduceOnlyMakersOnly && !(maker.reduceOnly && taker.reduceOnly)) drop = "halted";
+      let size = bid.remaining < ask.remaining ? bid.remaining : ask.remaining;
+      if (!drop && opts.limit) {
+        const allowed = this.allowed(opts.limit, maker, taker, size);
+        if (allowed === 0n) drop = opts.limitReason ?? "oi_cap";
+        else if (allowed < size) {
+          // Trade what is allowed; the newer order then gives way for the rest.
+          res.fills.push({ makerId: maker.id, takerId: taker.id, price: maker.price, size: allowed, takerIsBuy: taker.isBuy });
+          maker.remaining -= allowed;
+          taker.remaining -= allowed;
+          drop = opts.limitReason ?? "oi_cap";
+        }
+      }
       if (drop) {
         // Same policy as for incoming orders: the newer order gives way.
         this.remove(taker);
         res.cancelled.push({ id: taker.id, size: taker.remaining, reason: drop });
         continue;
       }
-      const size = bid.remaining < ask.remaining ? bid.remaining : ask.remaining;
+      size = bid.remaining < ask.remaining ? bid.remaining : ask.remaining;
       res.fills.push({ makerId: maker.id, takerId: taker.id, price: maker.price, size, takerIsBuy: taker.isBuy });
       bid.remaining -= size;
       ask.remaining -= size;
@@ -371,6 +406,18 @@ export class OrderBook {
   }
 
   // ------------------------------------------------------------ internals
+
+  /**
+   * What the limit allows of a fill of `size`, never producing a fill that is below
+   * the minimum size without completing one of the two orders (the contract refuses those).
+   */
+  private allowed(limit: FillLimit, maker: RestingOrder, taker: BookOrder, size: bigint): bigint {
+    let a = limit(maker, taker, size);
+    if (a > size) a = size;
+    if (a < 0n) a = 0n;
+    if (a < size && a < this.minOrderSize) a = 0n;
+    return a;
+  }
 
   private crosses(takerIsBuy: boolean, takerPrice: bigint, makerPrice: bigint): boolean {
     return takerIsBuy ? takerPrice >= makerPrice : takerPrice <= makerPrice;

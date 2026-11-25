@@ -12,6 +12,11 @@ import { ViemKeeperChain } from "./viemKeeperChain.ts";
 
 let log = createLogger("info", "keeper");
 
+/** Set once the keeper is running; until then a signal simply ends the process. */
+let onSignal: () => void = () => process.exit(0);
+process.on("SIGINT", () => onSignal());
+process.on("SIGTERM", () => onSignal());
+
 async function main(): Promise<void> {
   try {
     process.loadEnvFile();
@@ -87,11 +92,18 @@ async function main(): Promise<void> {
   });
 
   // ---- observability
+  const startedAt = Date.now();
   const status = () => {
     const k = keeper.status();
-    const stale = k.lastTickAt > 0 && Math.floor(Date.now() / 1000) - k.lastTickAt > Math.max(60, (cfg.pollIntervalMs / 1000) * 10);
+    const sinceTick = Date.now() - (k.lastTickAt > 0 ? k.lastTickAt * 1000 : startedAt);
+    const ticking = sinceTick < Math.max(60_000, cfg.pollIntervalMs * 10);
+    const engineReachable = unwinder ? unwinder.isEngineReachable() : null;
     return {
-      ok: !stale,
+      // ok: ticks are completing, the event scan has reached the head, and (if it
+      // unwinds) the engine answers. Anything else needs a look.
+      ok: ticking && k.eventsCaughtUp && engineReachable !== false,
+      ticking,
+      engineReachable,
       keeper: account.address,
       chainId,
       exchange: deployment.exchange,
@@ -106,7 +118,9 @@ async function main(): Promise<void> {
   metrics.gauge("last_liquidation_timestamp", "Unix time of the last liquidation", () => keeper.status().lastLiquidation?.at ?? null);
   metrics.gauge("positions_in_backoff", "Liquidatable positions the keeper is backing off from", () => keeper.status().positionsInBackoff);
   metrics.gauge("event_cursor_block", "Last block whose events were processed", () => Number(keeper.status().eventCursor ?? 0n));
+  metrics.gauge("events_caught_up", "1 once the event scan has reached the head", () => (keeper.status().eventsCaughtUp ? 1 : 0));
   metrics.gauge("last_tick_timestamp", "Unix time of the last keeper tick", () => keeper.status().lastTickAt);
+  metrics.gauge("engine_reachable", "1 if the engine answered the unwinder's last pass", () => (unwinder ? (unwinder.isEngineReachable() ? 1 : 0) : null));
   metrics.gauge("free_collateral_usdc", "The keeper's free collateral in the Exchange, USDC", () => (freeCollateral === null ? null : Number(freeCollateral) / 1e6));
   metrics.gauge("position", "Position the keeper holds (base units), by market", () =>
     (unwinder?.status() ?? []).filter((m) => m.position !== null).map((m) => ({ labels: { market: String(m.marketId) }, value: Number(m.position) / 1e18 })),
@@ -124,27 +138,56 @@ async function main(): Promise<void> {
     balanceEth: formatEther(balance),
     state: cfg.statePath,
     trackedAccounts: keeper.trackedAccounts().length,
-    unwind: cfg.unwind ? { engine: cfg.engineUrl, offsetBps: cfg.unwindOffsetBps } : "off",
+    unwind: cfg.unwind ? { engine: cfg.engineUrl, offsetBps: cfg.unwindOffsetBps, intervalMs: cfg.unwindIntervalMs } : "off",
     port: cfg.port || "off",
   });
 
+  // ---- shutdown: the orders resting in the engine go first, at once; everything else after
   let stop = false;
   let wake: (() => void) | null = null;
-  const onSignal = () => {
+  let withdrawn: Promise<void> | null = null;
+  onSignal = () => {
     if (stop) process.exit(1); // second signal
     stop = true;
+    if (unwinder) withdrawn = Promise.race([unwinder.shutdown(), new Promise<void>((r) => setTimeout(r, 8000).unref())]);
     wake?.();
   };
-  process.on("SIGINT", onSignal);
-  process.on("SIGTERM", onSignal);
+
+  // ---- the unwinder runs on its own timer: a quote must be watched every second or so,
+  // not once per liquidation pass (which can take long when the node is slow).
+  let unwindTimer: NodeJS.Timeout | null = null;
+  if (unwinder) {
+    const loop = () => {
+      if (stop) return;
+      void unwinder.tick().finally(() => {
+        if (!stop) unwindTimer = setTimeout(loop, cfg.unwindIntervalMs);
+      });
+    };
+    loop();
+  }
+
+  // ---- watchdog: a keeper whose ticks no longer complete (a hung RPC call) cannot heal
+  // itself and a container health check does not restart it. Exit and let the process
+  // manager start a fresh one.
+  let lastTickDone = Date.now();
+  const watchdog = setInterval(() => {
+    if (Date.now() - lastTickDone < cfg.stuckExitMs) return;
+    log.error("no keeper tick has completed for too long; exiting to be restarted", { stuckForMs: Date.now() - lastTickDone });
+    const bye = () => process.exit(1);
+    if (unwinder) void Promise.race([unwinder.shutdown(), new Promise((r) => setTimeout(r, 5000))]).then(bye, bye);
+    else bye();
+  }, 5000);
+  watchdog.unref();
+
   let ticks = 0;
   const heartbeatEvery = Math.max(1, Math.round(300_000 / cfg.pollIntervalMs));
   while (!stop) {
     await keeper.tick();
-    if (unwinder && !stop) await unwinder.tick();
+    lastTickDone = Date.now();
     if (ticks % 6 === 0) freeCollateral = await keeperChain.ownFreeCollateral().catch(() => freeCollateral);
     // A status line every ~5 minutes, so that a silent keeper can be told from a dead one.
     if (++ticks % heartbeatEvery === 0) log.info("keeper status", status());
+    if (stop) break;
     await new Promise<void>((resolve) => {
       const t = setTimeout(resolve, cfg.pollIntervalMs);
       wake = () => {
@@ -153,8 +196,9 @@ async function main(): Promise<void> {
       };
     });
   }
-  // Leave nothing resting in the engine that nobody is watching.
-  if (unwinder) await Promise.race([unwinder.shutdown(), new Promise((r) => setTimeout(r, 8000).unref())]);
+  if (unwindTimer) clearTimeout(unwindTimer);
+  clearInterval(watchdog);
+  await withdrawn;
   server?.close();
   log.info("keeper stopped", status());
 }
