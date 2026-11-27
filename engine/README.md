@@ -63,14 +63,24 @@ As in `docs/SPEC.md`. Every bigint is a decimal string.
     order still in transit cannot land afterwards;
   - without them the signature cannot be checked: 404 `NOT_FOUND`, nothing recorded.
   Clients should always send `trader` and `nonce`.
+  Limits on such cancels (each is a durable row that belongs to no order): the nonce must be one
+  an order could be accepted with (else 400 `INVALID_ORDER`); they count against the trader's
+  order rate limit; at most 100 are kept per trader (then 429 `RATE_LIMITED` - use
+  `cancelAllOrders` on-chain to cancel in bulk). Repeating a cancel that is already recorded is
+  a no-op and is always answered 200.
 - `GET /orders?trader=0x…` → orders that rest or have matches awaiting settlement:
   `{ orderHash, order, status, remaining, pending, filled, postOnly, ioc, reason?, createdAt }`.
 - `GET /markets` → per market: parameters (`marketId`, `symbol`, `active`, `minOrderSize`,
   `maxOpenInterest`, margin and fee bps), book top (`bestBid`, `bestAsk`, `lastPrice`) and figures
   read from the contract so that clients need fewer chain reads: `indexPrice`, `markTwap`,
   `currentFundingRate` (WAD per hour, positive = longs pay), `lastFundingTime`, `nextFundingTime`
-  (unix seconds), `openInterestLong`, `openInterestShort`. Each of these is `null` when its view
-  cannot be read or the index is unavailable; they are refreshed every ~10 s.
+  (unix seconds: `lastFundingTime` + the funding interval, the earliest moment funding can next
+  accrue; it lies in the past whenever nobody has called `updateFunding` since - show "due"),
+  `openInterestLong`, `openInterestShort`. `currentFundingRate` is the contract's authoritative
+  rate (0 while the exchange is paused or the market inactive); `markTwap` is informational
+  (index x (1 + average premium)). `currentFundingRate` is `null` whenever `markTwap` or the index
+  is unavailable, never a made-up 0. Each figure is `null` when its view cannot be read; they are
+  refreshed every ~10 s on their own timer.
 - `GET /orderbook/:marketId?depth=` (default 50, max 500) → `{ marketId, bids: [{price,size}], asks }`,
   `GET /trades/:marketId?limit=` (newest first), `GET /health` (also carries the exchange-wide
   `insuranceFund` and `totalBadDebt`, USDC units or `null`), `GET /metrics`.
@@ -123,7 +133,14 @@ simply sends the same request again:
 
 - 200 without `duplicate` → it was not there before and is accepted now;
 - 200 with `duplicate: true` → the earlier attempt had gone through; this is its state;
-- 409 `NONCE_CANCELLED` → it was cancelled or closed in the meantime (or pruned after expiry: `EXPIRED`).
+- 200 with `duplicate: true` and `status: "cancelled"` / `"expired"` / `"rejected"` → the engine
+  has the order and it is closed (a cancelled order answers 200 with its state, not 409);
+- 409 `NONCE_CANCELLED` / 400 `EXPIRED` → only for an order the engine has no record of (never
+  received, or forgotten after its expiry) whose nonce is dead or whose expiry has passed.
+
+A known order is looked up (and its signature checked) before anything else, so its resubmission
+returns its real state even while the engine is draining, recovering, stalled, has store trouble,
+or the order is seconds from expiry: it never answers `EXPIRED` or a transient error.
 
 Server-side time per request is bounded: chain reads and waiting for the trader's earlier
 submissions may take at most `INTAKE_TIMEOUT_MS` (8 s), after which the order is refused with
@@ -137,7 +154,12 @@ recovering, settlement is stalled or the store is broken. `warnings` lists: reco
 operator balance, a stalled settlement, the operator being unable to pay for a settlement
 transaction, a transaction stuck at the fee cap, a broken store, a paused exchange, halted markets,
 and recorded bad debt (`totalBadDebt > 0`; a warning, `ok` stays true).
-`chain` is what the engine currently believes: pause flag and, per market, index price and price band.
+`chain` is what the engine currently believes: pause flag, `chainTimeLeadSec` (how far chain time
+is ahead of the host clock, as applied), `clockSkewSec` (non-null while a lead above
+`MAX_CHAIN_TIME_LEAD_SEC` halts intake) and, per market, index price, price band and
+`openInterestCapReached`. `time` is the engine's clock (unix seconds, the later of host and chain
+time): sign order expiries relative to it. Warnings also cover the clock skew and a reached
+open-interest cap.
 
 ## Matching rules
 
@@ -188,13 +210,30 @@ and recorded bad debt (`totalBadDebt > 0`; a warning, `ok` stays true).
   side of a market together may not exceed the position they reduce. Chain reads are reused per
   trader for `PRETRADE_CACHE_MS`, and orders are also rate-limited per trader address
   (`TRADER_ORDERS_PER_MINUTE`, counted only for validly signed orders).
-- **Faults and suspension:** when an order fails on-chain through its trader's own doing
-  (margin, reduce-only), the trader's other resting orders that would fail the same way are
-  cancelled at once (margin: all non-reduce-only orders; reduce-only: the reduce-only orders on
-  that side of that market). `FAULT_THRESHOLD` such failures within `FAULT_WINDOW_SEC` suspend
-  the trader: all resting orders are cancelled and new ones refused (429) until the window has
-  passed. An order that merely turns out cancelled, filled or expired on-chain is removed
-  without counting.
+- **Open-interest cap.** The contract refuses a fill only if it *adds* open interest beyond
+  `maxOpenInterest`. The engine reads open interest on every chain refresh and mirrors that: a
+  fill in which either order is reduce-only cannot add any and always passes; every other fill
+  is assumed to add its full size and is matched only while chain open interest + such matches
+  not yet settled stay within the cap. Matches are cut to the room left; at the cap an order
+  that would cross is not matched and its remainder is cancelled ("open-interest cap reached"),
+  orders that do not cross rest as usual. (As with the pause, `reduceOnly` stands for
+  "reducing": reducing flow without the flag waits.) `/health` shows `openInterestCapReached`.
+- **Reduce-only orders follow the position.** From the position read at intake and every match
+  the engine makes for the trader afterwards (settled or not), it knows what will be left to
+  reduce. A reduce-only order that is no longer covered - because the trader's other orders are
+  closing the position - is pulled (newest first), also in the middle of a matching pass, so it
+  does not reach the chain to fail. New reduce-only orders are measured against the same figure.
+- **Faults and suspension:** when an order fails on-chain for lack of margin, the trader's other
+  resting non-reduce-only orders are cancelled at once, and it counts: `FAULT_THRESHOLD` such
+  failures within `FAULT_WINDOW_SEC` suspend the trader (all resting orders cancelled, new ones
+  refused with 429 until the window has passed). A reduce-only failure pulls the trader's
+  reduce-only orders on that side but does **not** count: ordinary counterparty flow can cause
+  it. An order that merely turns out cancelled, filled or expired on-chain is removed without counting.
+- **Throttle for matches that cannot settle.** A match that fails for a reason that is nobody's
+  fault still costs the operator a transaction. A taker order involved in three of them is
+  cancelled, and a trader whose matches (as taker) fail that way `GLOBAL_FAILURE_THRESHOLD` (5)
+  times within `GLOBAL_FAILURE_WINDOW_SEC` (60) gets new orders refused (429 `RATE_LIMITED`)
+  for the rest of the window.
 
 ## Dead nonces (what a cancel is worth)
 
@@ -350,25 +389,37 @@ A liquidator takes the liquidated position over, so the keeper ends up holding p
 - Per market in which the keeper holds a position it keeps **one reduce-only order** resting in
   the engine (signed with the keeper key, sent to `ENGINE_URL` over the public REST API): a sell
   for a long, a buy for a short, sized to the whole position, priced `KEEPER_UNWIND_OFFSET_BPS`
-  (10) **through** the index — a sell below it, a buy above — which is attractive to takers and
-  well inside the price band (the offset is capped at half the band). It expires after
-  `KEEPER_UNWIND_EXPIRY_SEC` (300).
-- The on-chain position is read before every decision. The order is left alone while the
-  position is unchanged, the index is within `KEEPER_UNWIND_REPRICE_BPS` (20) of where it was
-  priced and it has two minutes to live; otherwise it is cancelled and, **only after the engine
+  (10) **through** the index - a sell below it, a buy above - which is attractive to takers and
+  well inside the price band (the offset is capped at half the band). It expires
+  `KEEPER_UNWIND_EXPIRY_SEC` (300) after the **engine's** time (`/health.time`), not the host's.
+- It runs on its own timer (`KEEPER_UNWIND_INTERVAL_MS`), independent of the liquidation loop,
+  and passes never overlap. Every pass reads the on-chain position, the index and the engine's
+  list of the keeper's open orders (`GET /orders?trader=`); the engine's list is the truth about
+  what is resting. An order of the keeper that this process does not manage (left by an earlier
+  run, or a second one in a market) is cancelled; an order the engine no longer lists is forgotten.
+- The order is left alone while the position equals what the order still has to fill (unfilled
+  remainder plus fills not yet settled - a partial fill does not cause a replacement), the index
+  is within `KEEPER_UNWIND_REPRICE_BPS` (5, never more than the offset) of where it was priced
+  and it has two minutes to live; otherwise it is cancelled and, **only after the engine
   confirmed the cancel**, replaced. No position: no order.
+- **No index, no order.** If the market's index cannot be read (stale or failing feed) the
+  resting order is cancelled at once and nothing is posted until the index is back; the new
+  order is priced from the new index, so a price that moved during the outage cannot fill a
+  stale order. Nothing is posted while the engine reports the market halted, either.
 - It cannot increase the keeper's exposure: orders are reduce-only (the contract refuses a
-  reduce-only fill that would not reduce) and never larger than the position just read. With
-  one order per market it cannot trip the engine's reduce-only cap or self-trade rule by itself.
-- Engine answers follow the `outcome` contract: `not_applied` (halted, paused for non-reduce-only,
-  recovering, rate-limited, shutting down, cap exceeded while a fill is still settling) → try
-  again next tick; `unknown` or no answer (engine down) → the **same signed order** is sent again
-  until there is a definite answer or it has expired.
-- Before the keeper takes over another position in a market it withdraws its order there, since
-  the position the order was sized for is about to change (a reduce-only order that no longer
-  reduces would fail on-chain and count as a fault of the keeper in the engine). If the engine
-  cannot be reached the liquidation goes ahead regardless.
-- On SIGTERM it cancels what it has resting (by nonce, so also an order whose fate was unknown).
+  reduce-only fill that would not reduce) and never larger than the position just read.
+- Engine answers follow the `outcome` contract: `not_applied` → try again later (after an order
+  ended on arrival, with a growing pause instead of every tick; while the exchange is paused
+  nothing is re-posted each tick); `unknown` or no answer (engine down) → the order **may be
+  live**: the same signed order is sent again until there is a definite answer, and if that
+  answer is a refusal the nonce is cancelled anyway before a new order is made. An order is
+  never forgotten while it could still be resting.
+- Before the keeper takes over another position in a market it withdraws its order there. If the
+  engine cannot be reached the liquidation goes ahead regardless.
+- On SIGTERM the keeper cancels its orders **first** (by nonce, so also one whose fate was
+  unknown), then stops.
+- Liquidating is never skipped for lack of reward: the contract pays the liquidator no penalty
+  share when a side market had no current price; that is a normal outcome, not an error.
 - Not handled: a position smaller than the market's minimum order size (the contract rejects
   such orders; reported in the status and left), and a fill that was already matched when a
   liquidation changed the position (it can fail on-chain once).
@@ -376,28 +427,37 @@ A liquidator takes the liquidated position over, so the keeper ends up holding p
 ### Observability
 
 Every ~5 minutes a `keeper status` JSON line is logged. With `KEEPER_PORT` set, the keeper also
-serves `GET /health` (200/503; `ok` is false when no tick has run for a while) and `GET /metrics`:
+serves `GET /health` and `GET /metrics`. `/health` is 200 only while `ok`: a tick completed
+recently **and** the event scan has reached the head (`eventsCaughtUp`) **and**, with the
+unwinder on, the engine answered its last pass (`engineReachable`). If no tick completes for
+`KEEPER_STUCK_EXIT_MS` the process exits non-zero so that the process manager restarts it.
 
 `{ ok, keeper, freeCollateral, trackedAccounts, eventCursor, eventsCaughtUp, liquidations,
-liquidationFailures, lastLiquidation, positionsInBackoff, lastTickAt, unwind: [{ marketId,
+liquidationFailures, lastLiquidation, positionsInBackoff, lastTickAt, engineReachable, unwind: [{ marketId,
 position, order, note }] }`
 
 Metrics (prefix `baldwin_keeper_`): `tracked_accounts`, `liquidations`, `liquidation_failures`,
-`last_liquidation_timestamp`, `positions_in_backoff`, `event_cursor_block`, `last_tick_timestamp`,
+`last_liquidation_timestamp`, `positions_in_backoff`, `event_cursor_block`, `events_caught_up`,
+`engine_reachable`, `last_tick_timestamp`,
 `free_collateral_usdc`, `position{market}`, `unwind_order_working{market}`, `rpc_errors_total{method}`.
 
 ## Soak test
 
 `scripts/soak-local.ts` runs N simulated traders against a local node and a running engine
-through the real REST API (random orders around the index, IOC and post-only, cancels), retries
-requests without a definite answer with the identical signed order, and at the end checks:
-every accepted order's engine state against on-chain `filledSize` (via idempotent
-resubmission), no order overfilled, `filledSize` equal to the sum of `Fill` events, every trade
-the engine reported present on-chain, positions netting to zero and balanced open interest per
-market, an uncrossed book, and `/health` ok with an empty settlement queue. The engine can be
-killed and restarted while it runs. See the header of the script for how to start the engine
-for it (rate limits raised). A local Hardhat node advances its clock by a second per block, so
-under load its time runs ahead of the host's; the engine follows chain time for expiry.
+through the real REST API (random orders around the index, IOC, post-only and reduce-only,
+off-chain and on-chain cancels) and retries requests without a definite answer with the
+identical signed order. It switches the node to interval mining (`SOAK_BLOCK_TIME_MS`) so that
+chain time keeps pace with the host, and fails if too little happened (floors on accepted
+orders, trades and cancels). At the end it checks, as engine invariants: every acknowledged
+cancel is final (no fill after it); the engine's trades and the chain's `Fill` logs correspond
+one to one; per order, the engine's trades add up to on-chain `filledSize`; every accepted
+order's engine state agrees with the chain (via idempotent resubmission); the book rebuilt from
+`/orders` equals `/orderbook` at one moment and is uncrossed; `/health` is ok with an empty
+settlement queue. Contract-level sanity (no overfill, positions netting to zero, balanced open
+interest) is reported separately. With `SOAK_LIQUIDATION=true` it also makes one account
+liquidatable and requires the keeper to liquidate it and to unwind the inventory through the
+engine. The engine can be killed (`kill -9`) and restarted while it runs. See the header of the
+script for how to start the engine for it (rate limits raised).
 
 ## Running on testnet (Arbitrum Sepolia)
 
@@ -422,6 +482,7 @@ under load its time runs ahead of the host's; the engine follows chain time for 
    [Service]
    WorkingDirectory=/srv/baldwin/engine
    EnvironmentFile=/srv/baldwin/engine/.env
+   User=baldwin                          # an unprivileged account that owns the store directory
    ExecStart=/usr/bin/npm start          # keeper unit: npm run keeper
    Restart=always
    RestartSec=2
@@ -492,11 +553,12 @@ under load its time runs ahead of the host's; the engine follows chain time for 
      order is the maker; a post-only order is never made the taker). An IOC order is matched
      once more against the remaining book and whatever is left is cancelled. Not given back:
      orders the trader cancelled meanwhile, expired orders, orders now on the wrong side of the band.
-   - **Global condition** → nobody is at fault, **no strike**, and only the failed fill is
-     undone. If the taker no longer rests (fully matched, or IOC), the maker gets the size back
-     and the taker's failed slice is dropped. If the taker still rests, re-posting the slice
-     would re-match the same pair at once and fail again, so the slice is dropped on **both**
-     sides and both orders keep everything else they have resting.
+   - **Global condition** → nobody is at fault, **no strike** for the maker, and only the failed
+     fill is undone: the maker gets its size back at its place in the queue; the **taker's**
+     slice is dropped (an IOC taker ends there). If the taker still rests, the restored maker
+     crosses it again; matching then runs under the conditions as re-read from the chain, so a
+     pause, a halted market or a reached open-interest cap make the newer order give way
+     instead. Such failures are counted per taker order and per trader (see "Throttle").
    - **`FillTooSmall`** (a sub-minimum fill only fails when an earlier fill of the order it was
      to complete has failed) → both sides get the size back and are matched again, now for the
      maker's whole remainder; the maker gets a strike so that this cannot repeat for ever.
@@ -548,9 +610,12 @@ under load its time runs ahead of the host's; the engine follows chain time for 
   two valid signatures, but it can settle a signed order its trader cancelled only off-chain
   (see "Dead nonces"). Traders can always cancel on-chain.
 - **Optimistic fills can be undone.** A `pending` fill is a promise the chain may refuse.
-- Expiry is judged by the later of the host clock and the latest block's timestamp (re-read every
-  `CHAIN_REFRESH_MS`, lead capped at 15 minutes). A chain whose clock jumps ahead between two
-  reads can still make an order expire on-chain first; that is a failed match without blame.
+- Expiry is judged by the later of the host clock and the chain's (`/health.time` is the result;
+  clients should date orders by it). The lead of chain time is the smallest of the last three
+  readings, so one odd block timestamp changes nothing; a lead that persists above
+  `MAX_CHAIN_TIME_LEAD_SEC` (900) is not applied at all: intake halts (503) with a `/health`
+  warning until the clocks agree. A chain whose clock jumps ahead between reads can still make
+  an order expire on-chain first; that is a failed match without blame.
 - **The band follows the engine's last index read** (`CHAIN_REFRESH_MS`). Between an oracle move
   and the next refresh, matches can still fail with `PriceOutOfBand`; that costs a failed match,
   no strike. Orders pushed onto the wrong side of the band by an index move are cancelled, not
@@ -566,8 +631,8 @@ under load its time runs ahead of the host's; the engine follows chain time for 
   multicall): slow with a very large book and a rate-limited RPC.
 - Trader fault counters, suspensions and per-trader rate-limit windows are in memory and reset
   on restart.
-- Under a global condition the failed slice of a still-resting taker (and of its maker) is
-  dropped rather than re-posted; such an order ends `cancelled` with less than its size filled.
+- Under a global condition the taker's failed slice is dropped rather than re-posted; such an
+  order ends `cancelled` with less than its size filled.
   Its nonce is not dead: the remainder can only be traded with a new order.
 - The contract's rule that a reducing fill by an account already below maintenance must not
   worsen its health is not mirrored pre-trade; it shows up as `InsufficientMargin(trader)` and
