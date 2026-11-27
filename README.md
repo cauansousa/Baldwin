@@ -52,8 +52,8 @@ ou o WSL, onde os comandos abaixo funcionam como estão; no PowerShell, troque `
 ### 1. Baixar e instalar
 
 ```bash
-git clone https://github.com/cauansousa/Baldwin.git
-cd Baldwin
+git clone https://github.com/cauansousa/Foxy.git
+cd Foxy
 
 cd contracts && npm install && cd ..
 cd engine    && npm install && cd ..
