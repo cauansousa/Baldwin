@@ -17,15 +17,16 @@ export const statusLabel = (status: string) => STATUS_LABELS[status] ?? status;
 
 /** Portuguese text for the reason the engine gives when it closes an order. */
 export function describeOrderReason(reason: string): string {
+  // Checked first: its detail may itself mention the band, the pause or the cap.
+  if (/could not settle on-chain/i.test(reason)) {
+    return "o negócio não pôde ser liquidado on-chain por uma condição geral (pausa, oráculo, banda de preço ou limite do mercado), sem culpa sua; o que não executou foi cancelado";
+  }
   if (/price band/i.test(reason)) return "preço fora da banda permitida em torno do índice; o que não executou foi cancelado";
   if (/open-interest cap/i.test(reason)) {
     return "o mercado atingiu o limite de contratos em aberto; só negócios que não aumentam esse total são aceitos";
   }
   if (/reduce-only order would reduce/i.test(reason)) {
     return "a posição que esta ordem somente-redução reduziria já está sendo fechada por outras ordens suas";
-  }
-  if (/could not settle on-chain/i.test(reason)) {
-    return "o negócio não pôde ser liquidado on-chain por uma condição geral (pausa, oráculo, banda de preço ou limite do mercado), sem culpa sua; o que não executou foi cancelado";
   }
   if (/match failed on-chain/i.test(reason)) return "o negócio falhou on-chain e a ordem foi retirada";
   if (/exchange paused, market inactive or without an index price/i.test(reason)) {

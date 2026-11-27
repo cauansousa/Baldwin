@@ -11,7 +11,7 @@ signed in the wallet, deposits/withdrawals are ordinary wallet transactions.
 ```sh
 npm install
 npm run dev          # http://localhost:5173 — local node + deployment + engine (see docs/SPEC.md)
-npm run dev:mock     # standalone: fake engine, fake chain and a fake connected wallet
+npm run dev:mock     # standalone (vite --mode mock, reads .env.mock): fake engine, chain and wallet
 npm run dev:testnet  # dev server against Arbitrum Sepolia (reads .env.testnet.local)
 ```
 
@@ -67,15 +67,17 @@ To check a build locally: `npm run preview` serves `dist/`.
 
 ## Mock mode
 
-`VITE_MOCK=1` (or `npm run dev:mock`) swaps in `src/mock/`: an in-memory engine (markets, a moving
+`npm run dev:mock` (`vite --mode mock`, which loads `.env.mock` with `VITE_MOCK=1`) swaps in `src/mock/`: an in-memory engine (markets, a moving
 book, trades, open orders) and a fake EIP-1193 provider that answers contract reads, "mines"
 approve/deposit/withdraw/mint/cancel instantly and returns dummy signatures. Engine failures can be
 injected from the URL: `?mockSubmit=timeout,unknown` (order registered, answer lost, then idempotent
 success), `?mockSubmit=lost`, `?mockSubmit=refused`, `?mockCancel=fail`, `?mockCancel=notfound`;
-`?mockBadDebt=1` shows the bad-debt warning; `?mockEngineStats=0` makes the mock engine report no
+`?mockBadDebt=1` shows the bad-debt warning; `?mockOiCap=1` the open-interest-cap banner;
+`?mockSubmit=closed` an order closed by the engine whose answer was lost; `?mockEngineStats=0` makes the mock engine report no
 mirrored figures, so everything is read from the mock chain. It exists to develop
 and screenshot the UI without a backend. It only works under the dev server and is not included in
-production bundles. `VITE_MOCK=1 VITE_CHAIN_ID=421614 npx vite` shows the testnet variant of the UI.
+production bundles. Setting `VITE_CHAIN_ID=421614` as well (e.g. in `.env.mock.local`) shows the
+testnet variant of the UI.
 
 ## Layout
 
@@ -97,9 +99,13 @@ Protocol constants, ABIs and EIP-712 types come from `../shared/src/index.ts` (a
   present, and each one that is `null` or missing is read from the contract instead, so a page
   load needs few RPC calls. Market parameters (re-read once a minute), the funding index, pause
   state, the price band, the oracle address, balances and positions always come from the contract.
+- Clock: order expiries and the time part of nonces are dated from the engine's clock
+  (`GET /health` `time`, the later of its host clock and chain time) while a reading at most
+  5 minutes old exists, and from the device clock otherwise.
 - Funding: the market bar shows the hourly rate the current period would apply
-  (`currentFundingRate`, positive = longs pay shorts; a market with no fills in the current period
-  pays none), the countdown to the engine's `nextFundingTime` (or `lastFundingTime` + 1 h from the
+  (`currentFundingRate`, authoritative; positive = longs pay shorts; zero when the market trades at
+  the index or not at all, and nothing accrues while paused; shown as "—" when unavailable; the TWAP
+  is informational and never used to derive the rate), the countdown to the engine's `nextFundingTime` (or `lastFundingTime` + 1 h from the
   contract),
   the last fill and the period's mark TWAP. "Funding pendente" in the account panel is exact for
   what is already in the cumulative index (`size × (cumulativeFunding − snapshot)`); "Próx.
