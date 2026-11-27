@@ -15,7 +15,7 @@ import { Metrics } from "../src/metrics.ts";
 import { createLogger, silentLogger } from "../src/types.ts";
 import { alice, bob, carol, harness, wad } from "./helpers.ts";
 
-const tmp = (name: string) => join(mkdtempSync(join(tmpdir(), "baldwin-ops-")), name);
+const tmp = (name: string) => join(mkdtempSync(join(tmpdir(), "foxy-ops-")), name);
 
 describe("LogPoller", () => {
   function setup(opts: { cursor?: bigint; startBlock?: bigint; maxRange?: bigint; overlap?: bigint } = {}) {
@@ -225,11 +225,11 @@ describe("metrics and health", () => {
     m.observe("h_seconds", 3);
     m.observe("h_seconds", 30);
     const text = m.render();
-    expect(text).toContain("# TYPE baldwin_a_total counter\nbaldwin_a_total 0\n");
-    expect(text).toContain('baldwin_b_total{code="X\\"Y"} 3\n');
-    expect(text).toContain("# TYPE baldwin_g gauge\nbaldwin_g 1.5\n");
+    expect(text).toContain("# TYPE foxy_a_total counter\nfoxy_a_total 0\n");
+    expect(text).toContain('foxy_b_total{code="X\\"Y"} 3\n');
+    expect(text).toContain("# TYPE foxy_g gauge\nfoxy_g 1.5\n");
     expect(text).not.toContain("hidden");
-    expect(text).toContain('baldwin_h_seconds_bucket{le="1"} 1\nbaldwin_h_seconds_bucket{le="5"} 2\nbaldwin_h_seconds_bucket{le="+Inf"} 3\nbaldwin_h_seconds_sum 33.5\nbaldwin_h_seconds_count 3\n');
+    expect(text).toContain('foxy_h_seconds_bucket{le="1"} 1\nfoxy_h_seconds_bucket{le="5"} 2\nfoxy_h_seconds_bucket{le="+Inf"} 3\nfoxy_h_seconds_sum 33.5\nfoxy_h_seconds_count 3\n');
   });
 
   it("GET /metrics exposes order, match, batch and queue metrics", async () => {
@@ -247,15 +247,15 @@ describe("metrics and health", () => {
     expect(res.statusCode).toBe(200);
     expect(res.headers["content-type"]).toMatch(/^text\/plain; version=0\.0\.4/);
     const body = res.body;
-    expect(body).toContain("baldwin_orders_accepted_total 3\n");
-    expect(body).toContain('baldwin_orders_rejected_total{code="INVALID_ORDER"} 1\n');
-    expect(body).toContain("baldwin_matches_settled_total 1\n");
-    expect(body).toContain("baldwin_matches_failed_total 1\n");
-    expect(body).toContain("baldwin_batches_total 2\n");
-    expect(body).toContain("baldwin_batch_latency_seconds_count 2\n");
-    expect(body).toContain("baldwin_settlement_queue_depth 0\n");
-    expect(body).toContain("baldwin_operator_balance_eth 0.25\n");
-    expect(body).toContain("baldwin_resting_orders 1\n");
+    expect(body).toContain("foxy_orders_accepted_total 3\n");
+    expect(body).toContain('foxy_orders_rejected_total{code="INVALID_ORDER"} 1\n');
+    expect(body).toContain("foxy_matches_settled_total 1\n");
+    expect(body).toContain("foxy_matches_failed_total 1\n");
+    expect(body).toContain("foxy_batches_total 2\n");
+    expect(body).toContain("foxy_batch_latency_seconds_count 2\n");
+    expect(body).toContain("foxy_settlement_queue_depth 0\n");
+    expect(body).toContain("foxy_operator_balance_eth 0.25\n");
+    expect(body).toContain("foxy_resting_orders 1\n");
     for (const line of body.trim().split("\n")) expect(line).toMatch(/^(# (HELP|TYPE) \w+ .+|\w+(\{[^}]*\})? -?[0-9.e+-]+)$/);
   });
 

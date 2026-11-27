@@ -30,7 +30,7 @@ const code = async (p: Promise<unknown>) => {
   }
   return "OK";
 };
-const tmpFile = () => join(mkdtempSync(join(tmpdir(), "baldwin-dead-")), "engine.sqlite");
+const tmpFile = () => join(mkdtempSync(join(tmpdir(), "foxy-dead-")), "engine.sqlite");
 
 describe("1: dead nonces survive a restart", () => {
   it("R1: an order cancelled off-chain cannot be re-posted from public calldata after a restart", async () => {

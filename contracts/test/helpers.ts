@@ -122,7 +122,7 @@ export class Ctx {
 
   async sign(signer: HardhatEthersSigner, order: Order, exchange: Exchange = this.exchange): Promise<string> {
     const domain = {
-      name: "Baldwin",
+      name: "Foxy",
       version: "1",
       chainId: (await ethers.provider.getNetwork()).chainId,
       verifyingContract: await exchange.getAddress(),

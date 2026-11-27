@@ -1,6 +1,6 @@
-# Baldwin — web
+# Foxy — web
 
-Trading UI for the Baldwin perpetuals exchange. Vite + React + TypeScript, wagmi v2 / viem,
+Trading UI for the Foxy perpetuals exchange. Vite + React + TypeScript, wagmi v2 / viem,
 injected wallet only (MetaMask and similar). The UI is in Brazilian Portuguese.
 
 The app never asks for, sees or stores private keys: orders and cancels are EIP-712 messages

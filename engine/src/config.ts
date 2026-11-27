@@ -74,7 +74,7 @@ export function loadDeployment(env: Env = process.env): Deployment {
 export function chainFor(deployment: Deployment, rpcUrl: string): Chain {
   return defineChain({
     id: deployment.chainId,
-    name: `baldwin-${deployment.chainId}`,
+    name: `foxy-${deployment.chainId}`,
     nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
     rpcUrls: { default: { http: [rpcUrl] } },
   });

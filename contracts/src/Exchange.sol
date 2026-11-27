@@ -15,7 +15,7 @@ import {IExchange} from "./interfaces/IExchange.sol";
 import {IOracle} from "./interfaces/IOracle.sol";
 
 /// @title Exchange
-/// @notice Custody, margin, settlement, funding and liquidation for Baldwin perpetuals.
+/// @notice Custody, margin, settlement, funding and liquidation for Foxy perpetuals.
 ///
 /// Accounting model
 ///  - Every account has one signed USDC cash balance shared by all markets (cross margin).
@@ -208,7 +208,7 @@ contract Exchange is IExchange, Ownable2Step, ReentrancyGuard, EIP712 {
         uint256 maxPriceAge_,
         uint256 maxFundingRateBps_,
         uint256 maxPriceDeviationBps_
-    ) Ownable(owner_) EIP712("Baldwin", "1") {
+    ) Ownable(owner_) EIP712("Foxy", "1") {
         if (collateral_ == address(0) || oracle_ == address(0) || feeRecipient_ == address(0)) revert ZeroAddress();
         if (
             maxPriceAge_ == 0 ||

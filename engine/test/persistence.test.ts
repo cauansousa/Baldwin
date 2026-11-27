@@ -10,7 +10,7 @@ import { SqliteStore } from "../src/store/sqliteStore.ts";
 import type { Commit } from "../src/store/types.ts";
 import { alice, bob, carol, DOMAIN, FakeChain, makeOrder, MARKET, signCancel, signOrder, wad, type TestAccount } from "./helpers.ts";
 
-const dbPath = () => join(mkdtempSync(join(tmpdir(), "baldwin-store-")), "engine.sqlite");
+const dbPath = () => join(mkdtempSync(join(tmpdir(), "foxy-store-")), "engine.sqlite");
 const code = async (p: Promise<unknown>) => {
   try {
     await p;

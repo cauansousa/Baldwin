@@ -27,7 +27,7 @@ export interface NonceStore {
 export function createNonceStore(scope: string, storage: Storage | undefined = defaultStorage()): NonceStore {
   const signed = new Map<string, bigint>();
   const floors = new Map<string, bigint>();
-  const key = (trader: string) => `baldwin.maxNonce:${scope}:${trader}`.toLowerCase();
+  const key = (trader: string) => `foxy.maxNonce:${scope}:${trader}`.toLowerCase();
 
   const readPersisted = (trader: string): bigint => {
     try {

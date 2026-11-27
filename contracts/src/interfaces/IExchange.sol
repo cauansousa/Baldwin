@@ -2,7 +2,7 @@
 pragma solidity 0.8.26;
 
 /// @title IExchange
-/// @notice External surface of the Baldwin perpetuals exchange. This file is the
+/// @notice External surface of the Foxy perpetuals exchange. This file is the
 ///         contract between the on-chain code, the matching engine and the web app.
 ///
 /// Units
@@ -11,7 +11,7 @@ pragma solidity 0.8.26;
 ///  - Funding index: USDC-WAD per 1 unit of base (18 decimals), signed, cumulative.
 ///  - Rates and fees: basis points (1e4 = 100%).
 interface IExchange {
-    /// @dev EIP-712 typed order. Domain: name "Baldwin", version "1", chainId,
+    /// @dev EIP-712 typed order. Domain: name "Foxy", version "1", chainId,
     ///      verifyingContract = this exchange.
     ///      Type string:
     ///      Order(address trader,uint32 marketId,bool isBuy,bool reduceOnly,uint256 size,uint256 limitPrice,uint256 nonce,uint64 expiry)

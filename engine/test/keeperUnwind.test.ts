@@ -296,7 +296,7 @@ describe("unwinder", () => {
     const { writeFileSync, mkdtempSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
-    const f = join(mkdtempSync(join(tmpdir(), "baldwin-kcfg-")), "d.json");
+    const f = join(mkdtempSync(join(tmpdir(), "foxy-kcfg-")), "d.json");
     writeFileSync(f, JSON.stringify({ chainId: 31337, exchange: alice.address, usdc: bob.address, oracle: carol.address, markets: [] }));
     const env = { KEEPER_PRIVATE_KEY: "0x" + "22".repeat(32), DEPLOYMENT_PATH: f };
     expect(loadKeeperConfig(env)).toMatchObject({ unwind: true, engineUrl: "http://127.0.0.1:8080", unwindOffsetBps: 10n, port: 0 });
@@ -333,7 +333,7 @@ describe("httpEngineClient follows the engine's error contract", () => {
 
 describe("keeper observability", () => {
   it("serves /health and /metrics with labelled gauges", async () => {
-    const metrics = new Metrics("baldwin_keeper_");
+    const metrics = new Metrics("foxy_keeper_");
     metrics.gauge("tracked_accounts", "Accounts watched", () => 3);
     metrics.gauge("position", "Position held, by market", () => [{ labels: { market: "0" }, value: 0.2 }, { labels: { market: "1" }, value: -1.5 }]);
     metrics.gauge("nothing", "omitted", () => []);
@@ -345,8 +345,8 @@ describe("keeper observability", () => {
     expect(health.status).toBe(200);
     expect(await health.json()).toEqual({ ok: true, trackedAccounts: 3, freeCollateral: "5", lastLiquidation: null, unwind: [{ marketId: 0, position: "200000000000000000", order: null, note: null }] });
     const text = await (await fetch(`http://127.0.0.1:${port}/metrics`)).text();
-    expect(text).toContain("baldwin_keeper_tracked_accounts 3\n");
-    expect(text).toContain('# TYPE baldwin_keeper_position gauge\nbaldwin_keeper_position{market="0"} 0.2\nbaldwin_keeper_position{market="1"} -1.5\n');
+    expect(text).toContain("foxy_keeper_tracked_accounts 3\n");
+    expect(text).toContain('# TYPE foxy_keeper_position gauge\nfoxy_keeper_position{market="0"} 0.2\nfoxy_keeper_position{market="1"} -1.5\n');
     expect(text).not.toContain("nothing");
     ok = false;
     expect((await fetch(`http://127.0.0.1:${port}/health`)).status).toBe(503);
@@ -381,8 +381,8 @@ describe("funding, open interest, insurance fund and bad debt in the API", () =>
     let health = (await app.inject({ url: "/health" })).json();
     expect(health).toMatchObject({ ok: true, insuranceFund: "1234000000", totalBadDebt: "0", warnings: [] });
     const first = (await app.inject({ url: "/metrics" })).body;
-    expect(first).toContain("\nbaldwin_insurance_fund_usdc 1234\n");
-    expect(first).toContain("\nbaldwin_total_bad_debt_usdc 0\n");
+    expect(first).toContain("\nfoxy_insurance_fund_usdc 1234\n");
+    expect(first).toContain("\nfoxy_total_bad_debt_usdc 0\n");
 
     // bad debt appears; some views start reverting (oracle trouble)
     h.chain.badDebt = 5_000_000n;
@@ -395,8 +395,8 @@ describe("funding, open interest, insurance fund and bad debt in the API", () =>
     expect(health.ok).toBe(true); // a warning, not an outage
     expect((await app.inject({ url: "/markets" })).json()[0]).toMatchObject({ markTwap: null, currentFundingRate: null, lastFundingTime: "900", openInterestLong: wad(7).toString() });
     const metrics = (await app.inject({ url: "/metrics" })).body;
-    expect(metrics).toContain("baldwin_total_bad_debt_usdc 5\n");
-    expect(metrics).not.toContain("baldwin_insurance_fund_usdc ");
+    expect(metrics).toContain("foxy_total_bad_debt_usdc 5\n");
+    expect(metrics).not.toContain("foxy_insurance_fund_usdc ");
     // matching is unaffected by those views
     await h.place(alice, false, 100, 1);
     expect((await h.place(bob, true, 100, 1)).fills).toHaveLength(1);

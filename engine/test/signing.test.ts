@@ -23,7 +23,7 @@ describe("EIP-712 orders", () => {
         [{ type: "bytes32" }, { type: "bytes32" }, { type: "bytes32" }, { type: "uint256" }, { type: "address" }],
         [
           keccak256(toHex("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")),
-          keccak256(toHex("Baldwin")),
+          keccak256(toHex("Foxy")),
           keccak256(toHex("1")),
           BigInt(DOMAIN.chainId),
           DOMAIN.verifyingContract,

@@ -18,7 +18,7 @@ function readDeployments(): unknown[] {
     try {
       out.push(JSON.parse(readFileSync(path.join(deploymentsDir, file), "utf8")));
     } catch (err) {
-      console.warn(`[baldwin] could not parse ${file}:`, err);
+      console.warn(`[foxy] could not parse ${file}:`, err);
     }
   }
   return out;
@@ -33,10 +33,10 @@ function readDeployments(): unknown[] {
  */
 function devDeployments(): Plugin {
   return {
-    name: "baldwin-dev-deployments",
+    name: "foxy-dev-deployments",
     config(_config, { command }) {
       const deployments = command === "serve" ? readDeployments() : [];
-      if (deployments.length > 0) console.log(`[baldwin] found ${deployments.length} deployment file(s) in ${deploymentsDir}`);
+      if (deployments.length > 0) console.log(`[foxy] found ${deployments.length} deployment file(s) in ${deploymentsDir}`);
       return { define: { __DEV_DEPLOYMENTS__: JSON.stringify(deployments) } };
     },
     configureServer(server) {

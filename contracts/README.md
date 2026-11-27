@@ -1,6 +1,6 @@
-# Baldwin contracts
+# Foxy contracts
 
-On-chain part of the Baldwin perpetuals exchange: USDC custody, EIP-712 order
+On-chain part of the Foxy perpetuals exchange: USDC custody, EIP-712 order
 settlement, cross margin, funding and liquidation. Rules: [`docs/SPEC.md`](../docs/SPEC.md).
 External interface (fixed, shared with the engine and the web app):
 [`src/interfaces/IExchange.sol`](src/interfaces/IExchange.sol).

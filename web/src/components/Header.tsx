@@ -52,7 +52,7 @@ export function Header({ live, wrongNetwork }: Props) {
     <>
       <header className="header">
         <div className="brand">
-          Baldwin
+          Foxy
           {MOCK && <span className="tag tag-mock">simulado</span>}
         </div>
 

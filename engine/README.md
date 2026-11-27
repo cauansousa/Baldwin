@@ -1,6 +1,6 @@
-# Baldwin engine
+# Foxy engine
 
-Off-chain matching engine for the Baldwin perpetuals exchange: order intake (EIP-712),
+Off-chain matching engine for the Foxy perpetuals exchange: order intake (EIP-712),
 price-time order books, settlement through `Exchange.settleMatches`, REST/WS API, and a
 separate liquidation + funding keeper. The contract is the source of truth; the engine
 only decides *which* signed orders are matched and in what order.
@@ -359,14 +359,14 @@ chain you run on.
 - **Logs**: one JSON object per line (`level`, `time`, `component`, `msg`, context). `info` on
   stdout, `warn`/`error` on stderr. `LOG_LEVEL` filters.
 - **`GET /health`**: see API. Use `ok` for liveness/readiness and alert on `warnings`.
-- **`GET /metrics`** (Prometheus text, no dependency): `baldwin_orders_accepted_total`,
-  `baldwin_orders_rejected_total{code}`, `baldwin_orders_duplicate_total`, `baldwin_orders_cancelled_total`,
-  `baldwin_matches_settled_total`, `baldwin_matches_failed_total`, `baldwin_batches_total`,
-  `baldwin_batch_errors_total`, `baldwin_batch_latency_seconds` (histogram),
-  `baldwin_settlement_queue_depth`, `baldwin_settlement_stalled`, `baldwin_resting_orders`,
-  `baldwin_exchange_paused`, `baldwin_settler_insufficient_funds`, `baldwin_settler_fee_cap_reached`,
-  `baldwin_store_broken`, `baldwin_recovering`, `baldwin_insurance_fund_usdc`, `baldwin_total_bad_debt_usdc`, `baldwin_operator_balance_eth`, `baldwin_rpc_errors_total{method}`,
-  `baldwin_cancel_watcher_block`. The endpoint is not authenticated: expose it to your
+- **`GET /metrics`** (Prometheus text, no dependency): `foxy_orders_accepted_total`,
+  `foxy_orders_rejected_total{code}`, `foxy_orders_duplicate_total`, `foxy_orders_cancelled_total`,
+  `foxy_matches_settled_total`, `foxy_matches_failed_total`, `foxy_batches_total`,
+  `foxy_batch_errors_total`, `foxy_batch_latency_seconds` (histogram),
+  `foxy_settlement_queue_depth`, `foxy_settlement_stalled`, `foxy_resting_orders`,
+  `foxy_exchange_paused`, `foxy_settler_insufficient_funds`, `foxy_settler_fee_cap_reached`,
+  `foxy_store_broken`, `foxy_recovering`, `foxy_insurance_fund_usdc`, `foxy_total_bad_debt_usdc`, `foxy_operator_balance_eth`, `foxy_rpc_errors_total{method}`,
+  `foxy_cancel_watcher_block`. The endpoint is not authenticated: expose it to your
   monitoring network only.
 - **Shutdown**: on SIGTERM/SIGINT the engine refuses new orders (503 `SHUTTING_DOWN`; cancels and
   reads still work), waits up to `SHUTDOWN_TIMEOUT_MS` for the batch in flight, terminates
@@ -436,7 +436,7 @@ unwinder on, the engine answered its last pass (`engineReachable`). If no tick c
 liquidationFailures, lastLiquidation, positionsInBackoff, lastTickAt, engineReachable, unwind: [{ marketId,
 position, order, note }] }`
 
-Metrics (prefix `baldwin_keeper_`): `tracked_accounts`, `liquidations`, `liquidation_failures`,
+Metrics (prefix `foxy_keeper_`): `tracked_accounts`, `liquidations`, `liquidation_failures`,
 `last_liquidation_timestamp`, `positions_in_backoff`, `event_cursor_block`, `events_caught_up`,
 `engine_reachable`, `last_tick_timestamp`,
 `free_collateral_usdc`, `position{market}`, `unwind_order_working{market}`, `rpc_errors_total{method}`.
@@ -480,9 +480,9 @@ script for how to start the engine for it (rate limits raised).
    them and sends SIGTERM to stop. With systemd, per unit:
    ```ini
    [Service]
-   WorkingDirectory=/srv/baldwin/engine
-   EnvironmentFile=/srv/baldwin/engine/.env
-   User=baldwin                          # an unprivileged account that owns the store directory
+   WorkingDirectory=/srv/foxy/engine
+   EnvironmentFile=/srv/foxy/engine/.env
+   User=foxy                          # an unprivileged account that owns the store directory
    ExecStart=/usr/bin/npm start          # keeper unit: npm run keeper
    Restart=always
    RestartSec=2
@@ -511,13 +511,13 @@ script for how to start the engine for it (rate limits raised).
 4. Monitor:
    - `/health`: `ok` false or any `warnings` (stalled settlement, low operator balance, paused
      exchange, halted market);
-   - `baldwin_settlement_stalled` = 1 or `baldwin_settlement_queue_depth` growing;
-   - `baldwin_operator_balance_eth` falling towards zero (settlement stops when it is empty),
-     `baldwin_settler_insufficient_funds` / `baldwin_settler_fee_cap_reached` = 1,
-     `baldwin_store_broken` = 1, `baldwin_recovering` staying at 1;
-   - `rate(baldwin_rpc_errors_total)` and `baldwin_cancel_watcher_block` not advancing (RPC trouble);
-   - `rate(baldwin_matches_failed_total)` against `…_settled_total` (stale band, unfunded makers);
-   - `baldwin_batch_latency_seconds` (inclusion time), `rate(baldwin_batch_errors_total)`;
+   - `foxy_settlement_stalled` = 1 or `foxy_settlement_queue_depth` growing;
+   - `foxy_operator_balance_eth` falling towards zero (settlement stops when it is empty),
+     `foxy_settler_insufficient_funds` / `foxy_settler_fee_cap_reached` = 1,
+     `foxy_store_broken` = 1, `foxy_recovering` staying at 1;
+   - `rate(foxy_rpc_errors_total)` and `foxy_cancel_watcher_block` not advancing (RPC trouble);
+   - `rate(foxy_matches_failed_total)` against `…_settled_total` (stale band, unfunded makers);
+   - `foxy_batch_latency_seconds` (inclusion time), `rate(foxy_batch_errors_total)`;
    - process restarts, `error` log lines, disk space for the store;
    - keeper: its "keeper alive" log line every ~5 minutes, `liquidation failed` warnings, its ETH
      and its free collateral in the Exchange.

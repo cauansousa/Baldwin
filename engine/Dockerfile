@@ -1,12 +1,12 @@
 # syntax=docker/dockerfile:1
 #
-# Baldwin engine and keeper (one image, the process is chosen by the command).
+# Foxy engine and keeper (one image, the process is chosen by the command).
 #
 # Build context is the REPOSITORY ROOT, because the engine imports ../shared:
-#   docker build -f engine/Dockerfile -t baldwin-engine .
+#   docker build -f engine/Dockerfile -t foxy-engine .
 # Run:
-#   engine:  docker run ... baldwin-engine                      (default command)
-#   keeper:  docker run ... baldwin-engine src/keeper/main.ts
+#   engine:  docker run ... foxy-engine                      (default command)
+#   keeper:  docker run ... foxy-engine src/keeper/main.ts
 #
 # NOTE: written without a Docker daemon at hand; see the README ("Docker").
 

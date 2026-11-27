@@ -68,7 +68,7 @@ describe("order helpers", () => {
     expect(hashTypedData(orderTypedData(31337, exchange, order))).toMatch(/^0x[0-9a-f]{64}$/);
     expect(hashTypedData(cancelTypedData(31337, exchange, trader, order.nonce))).toMatch(/^0x[0-9a-f]{64}$/);
     expect(orderTypedData(31337, exchange, order).domain).toEqual({
-      name: "Baldwin",
+      name: "Foxy",
       version: "1",
       chainId: 31337,
       verifyingContract: exchange,
@@ -225,7 +225,7 @@ describe("nonce store", () => {
     broken.recordSigned(trader, 8n);
     expect(broken.highestSigned(trader)).toBe(8n);
     const storage = memoryStorage();
-    storage.data.set(`baldwin.maxnonce:s:${trader.toLowerCase()}`, "not-a-number");
+    storage.data.set(`foxy.maxnonce:s:${trader.toLowerCase()}`, "not-a-number");
     expect(createNonceStore("s", storage).highestSigned(trader)).toBe(0n);
   });
 

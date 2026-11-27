@@ -23,7 +23,7 @@ describe("scripts/deploy-testnet.ts", () => {
     await eth.set(3_500n * 10n ** 8n, now);
     const sequencer = await Agg.deploy(0);
     await sequencer.setRound(0, now - 100_000, now);
-    const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "baldwin-deploy-")), "deployment.json");
+    const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "foxy-deploy-")), "deployment.json");
     const env: Record<string, string | undefined> = {
       USDC_ADDRESS: await token.getAddress(),
       BTC_USD_FEED: await btc.getAddress(),

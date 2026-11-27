@@ -30,7 +30,7 @@ async function main(): Promise<void> {
   if (process.env.OPERATOR_PRIVATE_KEY && process.env.OPERATOR_PRIVATE_KEY.replace(/^0x/, "").toLowerCase() === cfg.keeperKey.slice(2).toLowerCase()) {
     throw new Error("KEEPER_PRIVATE_KEY must differ from OPERATOR_PRIVATE_KEY: the engine manages the operator's nonces on its own");
   }
-  const metrics = new Metrics("baldwin_keeper_");
+  const metrics = new Metrics("foxy_keeper_");
   metrics.counter("rpc_errors_total", "JSON-RPC requests that failed after retries, by method");
   const chain = chainFor(deployment, cfg.rpcUrl);
   const transport = rpcTransport(cfg.rpcUrl, (method) => metrics.inc("rpc_errors_total", { method }));

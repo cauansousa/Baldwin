@@ -1,4 +1,4 @@
-# Baldwin — perpetuals exchange (MVP spec)
+# Foxy — perpetuals exchange (MVP spec)
 
 Non-custodial perpetual futures. Traders sign orders in their wallet (EIP-712);
 an off-chain engine matches them; an on-chain contract verifies both signatures,

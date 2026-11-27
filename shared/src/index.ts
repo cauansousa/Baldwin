@@ -2,7 +2,7 @@
 // contracts/src/interfaces/IExchange.sol — change both together.
 // Consumers: `parseAbi(EXCHANGE_ABI)` from viem.
 
-export const EIP712_DOMAIN_NAME = "Baldwin";
+export const EIP712_DOMAIN_NAME = "Foxy";
 export const EIP712_DOMAIN_VERSION = "1";
 
 export const ORDER_TYPES = {

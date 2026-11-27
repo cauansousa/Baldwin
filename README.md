@@ -1,4 +1,4 @@
-# Baldwin
+# Foxy
 
 Exchange de futuros perpétuos não custodial (MVP). O usuário assina ordens na própria
 carteira, um motor fora da blockchain casa as ordens e um contrato confere as duas
@@ -54,7 +54,6 @@ ou o WSL, onde os comandos abaixo funcionam como estão; no PowerShell, troque `
 ```bash
 git clone https://github.com/cauansousa/Baldwin.git
 cd Baldwin
-git checkout claude/laughing-lovelace-9kq8ph   # enquanto o PR não for mesclado
 
 cd contracts && npm install && cd ..
 cd engine    && npm install && cd ..

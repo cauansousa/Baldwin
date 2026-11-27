@@ -15,7 +15,7 @@ import { useChainAccount, useChainMarkets, useExchangeStatus } from "./hooks/use
 import { useEngineHealth, useMarketFeed, useMarkets } from "./hooks/useEngine";
 import { describeError } from "./lib/errors";
 
-const TESTNET_NOTICE_KEY = "baldwin.testnet-notice-dismissed";
+const TESTNET_NOTICE_KEY = "foxy.testnet-notice-dismissed";
 
 // sessionStorage can throw (private mode, blocked storage); the notice then simply reappears.
 function readSessionFlag(key: string): boolean {

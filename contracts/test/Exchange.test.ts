@@ -325,7 +325,7 @@ describe("Exchange", () => {
       const { exchange, ctx, alice } = await loadFixture(deployFixture);
       const order = ctx.order(alice, true, ONE, BTC_PRICE, { expiry: 1234567890, reduceOnly: true, nonce: 77 });
       const domain = {
-        name: "Baldwin",
+        name: "Foxy",
         version: "1",
         chainId: (await ethers.provider.getNetwork()).chainId,
         verifyingContract: await exchange.getAddress(),
@@ -362,7 +362,7 @@ describe("Exchange", () => {
       // signed for another chain id
       m = await ctx.trade(alice, bob, ONE, BTC_PRICE);
       m.makerSig = await alice.signTypedData(
-        { name: "Baldwin", version: "1", chainId: 1, verifyingContract: await exchange.getAddress() },
+        { name: "Foxy", version: "1", chainId: 1, verifyingContract: await exchange.getAddress() },
         ORDER_TYPES,
         m.maker,
       );
@@ -371,7 +371,7 @@ describe("Exchange", () => {
       // signed for another exchange
       m = await ctx.trade(alice, bob, ONE, BTC_PRICE);
       m.makerSig = await alice.signTypedData(
-        { name: "Baldwin", version: "1", chainId: (await ethers.provider.getNetwork()).chainId, verifyingContract: carol.address },
+        { name: "Foxy", version: "1", chainId: (await ethers.provider.getNetwork()).chainId, verifyingContract: carol.address },
         ORDER_TYPES,
         m.maker,
       );

@@ -1,4 +1,4 @@
-# Baldwin engine + keeper for a public testnet (Arbitrum Sepolia).
+# Foxy engine + keeper for a public testnet (Arbitrum Sepolia).
 #
 #   cp .env.testnet.example .env.testnet      # fill in keys, RPC_URL, CORS_ORIGIN
 #   docker compose -f docker-compose.testnet.yml up -d --build
@@ -9,7 +9,7 @@
 # that a process only ever holds its own key.
 
 x-common: &common
-  image: baldwin-engine:latest
+  image: foxy-engine:latest
   build:
     context: ..
     dockerfile: engine/Dockerfile

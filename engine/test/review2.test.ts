@@ -323,7 +323,7 @@ describe("F5 / items 4 and 12: keeper", () => {
     const { writeFileSync, mkdtempSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
-    const dir = mkdtempSync(join(tmpdir(), "baldwin-cfg-"));
+    const dir = mkdtempSync(join(tmpdir(), "foxy-cfg-"));
     const dep = (chainId: number) => {
       const f = join(dir, `${chainId}.json`);
       writeFileSync(f, JSON.stringify({ chainId, exchange: alice.address, usdc: bob.address, oracle: carol.address, markets: [] }));
@@ -410,7 +410,7 @@ describe("F6 / item 8: fee bumping cannot lock the operator out", () => {
     const app = await buildServer(engine);
     const h = (await app.inject({ url: "/health" })).json();
     expect(h.warnings).toEqual([expect.stringMatching(/cannot pay/), expect.stringMatching(/fee cap/)]);
-    expect((await app.inject({ url: "/metrics" })).body).toContain("baldwin_settler_insufficient_funds 1\n");
+    expect((await app.inject({ url: "/metrics" })).body).toContain("foxy_settler_insufficient_funds 1\n");
     flags = { insufficientFunds: false, feeCapReached: false };
     expect((await app.inject({ url: "/health" })).json().warnings).toEqual([]);
     await app.close();
@@ -673,7 +673,7 @@ describe("ops: nothing secret in logs", () => {
     const { mkdtempSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
-    const path = join(mkdtempSync(join(tmpdir(), "baldwin-excl-")), "engine.sqlite");
+    const path = join(mkdtempSync(join(tmpdir(), "foxy-excl-")), "engine.sqlite");
     const first = new SqliteStore(path, { exclusive: true });
     first.setMeta("k", "v");
     const t0 = Date.now();

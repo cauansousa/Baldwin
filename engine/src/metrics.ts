@@ -28,7 +28,7 @@ export class Metrics {
   private readonly gauges = new Map<string, { help: string; read: () => GaugeValue }>();
   private readonly histograms = new Map<string, Histogram>();
 
-  constructor(private readonly prefix = "baldwin_") {}
+  constructor(private readonly prefix = "foxy_") {}
 
   /** Declare a counter so that it is exported (as 0) before its first increment. */
   counter(name: string, help: string): void {
