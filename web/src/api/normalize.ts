@@ -30,7 +30,14 @@ export function normalizeHealth(value: unknown): EngineHealth {
       const band = isObject(m.band)
         ? { lower: bigintFromJson(m.band.lo ?? m.band.lower, "band.lo"), upper: bigintFromJson(m.band.hi ?? m.band.upper, "band.hi") }
         : null;
-      return [{ marketId: Number(m.marketId), indexPrice: nullable(m.indexPrice, "indexPrice"), band }];
+      return [
+        {
+          marketId: Number(m.marketId),
+          indexPrice: nullable(m.indexPrice, "indexPrice"),
+          band,
+          openInterestCapReached: m.openInterestCapReached === true,
+        },
+      ];
     } catch {
       return [];
     }
@@ -39,6 +46,8 @@ export function normalizeHealth(value: unknown): EngineHealth {
   const recovering = v.recovering === true || settlement.recovering === true;
   return {
     ok: v.ok !== false,
+    time: typeof v.time === "number" && Number.isFinite(v.time) && v.time > 0 ? v.time : undefined,
+    clockSkewSec: typeof chain?.clockSkewSec === "number" ? chain.clockSkewSec : undefined,
     recovering,
     stalled: typeof settlement.stalled === "boolean" ? settlement.stalled : v.ok === false && !recovering,
     paused: typeof chain?.paused === "boolean" ? chain.paused : undefined,
@@ -66,6 +75,8 @@ function normalizeMarketStats(m: Json): EngineMarketStats {
     const value = optionalBigint(m[field]);
     if (value !== undefined) stats[field] = value;
   }
+  // An explicit null funding rate means "unavailable": it must show as such, not fall back to a chain 0.
+  if (m.currentFundingRate === null) stats.currentFundingRate = null;
   return stats;
 }
 

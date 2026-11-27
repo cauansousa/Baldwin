@@ -10,7 +10,12 @@ export interface EngineMarketStats {
   indexPrice?: bigint; // WAD
   lastPrice?: bigint; // WAD, last confirmed fill
   markTwap?: bigint; // WAD
-  currentFundingRate?: bigint; // WAD per hour, positive = longs pay
+  /**
+   * WAD per hour, positive = longs pay. The contract's view is authoritative
+   * (0 while paused or for an inactive market). `null` = the engine says it is
+   * unavailable: shown as "—", never as 0 and never derived from the TWAP.
+   */
+  currentFundingRate?: bigint | null;
   lastFundingTime?: bigint; // unix seconds
   nextFundingTime?: bigint; // unix seconds
   openInterestLong?: bigint; // base, WAD
@@ -70,7 +75,12 @@ export function mergeMarketFigures(stats: EngineMarketStats | undefined, chain: 
     indexPrice,
     markPrice: positive(s.lastPrice) ?? positive(c.markPrice),
     markTwap: positive(s.markTwap) ?? positive(c.markTwap),
-    fundingRate: indexPrice === undefined ? undefined : (s.currentFundingRate ?? c.fundingRate),
+    fundingRate:
+      s.currentFundingRate === null || indexPrice === undefined
+        ? undefined
+        : s.currentFundingRate !== undefined
+          ? s.currentFundingRate
+          : c.fundingRate,
     nextFundingTime:
       positive(s.nextFundingTime) ?? (lastFundingTime !== undefined ? lastFundingTime + FUNDING_INTERVAL_SECONDS : undefined),
     openInterest,

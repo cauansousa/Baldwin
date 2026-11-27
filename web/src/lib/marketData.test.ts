@@ -70,6 +70,12 @@ describe("mergeMarketFigures", () => {
     expect(noIndex.markTwap).toBeUndefined();
     expect(noIndex.fundingRate).toBeUndefined();
     expect(noIndex.markPrice).toBeUndefined();
+    // The engine saying null means "unavailable": no chain read, and never shown as 0.
+    expect(missingReads({ ...full, currentFundingRate: null })).toEqual([]);
+    expect(mergeMarketFigures({ ...full, currentFundingRate: null }, { fundingRate: 0n }).fundingRate).toBeUndefined();
+    expect(mergeMarketFigures({ ...full, currentFundingRate: null }, { fundingRate: 7n }).fundingRate).toBeUndefined();
+    // The rate is whatever the contract reports; it is never derived from the TWAP.
+    expect(mergeMarketFigures({ indexPrice: 100n, markTwap: 150n, currentFundingRate: 0n }, undefined).fundingRate).toBe(0n);
     // With an index, a zero rate is real (e.g. no fills in the current period).
     expect(mergeMarketFigures({ indexPrice: 100n, currentFundingRate: 0n, markTwap: 100n }, undefined).fundingRate).toBe(0n);
   });

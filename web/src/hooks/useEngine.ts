@@ -1,6 +1,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { engine } from "../api";
+import { engineClock } from "../lib/clock";
 import { mergeTrades } from "../api/normalize";
 import type { Trade } from "../api/types";
 
@@ -17,7 +18,16 @@ export const queryKeys = {
 
 /** Engine self-report: settlement health, pause flag and halted markets. Best effort. */
 export function useEngineHealth() {
-  return useQuery({ queryKey: ["engine", "health"] as const, queryFn: () => engine.getHealth(), refetchInterval: 10_000 });
+  return useQuery({
+    queryKey: ["engine", "health"] as const,
+    queryFn: async () => {
+      const health = await engine.getHealth();
+      // Orders are dated from the engine's clock (see lib/clock.ts).
+      if (health.time !== undefined) engineClock.sync(health.time);
+      return health;
+    },
+    refetchInterval: 10_000,
+  });
 }
 
 export function useMarkets() {

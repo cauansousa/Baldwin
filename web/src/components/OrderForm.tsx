@@ -10,7 +10,9 @@ import { config } from "../config";
 import { readChainTime, type ChainAccount, type ChainMarket, type ExchangeStatus } from "../hooks/useChain";
 import { useTxFlow } from "../hooks/useTx";
 import { queryKeys } from "../hooks/useEngine";
-import { describeError, describeOrderReason, EngineError } from "../lib/errors";
+import { engineClock } from "../lib/clock";
+import { describeError, EngineError } from "../lib/errors";
+import { describeSubmitAnswer } from "../lib/orderStatus";
 import {
   cancelTypedData,
   DEFAULT_EXPIRY_SECONDS,
@@ -74,18 +76,6 @@ interface Props {
   trader: `0x${string}` | undefined;
   prefill: OrderPrefill | undefined;
 }
-
-const STATUS_LABELS: Record<string, string> = {
-  open: "aberta no livro",
-  partially_filled: "parcialmente executada",
-  pending_settlement: "casada, aguardando liquidação on-chain",
-  filled: "executada",
-  cancelled: "cancelada",
-  expired: "expirada",
-  rejected: "rejeitada",
-};
-/** Statuses meaning the order did not survive; shown as a warning, not a success. */
-const CLOSED_STATUSES = new Set(["cancelled", "expired", "rejected"]);
 
 export function OrderForm({ market, chainMarket, account, exchangeStatus, engineMarket, trader, prefill }: Props) {
   const queryClient = useQueryClient();
@@ -185,21 +175,17 @@ export function OrderForm({ market, chainMarket, account, exchangeStatus, engine
   };
 
   function describeAccepted(result: PostOrderResult): Submit {
-    const status = STATUS_LABELS[result.status] ?? result.status;
-    const warn = CLOSED_STATUSES.has(result.status) && result.fills.length === 0 && !((result.filled ?? 0n) + (result.pending ?? 0n) > 0n);
-    const reason = result.reason ? ` Motivo: ${describeOrderReason(result.reason)}.` : "";
-    if (result.duplicate) {
-      // The earlier attempt had gone through; this is the order's current state.
-      const matched = (result.filled ?? 0n) + (result.pending ?? 0n);
-      const executed = matched > 0n ? ` · ${formatSize(matched)} ${base} já casado` : "";
-      return {
-        status: "success",
-        message: `Ordem confirmada: o motor já a tinha recebido na primeira tentativa${status ? ` (${status})` : ""}${executed}.${reason}`,
-        warn,
-      };
-    }
-    const fills = result.fills.length > 0 ? ` · ${result.fills.length} execução(ões) aguardando liquidação` : "";
-    return { status: "success", message: `Ordem enviada${status ? `: ${status}` : ""}${fills}.${reason}`, warn };
+    const matched = (result.filled ?? 0n) + (result.pending ?? 0n);
+    return {
+      status: "success",
+      ...describeSubmitAnswer({
+        status: result.status,
+        reason: result.reason,
+        duplicate: result.duplicate,
+        fillCount: result.fills.length,
+        matched: matched > 0n ? `${formatSize(matched)} ${base}` : undefined,
+      }),
+    };
   }
 
   /**
@@ -221,9 +207,11 @@ export function OrderForm({ market, chainMarket, account, exchangeStatus, engine
       { onRetry: (n) => setSubmit({ status: "confirming", attempt: n }) },
     );
     if (outcome.kind === "accepted") {
+      // Known to the engine, live or closed: either way the intent is resolved.
       setPending(undefined);
-      setSubmit(describeAccepted(outcome.value));
-      setSize("");
+      const answer = describeAccepted(outcome.value);
+      setSubmit(answer);
+      if (!(answer.status === "success" && answer.warn)) setSize("");
     } else if (outcome.kind === "not_accepted") {
       // Not live at the engine: the signed order is dropped and a new one may be signed.
       setPending(undefined);
@@ -255,7 +243,9 @@ export function OrderForm({ market, chainMarket, account, exchangeStatus, engine
       const floor = nonceStore.floor(trader);
       if (floor > minValidNonce) minValidNonce = floor;
       // The contract's clock bounds nonces; fall back to the device clock if the read fails.
-      let chainTime = BigInt(Math.floor(Date.now() / 1000));
+      // "Now" is the engine's clock when it is known (GET /health `time`), else this device's.
+      const nowMs = engineClock.nowMs();
+      let chainTime = BigInt(Math.floor(nowMs / 1000));
       const [onChainMin, onChainTime] = await Promise.allSettled([
         readContract(wagmiConfig, {
           abi: exchangeAbi,
@@ -276,8 +266,8 @@ export function OrderForm({ market, chainMarket, account, exchangeStatus, engine
         reduceOnly,
         size: parsed.size,
         limitPrice: parsed.price,
-        nonce: nextNonce(minValidNonce, nonceUpperBound(chainTime)), // throws if no acceptable nonce exists
-        expiry: defaultExpiry(),
+        nonce: nextNonce(minValidNonce, nonceUpperBound(chainTime), nowMs), // throws if no acceptable nonce exists
+        expiry: defaultExpiry(nowMs),
       };
       const typedData = orderTypedData(config.chainId, config.exchange, order);
       // Recorded before the wallet is asked: the signature may exist even if we never get it back.

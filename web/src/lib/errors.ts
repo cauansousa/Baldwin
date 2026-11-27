@@ -39,8 +39,10 @@ const ENGINE_CODE_MESSAGES: Record<string, string> = {
   STATE_UNKNOWN: "O motor processou a ordem mas não conseguiu gravá-la; não se sabe se ela foi aceita.",
   RECOVERING: "O motor está se sincronizando com a blockchain após reiniciar e não aceitou a ordem. Tente de novo em instantes.",
   REDUCE_ONLY_EXCEEDS_POSITION: "Ordem somente-redução maior que a posição (somada às outras ordens de redução abertas).",
-  CHAIN_UNAVAILABLE: "O motor não consegue falar com a blockchain no momento. Tente de novo em instantes.",
-  RATE_LIMITED: "Muitas requisições em pouco tempo (limite por conexão e por conta). Aguarde alguns segundos e tente de novo.",
+  CHAIN_UNAVAILABLE:
+    "O motor não está aceitando ordens: sem acesso à blockchain ou com o relógio fora de sincronia com ela. Tente de novo em instantes.",
+  RATE_LIMITED:
+    "Limite de requisições atingido (por conexão, por conta ou após várias ordens suas não liquidarem on-chain). Aguarde um pouco e tente de novo.",
   NOT_FOUND: "Ordem não encontrada no motor.",
   INTERNAL: "Erro interno do motor; não se sabe se a requisição teve efeito.",
 };
@@ -100,18 +102,6 @@ function describeEngineError(status: number, body: unknown, rawText: string): En
 
 export const engineErrorMessage = (status: number, body: unknown, rawText: string) =>
   parseEngineError(status, body, rawText).message;
-
-/** Portuguese text for the reason the engine gives when it closes an order. */
-export function describeOrderReason(reason: string): string {
-  if (/price band/i.test(reason)) {
-    return "preço fora da banda permitida em torno do índice; o que não executou foi cancelado";
-  }
-  if (/self-trade/i.test(reason)) return "a ordem casaria com outra ordem sua";
-  if (/cancelled by trader/i.test(reason)) return "cancelada por você";
-  if (/expired/i.test(reason)) return "expirada";
-  if (/IOC/.test(reason)) return "ordem IOC: o que não executou de imediato foi cancelado";
-  return reason;
-}
 
 /** The transaction was not confirmed within the wait window; it may still confirm later. */
 export class TxTimeoutError extends Error {

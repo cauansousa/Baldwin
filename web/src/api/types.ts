@@ -78,8 +78,11 @@ export interface CancelResult {
 
 /** What GET /health says the engine currently believes. */
 export interface EngineHealth {
-  /** False when on-chain settlement is stalled. */
   ok: boolean;
+  /** The engine's clock, unix seconds (the later of its host clock and chain time). */
+  time?: number;
+  /** Set while chain time is too far ahead of the engine's clock: order intake is halted. */
+  clockSkewSec?: number;
   /** Reconciling with the chain after a restart: orders are refused for the moment. */
   recovering: boolean;
   /** On-chain settlement is stalled. */
@@ -95,6 +98,8 @@ export interface EngineHealth {
     indexPrice: bigint | null;
     /** Fill-price band the engine enforces, WAD. */
     band: { lower: bigint; upper: bigint } | null;
+    /** Only fills that do not add open interest are matched in this market. */
+    openInterestCapReached: boolean;
   }[];
 }
 

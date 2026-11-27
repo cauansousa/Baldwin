@@ -9,6 +9,7 @@ import { config } from "../config";
 import { queryKeys, useOpenOrders } from "../hooks/useEngine";
 import { readChainTime } from "../hooks/useChain";
 import { useTxFlow } from "../hooks/useTx";
+import { engineClock } from "../lib/clock";
 import { describeError } from "../lib/errors";
 import { cancelTypedData, nonceUpperBound, normalizeSignature, planBulkCancel } from "../lib/order";
 import { formatPrice, formatSize } from "../lib/units";
@@ -111,7 +112,13 @@ export function OpenOrdersTable({ markets, viewer, trader }: Props) {
       ]);
       let highestSigned = nonceStore.highestSigned(trader);
       for (const nonce of listed) if (nonce > highestSigned) highestSigned = nonce;
-      const planned = planBulkCancel({ currentMinValidNonce: currentMin, highestSignedNonce: highestSigned, upperBound: nonceUpperBound(chainTime) });
+      const planned = planBulkCancel({
+        currentMinValidNonce: currentMin,
+        highestSignedNonce: highestSigned,
+        upperBound: nonceUpperBound(chainTime),
+        // Nonces are dated from the engine's clock when it is known, so the cover must be too.
+        nowMs: Math.max(engineClock.nowMs(), Date.now()),
+      });
       plan = planned;
       return [
         {

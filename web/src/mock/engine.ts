@@ -7,11 +7,16 @@ import { account, buildBook, fundingRate, getMarket, indexPrice, lastFundingTime
  *   ?mockSubmit=timeout,unknown   order registered, then a timeout / "state unknown" 503
  *   ?mockSubmit=lost              request lost (order not registered), reported as a timeout
  *   ?mockSubmit=refused           503 SHUTTING_DOWN (definitely not accepted)
+ *   ?mockSubmit=closed            accepted, closed at once by the engine, answer lost; the retry
+ *                                 gets 200 `duplicate: true` with status "cancelled"
  * Cancels: ?mockCancel=fail (500, outcome unknown) or ?mockCancel=notfound (404), one per call.
  */
 const params = new URLSearchParams(typeof location === "undefined" ? "" : location.search);
 const submitFaults = (params.get("mockSubmit") ?? "").split(",").filter(Boolean);
 const cancelFaults = (params.get("mockCancel") ?? "").split(",").filter(Boolean);
+
+/** Orders the (mock) engine accepted and then closed, by nonce. */
+const closedOrders = new Map<bigint, { orderHash: `0x${string}`; status: string; reason: string }>();
 
 /** Nonces cancelled off-chain at the (mock) engine. */
 const deadNonces = new Set<bigint>();
@@ -28,7 +33,17 @@ function requireMarket(marketId: number) {
 export const mockEngine: EngineApi = {
   async getHealth() {
     const figures = params.get("mockEngineStats") === "0" ? {} : { insuranceFund: protocol.insuranceFund, totalBadDebt: protocol.totalBadDebt };
-    return { ok: true, recovering: false, stalled: false, paused: false, markets: [], ...figures };
+    // ?mockOiCap=1: the first market has reached its open-interest cap.
+    const capped = params.has("mockOiCap");
+    return {
+      ok: true,
+      time: Math.floor(Date.now() / 1000),
+      recovering: false,
+      stalled: false,
+      paused: false,
+      markets: markets.map((m, i) => ({ marketId: m.marketId, indexPrice: indexPrice(m), band: null, openInterestCapReached: capped && i === 0 })),
+      ...figures,
+    };
   },
   async getMarkets() {
     // ?mockEngineStats=0: the engine reports no figures, so everything is read from the (mock) chain.
@@ -67,6 +82,11 @@ export const mockEngine: EngineApi = {
     const nonce = BigInt(req.order.nonce);
     // Idempotent by order identity, like the real engine: a resubmission returns the current state.
     const existing = openOrders.find((o) => o.order.nonce === nonce && o.order.trader.toLowerCase() === req.order.trader.toLowerCase());
+    const closed = closedOrders.get(nonce);
+    if (closed) {
+      // A known closed order: 200 with its real status, not an error.
+      return { orderHash: closed.orderHash, status: closed.status, reason: closed.reason, fills: [], duplicate: true, remaining: 0n, pending: 0n, filled: 0n };
+    }
     if (existing) {
       return {
         orderHash: existing.orderHash,
@@ -85,6 +105,15 @@ export const mockEngine: EngineApi = {
     }
     const fault = submitFaults.shift();
     if (fault === "refused") throw new EngineError(503, "O motor está reiniciando e não aceitou a ordem. Tente de novo em instantes.", "SHUTTING_DOWN", "not_applied");
+    if (fault === "closed") {
+      // Accepted and immediately closed by the engine; the answer is lost.
+      closedOrders.set(nonce, {
+        orderHash: req.orderHash ?? newOrderHash(),
+        status: "cancelled",
+        reason: "open-interest cap reached: only fills that do not add open interest can trade",
+      });
+      throw new DOMException("The operation timed out.", "TimeoutError");
+    }
     if (fault === "lost") throw new DOMException("The operation timed out.", "TimeoutError"); // never reached the engine
     const orderHash = req.orderHash ?? newOrderHash();
     const amounts = { duplicate: false, remaining: size, pending: 0n, filled: 0n };

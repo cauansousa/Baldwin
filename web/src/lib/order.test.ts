@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { hashTypedData } from "viem";
-import { describeError, describeOrderReason, EngineError, engineErrorMessage, parseEngineError, TxTimeoutError } from "./errors";
+import { createEngineClock, ENGINE_TIME_MAX_AGE_MS } from "./clock";
+import { describeError, EngineError, engineErrorMessage, parseEngineError, TxTimeoutError } from "./errors";
+import { describeOrderReason, describeSubmitAnswer } from "./orderStatus";
 import { createNonceStore } from "./nonceStore";
 import { classifySubmitFailure, submitUntilKnown } from "./submit";
 import {
@@ -157,6 +159,38 @@ describe("nonce bounds and on-chain bulk cancel", () => {
   });
 });
 
+describe("engine clock", () => {
+  const device = 1_800_000_000_000;
+
+  it("falls back to the device clock until synchronised", () => {
+    const clock = createEngineClock();
+    expect(clock.synced(device)).toBe(false);
+    expect(clock.nowMs(device)).toBe(device);
+  });
+
+  it("dates from the engine's time once synchronised, ahead or behind the device", () => {
+    const clock = createEngineClock();
+    clock.sync(1_800_000_090, device); // engine 90 s ahead (e.g. chain time leading)
+    expect(clock.synced(device)).toBe(true);
+    expect(clock.nowMs(device)).toBe(device + 90_000);
+    expect(clock.nowMs(device + 7_000)).toBe(device + 97_000);
+    // An order dated from it expires 24 h after the ENGINE's now, and its nonce carries the engine's ms.
+    expect(defaultExpiry(clock.nowMs(device))).toBe(1_800_000_090n + 86_400n);
+    expect(generateNonce(clock.nowMs(device), 0n) >> 64n).toBe(BigInt(device) + 90_000n);
+    clock.sync(1_799_999_970, device); // 30 s behind
+    expect(clock.nowMs(device)).toBe(device - 30_000);
+  });
+
+  it("stops trusting a stale reading and ignores nonsense", () => {
+    const clock = createEngineClock();
+    clock.sync(1_800_000_090, device);
+    expect(clock.nowMs(device + ENGINE_TIME_MAX_AGE_MS + 1)).toBe(device + ENGINE_TIME_MAX_AGE_MS + 1);
+    clock.sync(Number.NaN, device);
+    clock.sync(0, device);
+    expect(clock.nowMs(device)).toBe(device + 90_000); // earlier good reading kept
+  });
+});
+
 describe("nonce store", () => {
   const memoryStorage = () => {
     const data = new Map<string, string>();
@@ -306,7 +340,7 @@ describe("error messages", () => {
     });
     expect(engineErrorMessage(400, body("INVALID_EXPIRY"), "")).toMatch(/Validade inválida/);
     expect(engineErrorMessage(429, body("TRADER_SUSPENDED"), "")).toMatch(/suspensa/);
-    expect(engineErrorMessage(429, body("RATE_LIMITED"), "")).toMatch(/Muitas requisições/);
+    expect(engineErrorMessage(429, body("RATE_LIMITED"), "")).toMatch(/Limite de requisições/);
     expect(engineErrorMessage(503, body("EXCHANGE_PAUSED"), "")).toMatch(/pausada/);
     expect(engineErrorMessage(503, body("MARKET_HALTED"), "")).toMatch(/Mercado suspenso/);
     expect(engineErrorMessage(503, body("CHAIN_UNAVAILABLE"), "")).toMatch(/blockchain/);
@@ -329,10 +363,53 @@ describe("error messages", () => {
     expect(parseEngineError(418, body("NEW_CODE", "something new"), "")).toEqual({ code: "NEW_CODE", message: "something new" });
   });
 
-  it("translates the reason of an order the engine closed", () => {
+  it("translates the reasons the engine gives for closing an order", () => {
     expect(describeOrderReason("price outside the oracle price band")).toMatch(/fora da banda/);
-    expect(describeOrderReason("IOC order: match failed on-chain, size not re-posted")).toMatch(/IOC/);
+    expect(describeOrderReason("IOC remainder cancelled")).toMatch(/IOC/);
+    expect(describeOrderReason("open-interest cap reached: only fills that do not add open interest can trade")).toMatch(/limite de contratos em aberto/);
+    expect(describeOrderReason("the position this reduce-only order would reduce is being closed by the trader's other orders")).toMatch(
+      /somente-redução/,
+    );
+    expect(describeOrderReason("match could not settle on-chain: exchange paused")).toMatch(/condição geral/);
+    expect(describeOrderReason("match could not settle on-chain: price band (repeatedly)")).toMatch(/sem culpa sua/);
+    expect(describeOrderReason("exchange paused, market inactive or without an index price: this order cannot trade now")).toMatch(/pausada/);
+    expect(describeOrderReason("post-only order would have taken liquidity")).toMatch(/post-only/);
     expect(describeOrderReason("something else")).toBe("something else");
+  });
+
+  it("describes a 200 answer: fresh, duplicate-and-live, duplicate-and-closed", () => {
+    const base = { fillCount: 0, duplicate: false } as const;
+    expect(describeSubmitAnswer({ ...base, status: "open" })).toEqual({ message: "Ordem enviada: aberta no livro.", warn: false });
+    expect(describeSubmitAnswer({ ...base, status: "partially_filled", fillCount: 2 }).message).toMatch(/2 execução/);
+    // IOC with nothing to match: accepted, but nothing is live.
+    expect(describeSubmitAnswer({ ...base, status: "cancelled", reason: "IOC remainder cancelled" })).toMatchObject({ warn: true });
+
+    const live = describeSubmitAnswer({ status: "open", duplicate: true, fillCount: 0 });
+    expect(live.warn).toBe(false);
+    expect(live.message).toMatch(/já a tinha recebido na primeira tentativa \(aberta no livro\)/);
+
+    // Resubmitting a known closed order answers 200 with its real status: resolved, and closed.
+    for (const [status, word] of [["cancelled", "cancelada"], ["expired", "expirada"], ["rejected", "rejeitada"]] as const) {
+      const closed = describeSubmitAnswer({ status, duplicate: true, fillCount: 0 });
+      expect(closed.warn, status).toBe(true);
+      expect(closed.message, status).toContain(`já está encerrada (${word})`);
+      expect(closed.message, status).toContain("não está mais no livro");
+    }
+    const partly = describeSubmitAnswer({
+      status: "cancelled",
+      duplicate: true,
+      fillCount: 0,
+      matched: "0,0500 BTC",
+      reason: "open-interest cap reached: only fills that do not add open interest can trade",
+    });
+    expect(partly.message).toMatch(/0,0500 BTC já casado/);
+    expect(partly.message).toMatch(/Motivo: o mercado atingiu o limite/);
+  });
+
+  it("the new meanings of RATE_LIMITED and CHAIN_UNAVAILABLE are in their messages", () => {
+    const body = (code: string) => ({ error: { code, message: "x", outcome: "not_applied" } });
+    expect(engineErrorMessage(429, body("RATE_LIMITED"), "")).toMatch(/não liquidarem on-chain/);
+    expect(engineErrorMessage(503, body("CHAIN_UNAVAILABLE"), "")).toMatch(/relógio fora de sincronia/);
   });
 
   it("translates the contract's nonce errors and an engine request timeout", () => {

@@ -71,25 +71,27 @@ describe("engine payload normalization", () => {
       chain: {
         paused: true,
         markets: [
-          { marketId: 0, indexPrice: "100", band: { lo: "95", hi: "105" } },
+          { marketId: 0, indexPrice: "100", band: { lo: "95", hi: "105" }, openInterestCapReached: true },
           { marketId: 1, indexPrice: null, band: null },
         ],
       },
     });
     expect(health).toEqual({
       ok: false,
+      time: undefined,
+      clockSkewSec: undefined,
       recovering: false,
       stalled: true,
       paused: true,
       insuranceFund: undefined,
       totalBadDebt: undefined,
       markets: [
-        { marketId: 0, indexPrice: 100n, band: { lower: 95n, upper: 105n } },
-        { marketId: 1, indexPrice: null, band: null },
+        { marketId: 0, indexPrice: 100n, band: { lower: 95n, upper: 105n }, openInterestCapReached: true },
+        { marketId: 1, indexPrice: null, band: null, openInterestCapReached: false },
       ],
     });
     // Engine without a chain reader, or an unexpected body: nothing is assumed.
-    const blank = { ok: true, recovering: false, stalled: false, paused: undefined, insuranceFund: undefined, totalBadDebt: undefined, markets: [] };
+    const blank = { ok: true, time: undefined, clockSkewSec: undefined, recovering: false, stalled: false, paused: undefined, insuranceFund: undefined, totalBadDebt: undefined, markets: [] };
     expect(normalizeHealth({ ok: true, insuranceFund: "5000000", totalBadDebt: "0" })).toMatchObject({ insuranceFund: 5_000_000n, totalBadDebt: 0n });
     expect(normalizeHealth({ ok: true, chain: null })).toEqual(blank);
     expect(normalizeHealth("nope")).toEqual(blank);
@@ -100,6 +102,12 @@ describe("engine payload normalization", () => {
       stalled: false,
     });
     expect(normalizeHealth({ ok: false })).toMatchObject({ recovering: false, stalled: true });
+    // Engine clock and clock-skew halt.
+    expect(normalizeHealth({ ok: true, time: 1_800_000_000, chain: { paused: false, chainTimeLeadSec: 3, clockSkewSec: null, markets: [] } })).toMatchObject({
+      time: 1_800_000_000,
+      clockSkewSec: undefined,
+    });
+    expect(normalizeHealth({ ok: true, time: "soon", chain: { clockSkewSec: 400, markets: [] } })).toMatchObject({ time: undefined, clockSkewSec: 400 });
   });
 
   it("reads POST /orders answers, including the idempotent duplicate", () => {
@@ -154,8 +162,9 @@ it("normalizes markets and the contract figures the engine mirrors", () => {
       openInterestShort: 7n,
       lastPrice: 102n,
     });
-    // null (view unreadable / index unavailable) means "not reported": the chain is read instead.
-    expect(markets[1]?.stats).toEqual({});
+    // null (view unreadable / index unavailable) means "not reported": the chain is read instead —
+    // except the funding rate, whose null is kept so that it shows as unavailable rather than 0.
+    expect(markets[1]?.stats).toEqual({ currentFundingRate: null });
     expect(normalizeMarkets([{ marketId: 2, symbol: "X", indexPrice: "garbage" }])[0]?.stats).toEqual({});
   });
 });

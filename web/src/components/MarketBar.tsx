@@ -61,14 +61,14 @@ export function MarketBar({ markets, market, onSelectMarket, chainMarket: cm, lo
         </Stat>
         <Stat
           label="Último negócio"
-          title="Preço do último negócio. A média ponderada pelo tempo (TWAP) do período atual é a que define o funding."
+          title="Preço do último negócio. TWAP: índice × (1 + prêmio médio do período atual); é apenas informativo."
           hint={cm?.markTwap !== undefined ? <>TWAP {formatPrice(cm.markTwap)}</> : undefined}
         >
           {price(cm?.markPrice)}
         </Stat>
         <Stat
           label="Funding (por hora)"
-          title="Taxa que o período atual aplicaria se fosse apurado agora. Positiva: comprados pagam vendidos. Um mercado sem negócios no período atual não paga funding."
+          title="Taxa informada pelo contrato para o período atual, se fosse apurado agora. Positiva: comprados pagam vendidos. É zero se o mercado negociar no preço índice ou não negociar, e nada é apurado enquanto a exchange está pausada."
           hint={rate !== undefined ? DIRECTION_TEXT[fundingDirection(rate)] : undefined}
         >
           {rate !== undefined ? formatFundingRate(rate) : blank}

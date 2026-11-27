@@ -65,6 +65,8 @@ export function App() {
         }
       : undefined;
 
+  const cappedMarkets = markets.filter((m) => health.data?.markets.some((h) => h.marketId === m.marketId && h.openInterestCapReached));
+
   const [testnetNoticeOpen, setTestnetNoticeOpen] = useState(() => !isLocalChain && !readSessionFlag(TESTNET_NOTICE_KEY));
   const dismissTestnetNotice = () => {
     writeSessionFlag(TESTNET_NOTICE_KEY);
@@ -138,6 +140,18 @@ export function App() {
           cancelamentos continuam funcionando.
         </div>
       )}
+      {health.data?.clockSkewSec !== undefined && !health.data.recovering && (
+        <div className="banner banner-warn" role="alert">
+          O relógio do motor está fora de sincronia com o da blockchain: novas ordens são recusadas até que voltem a
+          coincidir.
+        </div>
+      )}
+      {cappedMarkets.map((m) => (
+        <div className="banner banner-warn" role="alert" key={m.marketId}>
+          {m.symbol} atingiu o limite de contratos em aberto: neste mercado só serão executadas ordens que reduzem
+          posição (somente-redução).
+        </div>
+      ))}
       {halted && market && (
         <div className="banner banner-warn" role="alert">
           {market.symbol} está suspenso: o motor não tem um preço índice recente e não aceita novas ordens neste mercado.
