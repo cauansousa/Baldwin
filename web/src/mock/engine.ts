@@ -88,6 +88,16 @@ export const mockEngine: EngineApi = {
       return { orderHash: closed.orderHash, status: closed.status, reason: closed.reason, fills: [], duplicate: true, remaining: 0n, pending: 0n, filled: 0n };
     }
     if (existing) {
+      // A queued fault also hits a resubmission, so "timeout,unknown" really takes three attempts.
+      const again = submitFaults[0];
+      if (again === "timeout" || again === "lost") {
+        submitFaults.shift();
+        throw new DOMException("The operation timed out.", "TimeoutError");
+      }
+      if (again === "unknown") {
+        submitFaults.shift();
+        throw new EngineError(503, "O motor processou a ordem mas não conseguiu gravá-la; não se sabe se ela foi aceita.", "STATE_UNKNOWN", "unknown");
+      }
       return {
         orderHash: existing.orderHash,
         status: existing.status,
